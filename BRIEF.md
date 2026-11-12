@@ -54,10 +54,52 @@ Owner does not want the hobby-tier defaults (Vercel + Supabase). They want more 
 production-grade infrastructure for stability. Stack is to be chosen with the owner before
 Stage 2. Do not assume a stack in specs; keep specs infrastructure-agnostic.
 
-## Status: PAUSED — waiting for the owner's walkthrough video.
+## Status
+Phase 1 (now): build the "CRM brain" from the 20 transcripts + llms.txt — a module-by-module
+breakdown plus a master map of how every part talks to every other part. Written so the
+owner's upcoming walkthrough video can be layered on top (Verify-against-video checklists).
+Phase 2 (after video): reconcile with the video, then build guideline, then code.
+
+## Team (Phase 1) — ten agents
+| # | Agent | Owns | Main videos |
+|---|---|---|---|
+| 01 | Booking Portal & Subdomain | customer journey on the booking site, subdomain/custom-domain hosting, website buttons, embed, QR, short links, customer accounts | 05 (+01,02,06,07,11 customer side) |
+| 02 | Catalog & Coverage | services, categories, pricing, durations, add-ons (customer + company), inventory, service areas/zones, shops, travel fees, zone tax | 06, 07, 11 |
+| 03 | Scheduling & Dispatch Engine | availability math, calendar/jobs tab, booking from CRM, auto-dispatch, recurring engine, route optimization, travel time | 02, 08, 14, 15, 19 |
+| 04 | Job Lifecycle & Field Workflow | single job ID across quote→appointment→invoice, statuses, worker-app job flow (on-my-way, checklists, photos, complete), quotes & invoices documents | 04 (+02,06,16) |
+| 05 | Payments & Money Movement | payment options, timing, card on file, deposits/pre-auth, POS, tips, tax order, refunds, transactions, payouts, disputes, processor integration | 16, 17 (+04,09) |
+| 06 | Subscriptions, Discounts & Gift Cards | subscription packages, billing cycles, commitments, auto-scheduling, dunning; discount codes/promos; gift card ledger | 01, 09 |
+| 07 | Customers, Leads & Assets | customer profiles, contacts/addresses, tags, CSV import/export, dedupe, assets/vehicles, leads, lead board, abandoned-booking capture, enrichment | 18, 20 (+09,10) |
+| 08 | Marketing, Comms & Reporting | notification catalog (all SMS/email/push triggers), campaigns, drip engine, inbox/chat, reviews, referrals, dashboard tiles, reports, leaderboard, metrics formulas | 10, 12 (+09) |
+| 09 | Team, Permissions & Timesheets | workers, invites, RBAC matrix, service/zone assignment, availability, calendar sync, timesheets, pay rates | 03, 13 |
+| 10 | Systems Integrator — "the brain" | runs AFTER 01–09: unified entity graph, event catalog, end-to-end flows, cross-module contracts, conflicts, master index | all |
+
+Notification ownership: Agent 08 owns the master notification catalog; other agents list the
+triggers their module fires and reference 08.
 
 ## Output layout
-- `docs/specs/` — module specs (Stage 1)
+- `docs/brain/NN-<name>.md` — one file per agent (01–09)
+- `docs/brain/00-CRM-BRAIN.md` — Agent 10's master synthesis
 - `docs/reviews/` — stage reviews
-- `docs/guideline/` — build guideline (Stage 2)
-- `app/` — foundation code (Stage 3)
+- Agents never run git; the lead commits.
+
+## Module file template (agents 01–09)
+1. **Summary** — what the module is for, in plain language (5–10 lines)
+2. **Roles** — who touches it (owner/admin/manager/foreman/worker/customer/system)
+3. **Screens** — per screen: where it lives in nav, layout regions, every field (type,
+   validation, default), actions, states (empty/loading/error/success), mobile behavior
+4. **Workflows** — numbered steps with side effects (records written, notifications, status changes)
+5. **Business rules & math** — formulas, order of operations, rounding (money = integer cents)
+6. **State machines** — tables: state, event, guard, next state, side effects
+7. **Data model** — entities with fields, types, keys, relations (stack-agnostic, TypeScript-style interfaces)
+8. **API surface** — endpoints/commands/queries this module exposes (name, input, output, auth)
+9. **Interfaces with other modules** — CONSUMES (data/events from module X), PRODUCES (events/data for X),
+   with event names in `domain.entity.verb` form (e.g. `booking.appointment.created`)
+10. **Algorithms / pseudo-code** — for any non-trivial logic
+11. **Edge cases & failure modes** — exhaustive
+12. **Better than Fieldd** — concrete improvements, plus "budget tier" notes (what a starter
+    business needs vs. what can be gated to higher plans)
+13. **Open questions**
+14. **Verify against video** — concrete checklist for the owner's walkthrough video
+
+
