@@ -1468,3 +1468,225 @@ units with fixed decimals (currency exponent) and a separate currency column. UT
 RFC-4180 quoting; **formula-injection guard**: prefix `'` to any cell starting with `= + - @ \t \r`.
 > 10 000 rows → async job, emailed signed link (K16, 24 h expiry). Export audited (who, filters,
 row count).
+
+---
+
+## 11. Edge cases & failure modes
+
+**Double charges & concurrency**
+- E1 Worker double-taps "Charge" → same idempotency key → one PaymentIntent; second tap returns stored response.
+- E2 App killed mid-charge, reopened → tender screen loads job's in-flight Payment (`processing`/`unknown`) and shows its live status instead of a fresh pay button.
+- E3 Customer pays invoice online while worker charges card on file → partial unique index + balance_version: one succeeds, the other gets `PAYMENT_IN_PROGRESS` / `BALANCE_CHANGED`.
+- E4 Two office users apply different discounts simultaneously → `saveBreakdown(expectedVersion)` CAS; loser sees diff and re-applies.
+- E5 Split job: two workers both open POS → job lock; second sees "Being collected by Sam (2 min ago)", with override for managers after timeout (10 min) only if attempt is not `processing`.
+- E6 Auto-charge on `job.job.completed` fires twice (at-least-once event) → idempotency key `auto:{job_id}:{breakdown_version}`.
+- E7 Job reopened and re-completed with same total → no new charge (balance 0); with higher total → charge delta only.
+
+**Network & processor failures**
+- E8 Timeout after the processor received the request → `unknown` → resolve by retrieve; never create a second intent.
+- E9 Processor outage (5xx for minutes) → POS offers cash/check/send invoice; booking site degrades to "pay after job" only if business allows, else shows retry with preserved form state; circuit breaker opens after N failures; status banner.
+- E10 Webhook endpoint down for hours → processor retries for days `[I]`; nightly reconciliation catches anything missed; POS/portal flows don't depend on webhooks (sync retrieve after confirm).
+- E11 Webhooks out of order (`succeeded` before `processing`, `refund.updated` before `charge.refunded`) → precedence lattice + re-fetch (§10.4).
+- E12 Money moved but booking not created (crash between confirm and job insert) → orphan sweep after 15 min voids/refunds and notifies; if the job appears late, sweep re-checks before refunding (idempotent attach wins if it happens first; refund cancels attach otherwise).
+- E13 Duplicate webhook delivery → `UNIQUE(provider_event_id)` → no-op.
+- E14 Signature failure (secret rotated, clock skew) → 400 + alert on rate; verify with current and previous secret during rotation window.
+- E15 Processor idempotency key reused with different params (bug) → processor error → alert, Payment `failed` with `INTERNAL_IDEMPOTENCY_MISMATCH`, no retry.
+
+**Authorizations**
+- E16 Job booked 3 weeks out with pre-auth → card saved now, hold scheduled (§10.5).
+- E17 Hold fails 24 h before job (insufficient funds) → customer update link, job flagged `payment_at_risk`, business decides (keep/cancel); auto-cancel only if configured.
+- E18 Job runs late; hold expires before completion → renewal at `capture_before − 12h`; if renewal fails, complete normally and charge off-session; if that fails → invoice.
+- E19 Final amount > hold (upsell add-ons [S: 07.txt], tip) → capture hold + top-up charge (§10.6).
+- E20 Final amount < hold → partial capture; remainder released (bank may show pending hold for days — receipt text explains `[I]`).
+- E21 Job canceled within fee window → capture fee from hold (partial) then auto-release; outside window → void.
+- E22 Job rescheduled earlier/later → hold voided/re-planned; avoid two simultaneous holds except during renewal overlap (≤ minutes).
+- E23 Card on file replaced while hold exists → keep existing hold; new card used for top-ups and renewals.
+
+**Totals & rounding**
+- E24 100 % discount or subscription-covered job → total 0; no charge; payment_status `no_charge`; card still optional for add-ons.
+- E25 Discount larger than eligible base → clamp, warning shown to staff, never negative.
+- E26 Total below processor minimum (e.g., $0.40 add-on) → card methods disabled with reason; cash/waive.
+- E27 Tax rate changed in zone between booking and completion → non-finalized jobs recompute (banner "Tax updated from 8.25% to 8.5%"); finalized invoices keep snapshot.
+- E28 Job address changes zone after booking → new travel fee + tax; deposit already collected unchanged; delta charged/refunded at completion.
+- E29 Customer becomes tax-exempt after invoice finalized → credit note via 04 + partial refund of tax.
+- E30 Prices-include-tax business switches setting → blocked after first finalized invoice.
+- E31 Hourly service billed by actual time (qty_milli from timer) → quantity rounding to nearest minute before pricing `[I]`; never fractional cents.
+- E32 Rounding mismatch between client preview and server → server wins; client shows "Updated total" diff; golden vectors prevent drift.
+- E33 Very large invoice (≥ $1M) → 128-bit intermediates; max charge guard requires owner confirmation.
+
+**Tips**
+- E34 Tip added after capture → separate tip payment (W14); never edits captured amount.
+- E35 Tip on cash payment → recorded in cash custody; tip owed to worker who already holds it → tips_payable offsets cash owed (net settle in Cash tab).
+- E36 Tip on split job → distribution rule; remainder cents to lead.
+- E37 Refund of service but not tip (or vice-versa) → separate amounts; tip refund claws back worker tip payable (flag to payroll if already paid → negative adjustment next period).
+- E38 Customer enters absurd tip (e.g., $500 on $50) → confirmation step on device; > 100 % requires second confirm.
+- E39 Tip on fully gift-card-paid job → tip charged to card (gift card can pay tips only if 06 allows; default no `[I]`).
+
+**Refunds**
+- E40 Refund > refundable → blocked with remaining amount shown.
+- E41 Refund on disputed charge → blocked (processor disallows `[I]`); suggest accepting/contesting dispute.
+- E42 Refund to closed/expired card → processor may still succeed (network routes) or fail → `refund.failed` → offer cash/store credit.
+- E43 Refund after 180 days (`[I]` card limit) → card destination disabled.
+- E44 Refund of gift-card-paid portion → back to same gift card (06); if card was voided → issue new card / store credit.
+- E45 Refund to gift card as store credit for a card payment → 06 issues/reloads; ledger reverses revenue, increases gift card liability.
+- E46 Refund of a deposit when booking canceled outside window → full refund, application fee refunded pro-rata (config).
+- E47 Refund in cash by a worker → reduces their cash on hand; can go negative (worker paid from own pocket) → shows as owed to worker.
+- E48 Partial refunds across multiple tenders (deposit card + final card + cash) → refund dialog chooses tender; default most-recent card tender first `[I]`.
+
+**Disputes**
+- E49 Dispute on a deposit for a job not yet done → job flagged; business decides to proceed (require new payment method) or cancel.
+- E50 Dispute on subscription charge → 06 auto-pauses (06 setting default on).
+- E51 Evidence deadline passes on weekend/holiday → reminders at 72/24 h in business TZ; deadline shown in both business TZ and UTC.
+- E52 Dispute won after funds already re-paid out → ledger reinstatement; included in next payout.
+- E53 Inquiry (warning) vs chargeback distinguished; inquiry has no funds movement.
+- E54 Dispute on payment refunded earlier (customer double-dipping) → evidence auto-includes refund record.
+
+**Cards on file & customers**
+- E55 Same card saved twice → dedupe by fingerprint per customer; set default instead.
+- E56 Card expires before a future job/subscription charge → `payments.card.expiring` 30 days ahead; account updater may refresh automatically.
+- E57 Off-session charge returns `authentication_required` (SCA) → customer action link; job stays `failed`/`requires_action`; office notified.
+- E58 Customer removes card used by active subscription/hold → blocked with explanation, or require replacement.
+- E59 Customers merged (07) → both processor customers mapped to survivor; cards remain on original processor customer (detached methods can't be re-attached `[I]`); UI lists union.
+- E60 Customer erasure request → detach cards at processor; keep financial records (pseudonymized) per legal retention.
+- E61 Card added via CRM (MOTO) without customer consent checkbox → blocked.
+- E62 Prepaid/debit card with insufficient balance for hold → decline; suggest pay-after-job.
+
+**Cash, checks, offline**
+- E63 Cash recorded offline, customer later pays online → overpayment flag (§10.10).
+- E64 Worker deactivated with cash on hand → alert, cannot be deleted until reconciled (09 blocks hard delete).
+- E65 Counted cash ≠ expected → variance entry (over/short), requires note.
+- E66 Bounced check → reversal, fee optional, job reopens balance, customer notified by office (template 08).
+- E67 Backdated cash entry into a closed reporting period → requires admin; posts with today's ledger date and original `occurred_at` (no rewriting closed periods).
+- E68 Change due > $X float → warn ("Do you have change?") `[I]`.
+
+**Account & payouts**
+- E69 Processor account restricted mid-day → online checkout switches to non-card modes immediately (cache TTL ≤ 60 s); POS card tiles disabled with reason.
+- E70 Payout fails (bank closed) → funds return to balance; owner notified; next payouts paused by processor until fixed.
+- E71 Negative balance (refunds/disputes > incoming) → processor debits bank `[I]`; shown as negative payout row.
+- E72 Business disconnects processor → saved cards unusable; subscriptions (06) moved to invoice mode with notice; history retained read-only.
+- E73 Currency mismatch (gift card or discount in another currency) → rejected.
+
+**Time & DST**
+- E74 Worker summary week containing DST change → local-date boundaries; no double/missing hour.
+- E75 Payment at 23:59 local on Sunday → belongs to that week in business TZ even though UTC is Monday.
+- E76 Auth `capture_before` near DST transition → stored as UTC instant; scheduling in UTC.
+- E77 Payout `arrival_date` is a bank date (processor account TZ) — displayed as date only, no time conversion.
+
+**Security & abuse**
+- E78 Card-testing attacks via booking site (many small SetupIntents) → rate limit per IP/device/business, CAPTCHA/risk challenge after N failures, processor fraud rules, alert on decline spikes.
+- E79 Invoice pay-link forwarded/leaked → link can only pay that invoice; shows business name and amount only; no PII beyond first name; tokens expire after invoice paid + 30 days.
+- E80 Worker tries to charge a job not assigned to them → 403 (`collect.assigned`).
+- E81 Manual card entry above cap → blocked, prompt tap-to-pay or invoice.
+- E82 Malicious CSV content in customer names → formula-injection guard.
+- E83 Staff refund fraud (refund to different card) → processor refunds only to original method; refunds to cash/store credit need permission and are audit-logged; daily refund digest to owner.
+
+---
+
+## 12. Better than Fieldd
+
+| # | Improvement | Why it matters |
+|---|---|---|
+| B1 | **Single deterministic totals engine** shared by booking widget, CRM, worker POS, invoice, with published order of operations and golden tests. | No "the app says $X, invoice says $Y" support tickets. |
+| B2 | **Pre-auth that survives long lead times** (card saved now, hold scheduled before the job, renewal before `capture_before`). | Fieldd's pre-auth window behavior is unknown; holds expiring silently cost businesses money. |
+| B3 | **Payout drill-down**: every payout explained line by line, with job links and fee totals; reconciliation badge. | Owners' #1 money question: "what is this deposit in my bank?" |
+| B4 | **Fees shown per transaction** (processor + platform), net, and in CSV. | Trust; easy bookkeeping. |
+| B5 | **Partial & split payments** first-class (deposit + gift card + card + cash on one job) with live remaining due. | Real field jobs mix tenders. |
+| B6 | **Cash custody per worker** with collect/deposit/variance workflow. | Fieldd shows cash as a method [S: 16.txt]; no evidence of reconciliation. |
+| B7 | **Dispute evidence auto-pack** from photos, checklists, arrival timestamps, signed terms. | Higher win rates with minutes of work. |
+| B8 | **Never-double-charge guarantees** (idempotency end-to-end, single in-flight attempt, `unknown` resolution UI). | Zero-crash, zero-duplicate mindset (Brief rule 5). |
+| B9 | **Offline-tolerant POS** for cash/check; clear disabled states for card when offline. | Rural/basement jobs. |
+| B10 | **Tap to Pay on phone** at launch, physical reader optional. | "No extra hardware" parity [S: 16.desc] at low cost. |
+| B11 | **Tip distribution for split jobs** and payroll-ready tips payable export to 09. | Split jobs are new in Fieldd [S: llms.txt]; tip fairness is a common pain `[I]`. |
+| B12 | **Labeled metrics** ("Collected" vs "Earned") everywhere; custom date range in worker summary (not only weeks). | Numbers that match the bank and the accountant. |
+| B13 | **Tenant-branded payment surfaces**: processor elements themed from the tenant's light/dark palettes, radius, shadows and uploaded fonts; receipts/pay page with tenant logo variants (owner req. 2026-11-13). | Checkout looks like the business, not like us. |
+| B14 | **Accessible POS & pay pages**: WCAG 2.2 AA, 48 dp targets, screen-reader labels on tip buttons, no color-only status; responsive desktop/tablet/phone. | Customer-facing device hand-offs. |
+| B15 | **Fast checkout**: pay page interactive < 2 s on mid-range 4G; processor script loaded only on the payment step (booking widget budget, Brief rule 6). | Conversion. |
+| B16 | **Safe AI/MCP**: read-only money queries for assistants; money movement needs human confirmation. | Fieldd exposes 300+ MCP actions [S: llms.txt]; money actions are the riskiest. |
+| B17 | **Plain-language decline reasons** for staff and customers, with next best action. | Fewer awkward on-site moments. |
+| B18 | **ACH/bank debit for large jobs** (phase 2) to cut fees on big tickets. | Affordability for the business. |
+
+**Budget tier vs gated** `[I]` (Fieldd puts POS, invoicing, credit cards, gift cards in its $199 Start plan [S: llms.txt]; we aim far cheaper):
+
+| Starter (must be in cheapest plan) | Higher plans / add-ons |
+|---|---|
+| Card payments (online, card on file, tap to pay), cash/check/custom, send invoice, tipping, deposits & card on file at booking, refunds, worker summary, card payments list, CSV export, payout list & detail, dispute alerts + basic evidence, receipts | Pre-auth scheduling & renewal, dispute auto-evidence pack, cash custody workflow for multi-worker teams, multi-business/multi-currency hub, accounting integrations (QBO/Xero), ACH, instant payouts, advanced tax engine (multi-component), custom refund limits per role, API/MCP money reads |
+| Application fee: 0 % (processor pricing passes through) | Optional application fee or flat add-on pricing for advanced features (OQ1) |
+
+---
+
+## 13. Open questions
+
+| # | Question | Who decides | Default if undecided |
+|---|---|---|---|
+| OQ1 | **Revenue model on payments**: application fee per transaction (bp + fixed) vs 0 % on all tiers vs 0 % on starter only. Can we credibly be "cheaper than Stripe" without carrying loss liability? | Owner | 0 % on starter; small fee on higher tiers |
+| OQ2 | **Connect configuration**: Stripe-owned loss liability + Stripe-collected fees (Standard-like) vs platform-owned (Express-like). | Owner + Agent 10 | Standard-like for v1 |
+| OQ3 | When (volume threshold) to evaluate a PayFac-as-a-Service for margin, and is a branded gateway (like fielddPAY) a goal at all? | Owner | Revisit at meaningful processing volume |
+| OQ4 | Is **next-day payout** a launch requirement (parity with fielddPAY [S: llms.txt]) or is the processor's default schedule acceptable? | Owner | Processor default; instant payouts optional |
+| OQ5 | Surcharging / cash-discount programs — offer at all? (state laws, card-brand rules) | Owner + legal | Not offered |
+| OQ6 | Does Fieldd treat gift card as a discount (pre-tax) or tender (post-tax)? It sits under "Options" [S: 16.txt]. | Video | Tender (post-tax) |
+| OQ7 | Tip base: pre-tax after discounts vs total incl. tax; preset percentages; does Fieldd prompt tips on invoice links? | Owner/video | Pre-tax after discounts; 15/20/25 % |
+| OQ8 | Worker summary basis: collected (cash) vs completed jobs (accrual); week start day; does Fieldd include cash/check in worker summary? | Video + Agent 08 | Collected; Monday |
+| OQ9 | Lost dispute: reverse sales tax payable automatically or leave to accountant? | Owner/accountant | Flag only |
+| OQ10 | PCI scope confirmation (SAQ-A for merchants; platform as service provider) — engage a QSA before launch? | Owner | Yes, before live payments |
+| OQ11 | Which countries at launch (US only vs US/CA/AU/UK)? Drives tax-inclusive pricing, SCA, tap-to-pay availability. | Owner | US first, data model ready for others |
+| OQ12 | Shared rounding primitive: half-up (this spec) vs half-even (Agent 06 discounts). | Agent 10 | Half-up everywhere |
+| OQ13 | Is a successful charge required to book from the CRM when "charge at booking" is selected, or is the job booked with `failed` status? | Owner/video | Booked + flagged |
+| OQ14 | Do workers see full job totals and other workers' revenue? (09 matrix row 280 proposes own-job only) | Owner | Own jobs only |
+| OQ15 | Support "bring your own processor" (existing Stripe/Square accounts) for businesses migrating from Fieldd/others? F12 implies Fieldd supports non-fielddPAY users. | Owner | Not in v1; cash/check/invoice-only mode works without processor |
+| OQ16 | Deposits: refundable rules — fully owned by cancellation policy (01/04) or separate deposit policy? | Agents 01/04/10 | Cancellation policy |
+| OQ17 | Can gift cards pay tips? | Owner + Agent 06 | No |
+| OQ18 | Platform billing of the business itself (our SaaS subscription, postcard costs mentioned by 08) — same processor platform account, separate from Connect flows? | Owner + Agent 10 | Separate billing module, out of scope here |
+
+---
+
+## 14. Verify against video
+
+**Job editor — Options & Payment** [S: 16.txt][S: 19.txt]
+- [ ] Exact section title ("Options and Payment"? one section or two) and position below services.
+- [ ] Options: discount picker (existing vs create inline), tax toggle vs rate field, gift card input — and whether gift card reduces the taxed amount (OQ6).
+- [ ] Payment choices wording: "Charge after job", "Card on file", "Charge at booking"/"Charge now" — radio, toggle or dropdown?
+- [ ] "Add card" UI: modal, inline fields, processor branding visible?
+- [ ] Is a deposit/pre-auth amount visible/editable per job?
+- [ ] Is there a manual discount ($/%), and who can apply it?
+- [ ] Total breakdown order on screen (subtotal, discount, travel fee, tax, gift card, total).
+
+**Settings → Payments** [S: 04.txt]
+- [ ] Location under Settings (below Communication → Email?) and exact sub-sections.
+- [ ] Deposit options: fixed vs %, per service override, refundable rules.
+- [ ] Prepayment option: full amount? at booking only?
+- [ ] Pre-authorization: amount basis, timing (at booking vs before job), behavior for far-future jobs.
+- [ ] Tipping settings (presets, on/off, where prompted).
+- [ ] Payment methods list (custom methods, check, cash) and whether they're configurable.
+- [ ] fielddPAY onboarding screen: fields, KYC flow, bank account, payout schedule controls.
+
+**Worker app POS** [S: 16.txt][S: 16.desc]
+- [ ] Path: Complete job → POS automatically? "Add Payment" button location on job details.
+- [ ] Payment type list and order; "custom payment method" naming.
+- [ ] Amount entry: editable (partial payments)? split tender?
+- [ ] Tip screen: presets, custom, no tip; customer-facing design.
+- [ ] Tap to Pay present? Reader support? Apple Pay on the phone?
+- [ ] Manual card entry fields; any signature capture; receipt options (email/SMS/print).
+- [ ] Payment confirmation screen content.
+- [ ] Adding add-ons at POS before completion [S: 07.txt] and how totals refresh.
+- [ ] Offline behavior (airplane mode): what's allowed.
+
+**Transactions** [S: 17.txt][S: 09.txt]
+- [ ] Tab names and order (Worker summary, Card payments, Subscriptions, Payouts, Disputes?).
+- [ ] Worker summary columns; week picker behavior (week start day; arbitrary ranges?).
+- [ ] Card payments columns; fee/net visible? status chips; link to job.
+- [ ] Filters: staff, payment method — any date/status filters; search.
+- [ ] Payout history location ("right under the tabs") and payout detail contents.
+- [ ] Dispute management: list, detail, evidence upload UI, deadlines.
+- [ ] "Card transaction details" fields.
+- [ ] CSV download icon location and column set.
+- [ ] Refund button location, partial refund support, refund reasons, refund to gift card.
+- [ ] Subscriptions sub-tab (active/packages dropdown) [S: 01.txt].
+- [ ] Whether non-fielddPAY accounts see a reduced Transactions view (F12) and what it contains.
+
+**Customer side (owner's swash.co-style walkthrough)**
+- [ ] Booking checkout payment step: deposit/prepay/hold wording, card form look, Apple Pay/Google Pay buttons on the business's subdomain.
+- [ ] Consent/terms text near card entry; cancellation fee disclosure.
+- [ ] Invoice pay page: amount, tip prompt, methods, success page, receipt email.
+- [ ] Customer portal saved cards management; gift card purchase checkout.
+- [ ] Statement descriptor shown on test charge (business name vs platform).
+- [ ] Jobs tab payment status labels/colors [S: 08.txt].

@@ -1798,3 +1798,409 @@ roles; worker default caps listed in §8.7.
 
 **06 ↔ 10**: conflicts flagged for normalisation: `cancelled` vs `canceled`; `jobs.job.*` vs
 `job.job.*`; stacking default (compound vs best-of); gift card hold TTL by context.
+
+---
+
+## 10. Algorithms / pseudo-code
+
+All `[I]`. Pseudo-code is language-neutral; `tx {}` = one database transaction;
+`lock(row)` = row-level lock (SELECT … FOR UPDATE or equivalent); `emit()` writes to the outbox
+inside the same transaction.
+
+### 10.1 Billing cycle run
+
+```
+// Runs every 5 minutes; sharded by hash(subscriptionId) % N so workers never overlap.
+function billingRunDue(now, shard):
+  ids = query Subscription
+          where nextBillingAt <= now
+            and status in ('active','trialing')
+            and shard(id) == shard
+          order by nextBillingAt limit 500
+  for id in ids:
+    try: billOne(id, now)
+    catch e: log(e, id); metrics.inc('billing.error')   // one failure never stops the batch
+
+function billOne(subId, now):
+  tx {
+    sub = lock(Subscription[subId])
+    if sub.nextBillingAt > now or sub.status not in ('active','trialing'): return  // raced
+    cur = sub.currentPeriodId ? Period[sub.currentPeriodId] : null
+
+    // 1) close the current period's entitlement windows that end at/before nextBillingAt
+    closeWindowsEndingBy(sub, sub.nextBillingAt)         // §10.3 (expire / rollover)
+
+    // 2) apply planned changes effective at this renewal (price, plan, pause, cancel)
+    for pc in sub.plannedChanges where effective(pc, sub.nextBillingAt):
+      applyPlannedChange(sub, pc)                         // may set status paused/cancelled
+    if sub.status in ('paused','cancelled','expired'): save(sub); emitStatus(sub); return
+
+    // 3) commitment end handling
+    if sub.commitment and sub.nextBillingAt >= sub.commitment.endsAt:
+      handleCommitmentEnd(sub)                            // renew / month-to-month / expire
+      if sub.status == 'expired': save(sub); emit('subscription.subscription.expired'); return
+
+    // 4) open next period
+    seq    = (cur?.seq ?? 0) + 1
+    start  = sub.nextBillingAt
+    end    = nextAnchor(sub.billingAnchor, sub.interval, sub.intervalCount, seq)   // §10.2
+    period = insert Period{subId, seq, start, end, status:'due',
+                           idempotencyKey: "sub:"+subId+":"+seq}     // unique(subId, seq) guards duplicates
+
+    // 5) amount
+    if sub.commitment?.paymentMode == 'prepay' and sub.commitment.cyclesPaid >= seq - sub.commitment.startSeq + 1:
+      period.status = 'prepaid'; grantEntitlements(sub, period); advance(sub, period)
+      emit('subscription.renewal.charged', {prepaid:true}); return
+    amt = computePeriodAmount(sub, period)                // price (overlay) − subscription-scoped discounts
+                                                          // − accountCredit, then tax via 05 (exclusive/inclusive/exempt)
+    period.amount = amt
+    if amt.totalCents == 0:
+      period.status = 'paid'; grantEntitlements(sub, period); advance(sub, period); return
+    if sub.collection == 'invoice':
+      period.status = 'awaiting_payment'; requestInvoice(sub, period)   // 04/05
+      advance(sub, period); return
+    period.status = 'charging'
+    advance(sub, period)                                  // currentPeriod = period; nextBillingAt = end
+  }
+  // 6) charge OUTSIDE the transaction (network call), idempotent
+  res = payments.chargeOffSession({purpose:'subscription', subscriptionId: subId, cycleId: period.id,
+          customerId: sub.customerId, amount: period.amount.totalCents,
+          paymentMethodId: sub.paymentMethodId,
+          idempotencyKey: period.idempotencyKey + ":" + 0})
+  onChargeResult(subId, period.id, attempt=0, res)
+
+function onChargeResult(subId, periodId, attempt, res):   // also invoked by 05 webhooks (dedup by chargeId)
+  tx {
+    sub = lock(Subscription[subId]); p = lock(Period[periodId])
+    if p.status in ('paid','void','refunded'): return     // late/duplicate result
+    switch res.status:
+      'succeeded':
+         p.status='paid'; p.chargeId=res.chargeId
+         grantEntitlements(sub, p)                         // firm up provisional reservations too
+         if sub.status in ('past_due','trialing'): sub.status='active'; sub.dunning=null
+             emit(attempt>0 ? 'subscription.subscription.recovered' : 'subscription.subscription.activated'/'renewal.charged')
+         else emit('subscription.renewal.charged', {periodId, amount:p.amount})
+      'requires_action':                                   // SCA
+         p.status='unpaid'; startOrContinueDunning(sub, p, attempt, res, needsAuth=true)
+      'failed':
+         p.status='unpaid'; startOrContinueDunning(sub, p, attempt, res)
+      'unknown':                                           // timeout
+         p.status='charging'; scheduleReconcile(periodId, in=10min)  // ask 05 by idempotency key; never re-charge blindly
+  }
+```
+
+### 10.2 Next anchor date (month-end and DST safe)
+
+```
+function nextAnchor(anchor, interval, count, seq):
+  // compute from the ORIGINAL anchor, never from the previous period end (avoids 31→28→28 drift)
+  n = seq * count
+  switch interval:
+    'week':  d = anchor.localDate + (7*n) days
+    'month': y,m = addMonths(anchor.localDate.year, anchor.localDate.month, n)
+             d = date(y, m, min(anchor.localDate.day, daysInMonth(y, m)))
+    'year':  y = anchor.localDate.year + n
+             d = (anchor is Feb 29 and !leap(y)) ? date(y,2,28) : date(y, anchor.month, anchor.day)
+  return toInstant(d, anchor.localTime, anchor.tz, gapPolicy='shift_forward', overlapPolicy='earlier')
+```
+
+### 10.3 Entitlement windows: grant, close, rollover
+
+```
+function grantEntitlements(sub, period):
+  defs = effectiveEntitlements(sub)          // version.entitlements + overlay.extra − overlay.removed
+  for def in defs:
+    for w in windowsFor(def, period, sub.benefitResetBasis):
+       // billing_cycle → one window = period; month/week → calendar windows clipped to [period.start, period.end)
+       // year plan + 'month' window → 12 windows, granted all now but each only usable in its own range
+       win = upsert EntitlementWindow{sub, def, period, w.start, w.end, state:'open'}
+       if def.quantity == 'unlimited': continue      // no grant rows; fair-use checked at reserve
+       appendLedger(win, 'grant', +def.quantity, key="grant:"+win.id)       // idempotent
+  firmProvisionalReservations(sub, period)            // provisional → firm for jobs dated inside period
+
+function closeWindowsEndingBy(sub, t):
+  for win in openWindows(sub) where win.end <= t:
+    avail = available(win)                            // Σ grants − reserves(non-released) − expires ± adjusts
+    // reservations still open for jobs dated in this window stay valid (job happens later? no: job date ∈ window,
+    // so window cannot close before the job date unless the job is overdue/unscheduled → leave reservation as is)
+    if avail > 0:
+      r = rolloverQty(win.def, avail)                 // none → 0; capped → min(avail, max); unlimited → avail
+      appendLedger(win, 'expire', -avail, key="expire:"+win.id)
+      if r > 0:
+        nextWin = windowContaining(sub, win.def, win.end)   // may be provisional (unpaid)
+        appendLedger(nextWin, 'rollover_grant', +r, key="roll:"+win.id,
+                     expiresAt = win.end + def.rollover.expiresAfterWindows * windowLength)
+      emit('subscription.entitlement.expired', {win, qty: avail - r})
+    win.state = 'closed'
+```
+
+### 10.4 Benefit consumption (reserve → consume / release / move)
+
+```
+// Called on: job created/materialized, lines changed, rescheduled, cancelled, completed.
+function syncJobCoverage(jobId):
+  tx {
+    job   = load Job snapshot (lines, serviceAt, customerId, assetIds, status, funding)
+    subs  = activeOrFutureValidSubscriptions(job.customerId, job.serviceAt, job.assetIds)
+             // statuses: active, trialing, past_due (provisional), pending_cancel (if serviceAt < effectiveAt)
+    lockAll(subs)
+    desired = planCoverage(job, subs)                 // pure function below
+    current = reservationsFor(jobId)                  // non-released ledger reserves
+    // diff: release what is no longer desired, reserve what is new; unchanged rows untouched
+    for r in current - desired: appendLedger(r.window, 'release', +r.qty, key="rel:"+jobId+":"+r.lineId+":"+r.window.id+":"+job.version)
+    for d in desired - current:
+       if available(d.window) < d.qty and d.def.quantity != 'unlimited': continue    // lost a race → not covered
+       appendLedger(d.window, 'reserve', -d.qty, jobId, d.lineId,
+                    reservationState = d.window.period.status in ('paid','prepaid','comped') ? 'firm' : 'provisional',
+                    listValueCents = d.lineListValue,
+                    key="res:"+jobId+":"+d.lineId+":"+d.window.id+":"+job.version)
+    if desired != current: emit('subscription.coverage.changed', {jobId, lines})
+  }
+
+function planCoverage(job, subs):               // deterministic, no side effects
+  plan = []
+  lines = job.lines sorted by unitPrice desc     // cover most expensive eligible line first (§5.5)
+  for line in lines:
+    remainingQty = line.qty
+    candidates = []
+    for sub in subs:
+      for def in effectiveEntitlements(sub) where matches(def.target, line.item) and variantOk(def, line):
+        win = windowContaining(sub, def, job.serviceAt)
+        if win == null: continue
+        if def.fairUse and violatesFairUse(def, win, job): continue
+        candidates.add({sub, def, win, avail: availableExcludingJob(win, job.id)})
+    candidates.sort by (win.end asc, specificity(def.target) desc, oldestGrant asc)
+    for c in candidates while remainingQty > 0:
+      q = (c.def.quantity == 'unlimited') ? remainingQty : min(remainingQty, c.avail)
+      if q > 0: plan.add({window:c.win, def:c.def, lineId:line.id, qty:q, coverage:c.def.coverage}); remainingQty -= q
+  return plan
+
+function onJobCompleted(jobId):
+  tx { for r in reservationsFor(jobId): markConsumed(r); emit('subscription.entitlement.consumed', r) }
+
+function onJobCancelled(jobId, cancel):
+  tx {
+    consume = cancel.isNoShow or (cancel.lateFeeCharged and settings.noShowConsumesCredit)
+    for r in reservationsFor(jobId):
+      if consume: markConsumed(r)
+      else if r.window.state == 'closed': appendLedger(r.window,'release',+r.qty); appendLedger(r.window,'expire',-r.qty)
+      else: appendLedger(r.window,'release',+r.qty)
+  }
+// Reschedule = syncJobCoverage with the new serviceAt: releases in old window and reserves in the new one
+// in ONE transaction. If the new window lacks availability, the job is repriced and 03's UI shows the warning
+// returned by pricing.modifiers.evaluate(dryRun) BEFORE staff confirms.
+```
+
+Member % discounts (not count-limited) are not reserved; they are applied by the evaluator
+whenever the customer has a qualifying subscription on the service date. `first_n_per_window`
+member discounts use the same ledger with an implicit count entitlement.
+
+### 10.5 Discount / modifier evaluation
+
+```
+function evaluate(req):                                     // pure given a read snapshot; < 20 ms target
+  lines   = clone(req.lines)                                // each: id, item, category, unitPrice, qty, gross, net=gross, taxable
+  applied = []; rejected = []
+
+  // Stage 3: membership coverage
+  plan = req.dryRun ? planCoverage(virtualJob(req), membershipsFor(req)) : reservationsFor(req.jobId)
+  for p in plan:
+    line = lines[p.lineId]; amt = coverageAmount(p.coverage, line, p.qty)   // free → line unit price × qty covered
+    take(line, amt, applied, stage='coverage', source=p.def)
+
+  // Stage 4: member discounts
+  memberDefs = memberDiscountsFor(req)                      // from active subscriptions on serviceAt (or assumeMembership)
+  memberPerLine = {}
+  for d in memberDefs:
+    for line in lines where inScope(d.appliesTo, line) and line.net > 0:
+      memberPerLine[line.id] = max(memberPerLine[line.id], valueOn(d.value, line.net))    // best member def per line
+
+  // Stage 5: recurring discount (skip if job is subscription-funded)
+  recurPerLine = {}
+  if req.recurring and req.context.funding != 'subscription':
+    for line in lines where line.isServiceOrAddon and line.net > 0:
+      recurPerLine[line.id] = valueOn(req.recurring.value, line.net, perJobFixedAllocated=true)
+
+  // Member vs recurring stacking (§5.6 default: best of, per line)
+  for line in lines:
+    m = memberPerLine[line.id] ?? 0; r = recurPerLine[line.id] ?? 0
+    if settings.stackMemberAndRecurring: apply m then recompute r on remaining net
+    else if m >= r and m > 0: take(line, m, applied, 'member') else if r > 0: take(line, r, applied, 'recurring')
+
+  // Stage 6: promos — codes + automatic + manual
+  cands = []
+  for code in dedupe(normalize(req.codes)):
+     d = findActiveByCode(code) ?? findBulkCode(code)
+     if !d: rejected.add({code, reason:'NOT_FOUND'}); continue
+     fails = eligibility(d, req, lines)                     // §10.5.1
+     if fails: rejected.add({code, reason: fails[0], failedConditions: fails}) else cands.add(d)
+  if cands.count(c => c.method=='code') > settings.maxCodesPerBooking:
+     keep best maxCodesPerBooking codes by simulated saving; reject others 'ONE_CODE_PER_BOOKING'
+  for d in automaticDiscounts(req.businessId) where !eligibility(d, req, lines): cands.add(d)
+  for m in req.manual: cands.add(asDiscount(m))            // permission caps verified by caller identity
+  cands = resolveStacking(cands, lines, applied)            // §10.5.2
+  for d in cands sorted by (priority asc, id asc):
+     eligibleLines = lines.filter(l => inScope(d.scope, l) and l.net > 0 and allowedAfter(d, l.appliedStages))
+     amt = discountAmount(d.value, eligibleLines)          // percent: per line half-even; amount_per_order: min(cents, Σnet)
+     amt = min(amt, d.value.maxCents ?? ∞, remainingBudget(d), Σ eligibleLines.net)
+     alloc = largestRemainder(amt, eligibleLines by net)    // Σ alloc == amt
+     for (line, a) in alloc: line.net -= a
+     applied.add({stage:'promo'|'manual', source:d, amountCents:amt, allocations:alloc})
+  return {lines, applied, rejected, evalHash: hash(req.snapshotVersion, lines, applied)}
+
+// 10.5.1 eligibility → list of failed conditions (empty = eligible)
+function eligibility(d, req, lines):
+  v = d.currentVersion; f = []
+  t = (v.window.basis=='service_at') ? req.serviceAt : req.bookedAt
+  if t < v.window.startsAt or (v.window.endsAt and t >= v.window.endsAt): f.add('OUTSIDE_DATES')
+  if v.window.basis=='both' and (req.serviceAt outside window): f.add('SERVICE_DATE_OUTSIDE')
+  if d.status in ('paused','archived'): f.add('INACTIVE')
+  if v.bookingConditions.channels and req.channel ∉ channels: f.add('CHANNEL')
+  if subtotal(lines in scope) < minSubtotal: f.add('MIN_SUBTOTAL')
+  if zone/shop/day-of-week/time-of-day/lead-time mismatch: f.add(...)
+  if bookingType ∉ allowed: f.add('BOOKING_TYPE')
+  if !customerEligible(v.customerEligibility, req): f.add('CUSTOMER_NOT_ELIGIBLE')
+  if v.limits.perCustomer and usesBy(d, req.customerId, req.fingerprint) >= perCustomer: f.add('ALREADY_USED')
+  if v.limits.totalUses and d.usage.totalReserved >= totalUses: f.add('LIMIT_REACHED')
+  if v.limits.budgetCents and d.usage.cost >= budget: f.add('BUDGET_REACHED')
+  if !lines.any(l => inScope(v.scope, l)): f.add('NO_ELIGIBLE_ITEMS')
+  if req.seriesId and !seriesRuleAllows(v.recurring, req.occurrenceIndex): f.add('RECURRING_RULE')
+  return f
+
+// 10.5.2 stacking
+function resolveStacking(cands, lines, appliedSoFar):
+  stagesPresent = set(appliedSoFar.map(a => a.stage))
+  ok = cands.filter(d => (!stagesPresent.has('member')    or d.combinesWith.member)
+                     and (!stagesPresent.has('recurring') or d.combinesWith.recurring))
+  // If a non-combinable promo is excluded only because a member/recurring discount exists,
+  // and settings.bestPriceGuarantee: compare (member/recurring alone) vs (promo alone) and keep the better for the customer.
+  exclusive = ok.filter(d => !d.combinesWith.promo)
+  if exclusive.nonEmpty:
+    best = argmax over (each exclusive alone, all combinable together) of simulatedSaving
+    return best
+  return ok
+```
+
+### 10.6 Redemption reservation with atomic limits
+
+```
+function reserveRedemptions(evalResult, target, key):
+  tx {
+    for a in evalResult.applied where a.source.kind == 'discount':
+      d = lock(Discount[a.source.id])                      // short lock; or conditional UPDATE … WHERE totalReserved < limit
+      if exists Redemption where idempotencyKey == key+":"+d.id: continue
+      if limitReached(d) or perCustomerReached(d, target.customer): throw PRICE_CHANGED   // caller re-evaluates & shows new price
+      insert Redemption{d, target, amount:a.amountCents, status:'reserved', key}
+      d.usage.totalReserved += 1
+      if d.version.limits.totalUses and d.usage.totalReserved >= totalUses: d.status='exhausted'; emit('discount.discount.exhausted')
+      if bulk code: DiscountCode.status = 'reserved'
+  }
+// release: status→released, totalReserved −= 1, exhausted → active if below limit (and dates valid)
+```
+
+### 10.7 Gift card hold / capture / release (concurrency-safe)
+
+```
+function hold(giftCardId, amount, paymentIntentId, ttl):
+  tx {
+    gc = lock(GiftCard[giftCardId])
+    if gc.status != 'active': throw NOT_ACTIVE
+    if gc.expiresAt and now >= gc.expiresAt: throw EXPIRED
+    if exists Hold where paymentIntentId == paymentIntentId and status=='held': return it   // idempotent
+    usable = min(amount, gc.balanceCents)
+    if usable <= 0: throw ZERO_BALANCE
+    h = insert Hold{gc, usable, paymentIntentId, 'held', expiresAt: now+ttl}
+    appendGcLedger(gc, 'hold', -usable, holdId=h.id)       // balanceCents -= usable; CHECK balance >= 0
+    return h
+  }
+function capture(holdId, jobId):  tx { h = lock(Hold); if h.status=='captured' return; require h.status=='held'
+                                       h.status='captured'; appendGcLedger(gc,'redeem',0,holdId)  // converts hold; amount already deducted
+                                       emit('giftcard.giftcard.redeemed') }
+function release(holdId):          tx { h = lock(Hold); if h.status!='held' return
+                                       h.status='released'; appendGcLedger(gc,'release',+h.amount,holdId) }
+// sweeper: holds past expiresAt and still 'held' → release (and alert if payment intent actually succeeded → reconcile with 05)
+
+function appendGcLedger(gc, type, amount, …):
+  seq = gc.lastSeq + 1
+  newBal = gc.balanceCents + amount
+  assert newBal >= 0
+  insert GiftCardLedgerEntry{gc, seq, type, amount, balanceAfter:newBal, …}   // unique(gc, seq) — a second writer fails & retries
+  gc.balanceCents = newBal; gc.lastSeq = seq; gc.lastActivityAt = now
+  if newBal == 0 and type in ('redeem','hold'): gc.status = (type=='redeem') ? 'redeemed' : gc.status
+```
+
+### 10.8 Gift card code generation
+
+```
+ALPHABET = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"         // Crockford base32
+function newCode(businessId):
+  loop up to 5:
+    body = 15 chars from CSPRNG over ALPHABET
+    code = body + checkChar(body)                    // mod-37 Crockford check symbol (or Luhn mod N)
+    h = HMAC_SHA256(pepper(businessId), code)
+    if not exists GiftCard where (businessId, codeHash) == (businessId, h): return code
+  throw CODE_GENERATION_FAILED                       // astronomically unlikely; alert
+normalize(input) = uppercase(NFKC(input)).remove('-',' ')
+// lookup: verify check char first (cheap reject typos without a DB hit, no oracle about existence)
+```
+
+### 10.9 Proration preview for plan change
+
+```
+function previewChange(sub, newVersion, timing, now):
+  if timing == 'next_renewal': return {chargeNow:0, creditNow:0, effectiveAt: sub.nextBillingAt, entitlementDiff: diff(old,new)}
+  p = currentPeriod(sub)
+  frac = units(now, p.end) / units(p.start, p.end)              // days or seconds per settings
+  paid = p.amount.subtotalCents - p.amount.discountCents         // pre-tax paid for this period
+  consumedList = Σ listValue of consumed+firm reservations in p's windows
+  usedTimeValue = paid - floor(paid * frac)
+  credit = max(0, floor(paid * frac) - max(0, consumedList - usedTimeValue))
+  newPortion = roundHalfEven(effectivePrice(newVersion, sub) * frac)
+  delta = newPortion - credit
+  return { chargeNow: max(0, delta), creditToAccount: max(0, -delta),
+           tax: tax(delta>0 ? delta : 0),
+           entitlementDiff: grantDiff(newVersion, consumedThisWindow(sub)),   // §5.4.3
+           repricedJobs: simulateCoverage(sub, newVersion),
+           hash: hash(sub.version, newVersion.id, now truncated to minute, amounts) }
+```
+
+### 10.10 Dunning scheduler
+
+```
+function startOrContinueDunning(sub, period, attempt, res, needsAuth=false):
+  if attempt == 0: sub.status='past_due'; sub.dunning={attempt:0, startedAt:now}; emit('subscription.subscription.past_due')
+  emit('subscription.payment.failed', {attempt, nextRetryAt, declineCategory: res.category, updateCardUrl})
+  hard = res.category in ('stolen','lost','closed','invalid_account','fraud') or needsAuth
+  next = settings.dunning.scheduleDays[attempt]        // e.g. [1,3,5,7]
+  if next == null or (hard and settings.hardDeclineStopsRetries):
+     if next == null: scheduleFinalAction(sub, at = startedAt + lastDay + 1)
+     else: sub.dunning.nextAttemptAt = null            // wait for card update; final action still scheduled
+  else:
+     sub.dunning.nextAttemptAt = atLocal(sub.dunning.startedAt + next days, settings.retryLocalTime, customerTz ?? businessTz)
+  insert DunningAttempt{…}
+
+function dunningRunDue(now):
+  for sub in Subscription where status=='past_due' and dunning.nextAttemptAt <= now (sharded, locked):
+     res = payments.chargeOffSession({…, idempotencyKey: period.idempotencyKey+":"+(attempt+1)})
+     onChargeResult(sub.id, period.id, attempt+1, res)
+  for sub where status=='past_due' and finalActionAt <= now:
+     apply final action (cancel / pause / keep) ; emit('subscription.dunning.exhausted')
+  for sub where status=='past_due' and now - dunning.startedAt >= settings.pastDueJobPolicy.keepDays:
+     apply job policy once (hold → ask 03 to put unpaid-period occurrences on hold; charge_as_regular → remove funding, reprice)
+```
+
+### 10.11 Upsell ranking
+
+```
+function upsellCandidates(cart, customer, zone, channel):
+  pkgs = published packages where upsellDuringBooking and zone allowed and customerType ok and not at maxActiveSubscribers
+  pkgs = pkgs minus packages the customer already holds (non-terminal)
+  pkgs = pkgs.filter(p => p.upsellTriggerServiceIds.empty ? overlaps(p.entitlements ∪ p.memberDiscounts scopes, cart) : intersects(trigger, cart))
+  for p in pkgs:
+     regular = evaluate(cart, no membership).total
+     member  = evaluate(cart, assumeMembership=p.currentVersion).total
+     firstCharge = quote(p).firstChargeCents
+     p.score = (regular - member)            // savings on this booking
+     p.netToday = member + firstCharge - regular   // what it costs the customer today vs not joining
+  return top 1 (booking widget) or top 3 (CRM) by score desc, tie → lower price
+```

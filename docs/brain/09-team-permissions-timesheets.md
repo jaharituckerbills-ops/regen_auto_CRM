@@ -1880,3 +1880,475 @@ access to this module beyond `team.eligibleWorkers`-derived public worker list (
 "choose your pro", if business enables it).
 
 ---
+## 9. Interfaces with other modules
+
+### 9.0 Event naming reconciliation (read first)
+
+Sections 4–6 of this file were drafted with `team.member.*` names. Agents 02, 03, 07 and 08 already
+consume **`team.worker.*`**, and Agent 08's notification catalog uses `timesheet.timesheet.*`. To minimise
+churn, the **canonical names below follow the majority usage**; earlier names in this file are aliases
+(Agent 10 to ratify):
+
+| Canonical (produce these) | Alias used earlier in this file | Also seen in |
+|---|---|---|
+| `team.worker.invited` | `team.member.invited` | 08 |
+| `team.worker.activated` | `team.member.activated` | 08 |
+| `team.worker.created` | (create of draft/invited) | 02, 03 |
+| `team.worker.updated` | `team.member.updated` | 03 |
+| `team.worker.zones_changed` | `team.member.zones_changed` | 03 |
+| `team.worker.services_changed` / `team.worker.skills_changed` (same event; 02 alias) | `team.member.services_changed` | 02, 03 |
+| `team.worker.role_changed` | `team.member.role_changed` | — |
+| `team.worker.permissions_changed` | `team.member.permissions_changed` | — |
+| `team.worker.deactivated` | `team.member.deactivated` | 02, 03, 07, 08 |
+| `team.worker.reactivated` | `team.member.reactivated` | — |
+| `team.worker.anonymized` | `team.member.anonymized` | — |
+| `team.availability.updated` | `team.availability.changed` | 03 |
+| `team.timeoff.created` (requested or admin-created) / `.updated` (approved/denied/cancelled, payload has `status`) / `.deleted` | `team.timeoff.requested/approved/denied/cancelled` | 03 |
+| `team.calendar_sync.busy_updated` | (pull of external busy) | 03 |
+| `team.calendar_sync.connected` / `.failed` / `.disconnected` | `team.calendar.connected/sync_failed` | — |
+| `timesheet.entry.started` / `.stopped` / `.submitted` / `.approved` / `.rejected` / `.paid` / `.edited` / `.voided` / `.auto_closed` | — | 08 uses `timesheet.timesheet.submitted/approved/rejected/paid` → alias |
+| `timesheet.entry.open_too_long` | (forgotten clock-out reminder trigger, 4.20) | 08 `timesheet.punch.open_too_long` → alias |
+| `timesheet.compensation.activated` | — | 08 `team.pay_rate.effective` → alias |
+| `team.location.pinged` | — | 03 expects it; **owned by 04** (on-my-way / live tracking) — 09 only supplies consent & membership; see Q8 |
+
+Permission keys: each module **owns the key names in its namespace** (02 `catalog.*`/`coverage.*`, 04
+`job.*`/`wa.*`, 05 `payments.*`, 06 `subs.*`/`discounts.*`/`giftcards.*`, 07 `customers.*`/`leads.*`/
+`assets.*`, 08 `comms.*`/`marketing.*`/`reports.*`/`inbox.*`/`chat.*`, 01 `branding.domain.*`/portal). 09
+owns the **engine, the role presets and the defaults matrix**. Where section 2.4 used a different spelling
+for a key declared by another module, the other module's spelling wins; mapping examples:
+
+| 2.4 row (this file) | Canonical key (owning module) |
+|---|---|
+| `transactions.view` O/C/A | `payments.view.own|crew|all` (05) |
+| `payments.refund` A* | `payments.refund` + limit `max_refund_minor` (05); `payments.refund.limited` for Manager |
+| `payments.charge_card_on_file:own` | `payments.collect.assigned` (05) |
+| `payments.discount.apply` (limit) | `payments.discount.apply` + `max_discount_bp` (05); `discounts.manual.max_pct/max_cents` (06) |
+| `settings.catalog.view_cost` | `catalog.read_cost` (02) / `job.cost.view` (04) |
+| `settings.catalog.manage` | `catalog.edit_draft`, `catalog.publish`, `catalog.archive_delete` (02) |
+| `settings.coverage.manage` | `coverage.edit`, `coverage.edit_fees_tax`, `coverage.assign_staff` (02) |
+| `jobs.override_service_area` | `coverage.override_out_of_area` (02) |
+| `jobs.create_in_past` | `scheduling.past` (03) |
+| `calendar.view_unassigned` / jobs all in app | `wa.jobs.view_all` (04) |
+| "See job prices" (2.6) | `wa.prices.view` (04); `wa.prices.edit`, `job.price.adjust` (04) |
+| `customers.delete_merge` | `customers.merge`, `customers.erase`, `customers.archive` (07) |
+| `leads.view/manage` | `leads.view_own|view_all|create|edit|assign|delete` (07) |
+| `marketing.campaigns.manage` | `marketing.campaign.create|send`, `marketing.drip.manage` (08) |
+| `reports.view` | `reports.view_financial` / `reports.view_operational` (08) |
+| `inbox.customer_chat` / `inbox.team_chat` | `inbox.view_all|view_assigned|reply`, `chat.team.participate|create_group` (08) |
+| `subscriptions.sell/manage` | `subs.subscription.create|edit|pause|cancel`, `subs.package.*` (06) |
+| `giftcards.issue` | `giftcards.issue` + `giftcards.issue.max_cents` (06) |
+
+Role-preset defaults for keys declared by other modules: 09 applies **the owning module's proposed
+defaults** (02 §2.1, 05 §2, 06 §2, 07 §7.12, 08 §2) and fills Operator = Owner minus owner-only keys,
+Estimator = Worker + quote/lead/customer-create keys, Bookkeeper = read financial + export keys.
+Disagreements between those defaults and 2.4 above are listed for Agent 10 in Q1.
+
+### 9.1 Agent 01 — Booking portal & subdomain (and branding)
+CONSUMES from 09:
+- `team.publicWorkerCards(businessId)` → `{membershipId, firstName, photoUrl, rating?}` for "choose
+  your pro" / live tracking page (first name + photo only; vehicle from 9.3) `[I]`.
+- `onlineBookable` flag per worker (exclude from customer selection, still dispatchable).
+- Branding permission keys (6.10) and `user.preferences.theme` for staff.
+PRODUCES for 09: nothing required. **Identity separation**: customer accounts (01/07) are a different
+principal pool; one email can be both a customer of business X and a staff user — they never share
+sessions or credentials `[I]`.
+
+### 9.2 Agent 02 — Catalog & coverage (allowed services, zones, shops)
+Contract:
+- **Zone/shop assignment joins are owned by 02** (`WorkerZoneAssignment`, `WorkerShopAssignment`);
+  09's worker profile calls `coverage.setWorkerZones{workerId, zoneIds, shopIds}` and reads
+  `coverage.zonesForWorker`. The zone editor's post-save "add staff to this zone?" prompt `[S: T11]` calls
+  the same command from 02's UI. Both UIs show the same data.
+- **Service skills are owned by 09** (`MemberServiceSkill`, `allServices`). 02 queries
+  `team.eligibleWorkers{serviceIds}` to warn "No worker can perform this service yet".
+- 02 `catalog.service.created` → if member `allServices=true` nothing to do; else no auto-grant (owner
+  chooses) — except duplicates: if created with `duplicatedFromId` and 02's "copy worker assignments" is
+  checked, 09 copies skills from the source service.
+- 02 `catalog.service.archived{serviceId, replacementServiceId?}` → 09 keeps the skill row (history),
+  and if `replacementServiceId` given, grants it to the same members. `catalog.service.deleted` (draft
+  only) → delete skill rows.
+- 02 `coverage.zone.archived` / `coverage.shop.archived` → 09 clears `primaryZoneId` if pointing to it,
+  re-evaluates availability "location by day" rules, emits `team.worker.zones_changed`.
+- 02 `coverage.zone.staff_assigned/_unassigned`, `coverage.shop.staff_assigned/_unassigned` → 09
+  refreshes profile caches and emits `team.worker.zones_changed` (single source for 03).
+
+### 9.3 Agent 03 — Scheduling & dispatch (availability for dispatch)
+09 PROVIDES (read models, versioned; shapes exactly as 03 §7 defines):
+- `WorkerScheduleProfile` = projection of `Membership` (`active` ⇐ status=`active` (or `invited` when
+  setting allows), `receivesJobs` ⇐ `isDispatchable`, `onlineBookable`, `tz`, `calendarColor`,
+  `zoneIds/shopIds` (from 02), `serviceIds|'all'`, `startLocation`, `maxJobsPerDay`, `version`).
+- `AvailabilityRule[]` (flattened from `AvailabilityTemplate.rules`, overnight = end < start),
+  `AvailabilityOverride[]`, `TimeOff[]` (only `approved` → `hard=true`; `requested` → `hard=false`,
+  warn only), `ExternalBusy[]` (calendar sync).
+- Fleet vehicles & default `VehicleAssignment` → 03 stamps "the vehicle on every job" `[S: llms]`
+  (ownership of `FleetVehicle` to be confirmed with 03 — Q7).
+- Events: `team.worker.created/updated/deactivated/reactivated`, `team.worker.zones_changed`,
+  `team.worker.services_changed`, `team.availability.updated{workerId, effectiveFrom, range}`,
+  `team.timeoff.created/updated/deleted`, `team.calendar_sync.busy_updated{workerId, ranges}`.
+- `team.worker.deactivated` payload includes `{effectiveAt, reassignment: 'auto'|'unassigned'|
+  {toWorkerId}, notifyCustomers}` → 03 executes and emits `scheduling.assignment.changed` per job.
+09 CONSUMES from 03:
+- `scheduling.assignment.created/.removed/.changed`, `scheduling.job.scheduled/.rescheduled/.unscheduled`
+  → Google Calendar push for the affected worker (4.15); forgotten-clock-out heuristics (scheduled end).
+- `scheduling.job.scheduled{isBackdated=true}` → no calendar push; timesheet: no effect (back-dated jobs
+  don't create time).
+- `routing.route.started{workerId}` → if worker not clocked in and timesheets on → push "Clock in?"
+  (one tap) `[I]`; `routing.route.completed` → forgotten-clock-out reminder baseline.
+- `team.previewDeactivation` calls 03 `scheduling.futureAssignments{workerId, from}` (query) for the
+  impact wizard.
+Guarantee: 09 never blocks a 03 read on external calls (calendar busy blocks are pre-synced, not fetched
+at query time).
+
+### 9.4 Agent 04 — Job lifecycle (who performs jobs, job time)
+09 PROVIDES: permission keys/defaults for `wa.*` and `job.*` (04 declares); worker display name, photo,
+work phone for the job card and customer messages; `timesheet.current{workerId}` (is clocked in?) so the
+job flow can prompt "Clock in?" (04 only prompts — `[S: T03]` context, 04 §W).
+09 CONSUMES:
+- `jobs.visit.started` / `job.job.started` and `jobs.job.completed` / `job.job.completed` `{jobId,
+  workerIds, at}` → `JobTimeLink` on the open TimeEntry (4.26) and "last job completed" for forgotten-
+  clock-out reminders.
+- `jobs.job.cancelled` → remove pushed Google event (also via 03 events).
+- `jobs.lineitem.added{addedByWorkerId}` → (future) commission attribution; v1 stored for reports only.
+- Quote preferred worker / estimator `[S: T04]`: 04 validates `preferredWorkerId` is an active member
+  via `team.get`; on `team.worker.deactivated` 04 clears preferred worker on open quotes.
+Who performs a job: 03 owns `JobAssignment` (worker ids, line split, lead worker); 09 only validates
+eligibility (`team.eligibleWorkers`) and permission (`jobs.assign` in scope).
+
+### 9.5 Agent 05 — Payments (revenue attribution, tips to workers)
+- **Revenue attribution** `[S: T17]` worker summary, `[S: llms]` split jobs: 05 splits each payment's
+  revenue among assigned workers by `share_bp`. Shares live on 03's `JobAssignment` (set when splitting
+  a job); **09 provides the default share rule** as a business setting `revenueShareDefault: 'equal' |
+  'lead_weighted' | 'by_line_duration'` (default `equal`) and per-member `excludeFromRevenueAttribution`
+  (e.g., trainee ride-alongs) `[I]`. 05 calls `team.revenueShareRule(businessId)`.
+- **Tips** `[I]`: 05 owns the tip ledger (`tips_payable:{worker}`) and allocation; 09 consumes
+  `payments.tip.added{jobId, allocations[{workerId, cents}]}` only to show "tips this period" on
+  timesheet period summaries and payroll export; 09 calls `tipsPayable(workerId, periodStart, periodEnd)`
+  at export time (pull, so refunds/voids are reflected). 09 never moves money.
+- **Cash on hand**: on deactivation preview 09 calls 05 `payments.cashOnHand{workerId}`; 05 emits
+  `payments.cash.outstanding_on_deactivation` and 09 shows it in the wizard (blocking warning, not
+  blocking action).
+- **Labor cost**: 09 exposes `timesheet.laborCost{jobIds}` for profit (05/08 reports), complementing
+  service cost `[S: T06, T19]`.
+- Permission keys and limits (`max_refund_minor`, `max_discount_bp`) are evaluated by 09's
+  `authz.check` and returned in `limits`; 05 enforces the amount comparison.
+
+### 9.6 Agent 06 — Subscriptions, discounts, gift cards
+Keys `subs.*`, `discounts.*`, `giftcards.*` with limits registered via manifest. On-site package change
+(native app, 6.9) = `subs.subscription.edit`. No events exchanged beyond `team.worker.deactivated`
+(clear "sold by" defaults on open subscription drafts).
+
+### 9.7 Agent 07 — Customers, leads, assets
+Keys `customers.*`, `leads.*`, `assets.*` registered. 07 consumes `team.worker.deactivated` → reassign
+lead owner per 07 §(lead owner must be active worker). Field masks for customer contact info (2.5) are
+evaluated by 09 `authz` and applied by 07's serializer (`customers.view_all` vs job-linked).
+
+### 9.8 Agent 08 — Marketing, comms, reporting (invites, leaderboard, notifications)
+09 → 08 (notification triggers; 08 owns templates, channels, quiet hours):
+
+| Trigger event | Recipient | 08 id (if known) | Channel default |
+|---|---|---|---|
+| `team.worker.invited` (+ resend) | invitee | — (`team.invite`) | Email `[S: T13]`; SMS optional |
+| `team.invite.expired` | inviter / admins | — | in-app digest |
+| `team.worker.activated` | inviter | — | in-app/push |
+| `team.worker.role_changed` / `permissions_changed` | member | — | in-app + email |
+| `team.worker.deactivated` (`notifyMember`) | member | — | email |
+| `team.timeoff.created` (requested) | approvers | — | in-app/push |
+| `team.timeoff.updated` (approved/denied) | member | — | push |
+| `team.availability.updated` (pending approval) | approvers | — | in-app |
+| `team.calendar_sync.failed` | member (+ admin banner) | — | push + email |
+| `timesheet.entry.submitted` | approvers | A-09 | in-app (+ email digest) `[S: T03]` |
+| `timesheet.entry.approved` / `.rejected` | worker | W-series | push `[S: T03]` |
+| `timesheet.entry.paid` | worker | W-09 | push (off by default) |
+| `timesheet.entry.open_too_long` | worker (then approvers on auto-close) | 08 `timesheet.punch.open_too_long` | push |
+| `timesheet.entry.edited` (by someone else) | worker | — | push |
+| `timesheet.compensation.activated` | admins (+ worker if `compensation.view_own`) | `team.pay_rate.effective` | in-app |
+| `auth.session.created` (new device) | user | — | email (security, cannot be disabled) |
+| `tenant.ownership.transferred` | old + new owner | — | email (security) |
+
+08 → 09:
+- `notification.delivery.failed{templateKey:'team.invite', to}` → `Invite.deliveryStatus='bounced'`.
+- Quiet hours / do-not-disturb for workers: 08 reads 09 availability (off-shift hours) and worker tz.
+- Leaderboard `[S: T09]` & MVP view `[S: llms]`: 08 reads worker list (`team.list`), honours
+  `leaderboard.view` and revenue masks from 09; deactivated workers excluded from current-period
+  rankings, kept historically.
+- Dashboard "team availability" and "who's active right now" `[S: llms]`: 08 tiles read
+  `team.activeNow` and materialized availability.
+- Team group chats `[S: llms]`: 08 consumes `team.worker.activated/deactivated` to add/remove chat
+  membership; crew changes → crew chat sync (optional).
+- Reports needing labor: `timesheet.laborCost`, `timesheet.periodSummary`.
+
+### 9.9 Agent 10 — integrator
+09 hands over: the permission-key manifest format (`authz.registerKeys`), canonical event names (9.0),
+the principal model (User / Membership / ApiCredential / Customer separate), session surfaces (6.9.1),
+and the request to name a single owner for the brand kit (6.10) and for `FleetVehicle` (Q7).
+
+### 9.10 Events produced — payloads
+
+| Event | Payload (beyond `{eventId, businessId, occurredAt, actor}`) | Consumers |
+|---|---|---|
+| `tenant.business.created` | `{ownerWorkerId, timezone, country, currency, plan}` | 02 (default zone from signup city `[S: T11]`), 08, 10 |
+| `tenant.business.plan_changed` | `{from, to, seatsIncluded}` | all (entitlement caches) |
+| `tenant.ownership.transferred` | `{fromWorkerId, toWorkerId}` | 05 (processor account owner contact), 08 |
+| `tenant.seat.limit_reached` | `{used, included}` | 08 (owner alert) |
+| `team.worker.created` | `{workerId, status, roleKey, zoneIds, shopIds, allServices, serviceIds}` | 02, 03 |
+| `team.worker.invited` | `{workerId, inviteId, channel, sentTo(masked), expiresAt}` | 08 |
+| `team.invite.expired` / `.revoked` / `.bounced` | `{workerId, inviteId}` | 08 |
+| `team.worker.activated` | `{workerId, userId}` | 03, 08 |
+| `team.worker.updated` | `{workerId, changedFields[], version}` | 03, 01 |
+| `team.worker.zones_changed` | `{workerId, zoneIds, shopIds, primaryZoneId}` | 03 |
+| `team.worker.services_changed` | `{workerId, allServices, added[], removed[]}` | 03, 02 |
+| `team.worker.role_changed` | `{workerId, fromRole, toRole}` | 08, audit |
+| `team.worker.permissions_changed` | `{workerId, permsVersion, added[], removed[]}` | all (cache), 08 |
+| `team.worker.deactivated` | `{workerId, effectiveAt, reason, reassignment, notifyCustomers}` | 02, 03, 04, 05, 07, 08 |
+| `team.worker.reactivated` | `{workerId}` | 03, 08 |
+| `team.worker.anonymized` | `{workerId}` | 08 (reports label), 05 |
+| `team.availability.updated` | `{workerId, effectiveFrom, range:[from,to], kind:'template'|'override'}` | 03, 01 (slot cache) |
+| `team.timeoff.created` / `.updated` / `.deleted` | `{timeOffId, workerId, start, end, status, hard}` | 03, 08 |
+| `team.calendar_sync.busy_updated` | `{workerId, ranges[]}` | 03 |
+| `team.calendar_sync.connected` / `.failed` / `.disconnected` | `{workerId, provider, error?}` | 08 |
+| `team.vehicle.assigned` | `{vehicleId, workerId|crewId, from, to?}` | 03 |
+| `timesheet.settings.changed` | `{enabled, changedFields[]}` | 04 (prompt clock-in), 08 |
+| `timesheet.entry.started` | `{entryId, workerId, startAt, geofenceResult, offline}` | 08 (dashboard active-now), 04 |
+| `timesheet.break.started` / `.ended` | `{entryId, workerId, paid, at}` | 08 (active-now) |
+| `timesheet.entry.stopped` | `{entryId, workerId, endAt, totals}` | 08 |
+| `timesheet.entry.submitted` | `{entryId, workerId, workday, payableMs, flags}` | 08 (A-09) |
+| `timesheet.entry.approved` / `.rejected` / `.paid` / `.voided` / `.unapproved` | `{entryId, workerId, by, reason?}` | 08, 05 (labor cost, optional) |
+| `timesheet.entry.edited` | `{entryId, workerId, by, reason, revision}` | 08 |
+| `timesheet.entry.auto_closed` | `{entryId, workerId, endAt, suggestedEndAt?}` | 08 |
+| `timesheet.entry.open_too_long` | `{entryId, workerId, openSince, reminderNo}` | 08 |
+| `timesheet.compensation.scheduled` / `.activated` | `{rateId, workerId, effectiveDate}` (no amount in event — PII/pay privacy) | 08 |
+| `timesheet.payroll.exported` | `{exportId, periodStart, periodEnd, memberCount, markedPaid}` | 08, audit |
+| `auth.session.created` / `.revoked` / `.reuse_detected` | `{userId, deviceKind, surface}` | 08 (security mail) |
+
+### 9.11 Events consumed — summary
+
+| Event | From | 09 reaction |
+|---|---|---|
+| `catalog.service.created/archived/deleted` | 02 | skills maintenance (9.2) |
+| `coverage.zone.*`, `coverage.shop.*`, `*.staff_assigned/_unassigned` | 02 | profile caches, `team.worker.zones_changed` |
+| `scheduling.assignment.*`, `scheduling.job.*` | 03 | calendar push; reminder baselines |
+| `routing.route.started/completed` | 03 | clock-in prompt; reminder baseline |
+| `job.job.started/completed`, `jobs.visit.started`, `jobs.job.completed/cancelled` | 04 | JobTimeLink; reminders; calendar delete |
+| `payments.tip.added`, `payments.cash.outstanding_on_deactivation` | 05 | period summaries; deactivation wizard |
+| `notification.delivery.failed` | 08 | invite bounce |
+| `portal.config.published` / branding publish | 01 | none (audit only) |
+
+---
+
+## 10. Algorithms / pseudo-code
+
+### 10.1 Permission check
+```ts
+function check(principal, key, resource?): Decision {
+  const m = loadMembership(principal.membershipId)          // cached by (id, permsVersion)
+  if (!m || m.status !== 'active') return deny('membership_inactive')
+  if (business(m).status === 'suspended' && isMutation(key) && !GRACE_KEYS.has(key)) return deny('suspended')
+  if (!surfaceAllowed(m, principal.surface)) return deny('surface')
+  if (!entitled(business(m).plan, featureOf(key))) return deny('plan')
+  const grants = effective(m)                                // preset ∪ grants − revokes (2.3)
+  const g = grants.get(key); if (!g) return deny('missing_key')
+  if (principal.kind === 'api_key' || principal.kind === 'mcp') {
+    if (!principal.scopes.includes(key) || HUMAN_ONLY.has(key)) return deny('credential_scope')
+  }
+  if (!resource) return allow(g.scope, g.limits)
+  if (SELF_FORBIDDEN.has(key) && resource.subjectWorkerId === m.id && !soloOwner(m)) return deny('self_action')
+  if (resource.subjectRank !== undefined && resource.subjectRank >= m.rank && key in RANK_GUARDED) return deny('rank')
+  switch (g.scope ?? 'all') {
+    case 'all':  return allow('all', g.limits)
+    case 'zone': if (inZones(m, resource) || inCrew(m, resource) || isOwn(m, resource)) return allow('zone', g.limits); break
+    case 'crew': if (inCrew(m, resource) || isOwn(m, resource)) return allow('crew', g.limits); break
+    case 'own':  if (isOwn(m, resource)) return allow('own', g.limits); break
+  }
+  return deny('out_of_scope')
+}
+// SELF_FORBIDDEN = { timesheets.approve_reject, timesheets.mark_paid, compensation.edit, team.deactivate, team.setRole }
+// HUMAN_ONLY = { payroll.export, tenant.ownership.transfer, settings.api_mcp.manage, team.permissions.manage, tenant.plan_billing.manage }
+```
+Scope inheritance: when a manager holds `:zone` and also is a crew lead, both checks apply (union).
+Every decision with `deny` on a mutation is logged (rate-limited) for security analytics.
+
+### 10.2 Escalation guard (granting permissions)
+```ts
+function canGrant(actor, target, newGrants): Result {
+  if (target.roleKey === 'owner') return fail('owner_immutable')
+  if (rank(actor) <= rank(target) && actor.id !== target.id) return fail('rank')
+  if (rankOfRole(newRoleId) >= rank(actor)) return fail('role_too_high')
+  const bad = newGrants.filter(g => !actorHolds(actor, g.key, g.scope, g.limits))   // scope ⊆, limits ≤
+  return bad.length ? fail('escalation', bad) : ok()
+}
+```
+Limit comparison: a grant's numeric limit must be ≤ actor's own limit for that key (e.g., refund cap).
+
+### 10.3 Entry totals & effective rate
+```ts
+function computeEntry(e, settings, rates): EntryTotals & Pay {
+  const segs = clipToEntry(e.segments, e.startAt, e.endAt)              // ensure inside
+  let work = sum(segs.filter(s => s.kind==='work'))
+  let paidB = sum(segs.filter(s => s.kind==='break' && s.paid))
+  let unpaidB = sum(segs.filter(s => s.kind==='break' && !s.paid))
+  const excess = Math.max(0, paidB - settings.maxPaidBreakMinPerShift*60_000)
+  paidB -= excess; unpaidB += excess
+  let autoDeduct = 0
+  if (settings.autoDeductMeal && unpaidB === 0 && work+paidB > settings.autoDeductMeal.afterHours*3_600_000)
+    autoDeduct = settings.autoDeductMeal.minutes*60_000
+  const payable = work + (settings.paidBreaksCountAsWorked ? paidB : 0) - autoDeduct
+  assert(e.endAt - e.startAt === work + paidB + unpaidB)   // span invariant (excess only moved between break buckets)
+  const rate = e.rateOverrideCents ?? rateFor(e.membershipId, e.workday, rates)  // 5.4
+  return { workMs: work, paidBreakMs: paidB, unpaidBreakMs: unpaidB + autoDeduct, payableMs: payable, rate }
+}
+```
+
+### 10.4 Overtime allocation (per member, per workweek)
+```ts
+function allocateOvertime(entries /* non-voided, same member, overlapping workweek W */, policy) {
+  // 1. Build chronological "payable time slices" in instants, split at workweek boundaries;
+  //    only the slices inside W are allocated here.
+  const slices = entries.flatMap(e => payableSlices(e)).filter(inWeek(W)).sort(byStart)
+  const byDay = groupBy(slices, s => s.entry.workday)          // daily rules use workday attribution
+  let weekRegular = 0
+  const consecutiveDay = consecutiveWorkdayIndex(byDay)        // for 7th-day rule
+  for (const day of sortedDays(byDay)) {
+    let dayTotal = 0
+    for (const s of byDay[day]) {
+      let ms = s.ms
+      while (ms > 0) {
+        let bucket: 'regular'|'ot'|'dt' = 'regular'
+        let cap = Infinity
+        if (policy.seventhDayRule && consecutiveDay[day] === 7) {
+          bucket = dayTotal < 8*H ? 'ot' : 'dt'; cap = dayTotal < 8*H ? 8*H - dayTotal : Infinity
+        } else if (policy.dailyDtAfterMin && dayTotal >= policy.dailyDtAfterMin*M) { bucket = 'dt' }
+        else if (policy.dailyOtAfterMin && dayTotal >= policy.dailyOtAfterMin*M) {
+          bucket = 'ot'; cap = policy.dailyDtAfterMin ? policy.dailyDtAfterMin*M - dayTotal : Infinity }
+        else {
+          const dailyCap = policy.dailyOtAfterMin ? policy.dailyOtAfterMin*M - dayTotal : Infinity
+          const weeklyCap = policy.weeklyOtAfterMin ? policy.weeklyOtAfterMin*M - weekRegular : Infinity
+          if (weeklyCap <= 0) { bucket = 'ot'; cap = dailyCap }          // weekly OT (no pyramiding:
+          else { bucket = 'regular'; cap = Math.min(dailyCap, weeklyCap) } // only regular hours count toward 40)
+        }
+        const take = Math.min(ms, cap)
+        s.entry.alloc[bucket] += take; ms -= take; dayTotal += take
+        if (bucket === 'regular') weekRegular += take
+      }
+    }
+  }
+  // 2. Persist alloc per entry; recompute pay per bucket (5.7); skip entries with status 'paid'
+  //    (their stored alloc is authoritative; differences → adjustment entry suggestion).
+}
+```
+`otExempt` members: all `regular`. Performance: ≤ ~30 entries/member/week → trivial; recompute triggered
+by any create/edit/void in that member's week (debounced 2 s, single-flight per member-week).
+
+### 10.5 Rounding
+```ts
+function roundInstant(t: Instant, n: number, tz: IanaTz): Instant {
+  if (!n) return t
+  const local = toLocal(t, tz); const minutes = local.hour*60 + local.minute + local.second/60
+  const r = Math.floor(minutes / n + 0.5) * n                   // half up
+  return fromLocalSameDay(local.date, r, tz)                    // DST: resolve via instant arithmetic
+}
+// startAt = roundInstant(rawStartAt); endAt = roundInstant(rawEndAt); if (endAt <= startAt) no rounding.
+```
+
+### 10.6 Offline clock event application
+```ts
+function applyClockBatch(memberId, events: ClockEvent[]) {
+  for (const ev of sortBy(events, ['bootId', 'monotonicMs'])) {
+    if (exists(ev.id)) { results.push(alreadyApplied(ev.id)); continue }        // idempotent
+    ev.trustedTime = trust(ev)                                                   // 4.19 offset logic
+    if (ev.trustedTime < now() - 7*DAY) { reject(ev, 'too_old'); continue }
+    if (ev.trustedTime > now() + 2*MIN) ev.trustedTime = now()                   // future clamp + flag clock_skew
+    const open = openEntry(memberId)
+    switch (ev.type) {
+      case 'clock_in':
+        if (open) { reject(ev, 'already_clocked_in'); continue }                 // client re-syncs state
+        if (overlapsExisting(memberId, ev.trustedTime)) { flag='overlap' }       // e.g. admin added entry
+        geofence(ev); createEntry(ev); break
+      case 'break_start': requireState(open, 'working'); openBreak(open, ev); break
+      case 'break_end':   requireState(open, 'on_break'); closeBreak(open, ev); break
+      case 'clock_out':   if (!open) { reject(ev, 'no_open_entry'); continue }   // e.g. auto-closed meanwhile
+                          if (open.flags.includes('auto_closed')) { proposeCorrection(open, ev); continue }
+                          closeEntry(open, ev); break
+    }
+  }
+  return { applied, rejected, currentState: stateOf(memberId), serverTime: now() }
+}
+```
+If a late real `clock_out` arrives after an auto-close, we **don't** silently overwrite; we attach it as a
+suggested correction the approver can accept in one click (`proposeCorrection`).
+
+### 10.7 Forgotten clock-out scheduler
+```
+every 5 min: for each open entry (in_progress) in businesses with timesheets on:
+  baseline = max(lastJobCompletedAt(member, today), scheduledEnd(member, today)) ?? startAt + 8h
+  if now ≥ baseline + remindAfterMin and reminders == 0 → emit timesheet.entry.open_too_long (1)
+  if now ≥ baseline + secondRemindAfterMin and reminders == 1 → emit (2)
+  if now ≥ startAt + maxShiftHours → auto close at startAt + maxShiftHours (close open break at same
+     instant), status submitted, flags += auto_closed, suggestedEndAt = baseline, emit auto_closed
+```
+Uses a durable job queue keyed by entryId (exactly-once effect via state check inside the transaction).
+
+### 10.8 Invite token
+```
+token = base64url(random 32 bytes); store sha256(token); URL carries token.
+accept: lookup by sha256(token) → constant-time compare; check status pending & not expired & membership invited;
+        require user session whose verified email/phone == invite.sentTo (or verify now via OTP);
+        transaction: membership.active, invite.accepted, user.active; emit events (outbox).
+```
+
+### 10.9 Seat counting (race-safe)
+```
+in a transaction with row lock on Business:
+  used = count(Membership where status in ('invited','active') and roleKey != 'bookkeeper')
+  if used + 1 > planSeatsIncluded and !overageAllowed → SEAT_LIMIT
+  else insert membership; if over included → record billable seat (prorated) and notify owner
+```
+
+### 10.10 Availability materialization (what 03 sees, also used for "next 14 days" preview)
+```ts
+function materialize(member, from: LocalDate, to: LocalDate): Interval[] {
+  const out = []
+  for (const d of dates(from, to)) {
+    const tpl = templateEffectiveOn(member, d)                       // active version
+    const override = overrideFor(member, d)
+    let local = override ? override.intervals : tpl.rules.filter(r => r.weekday === weekday(d))
+    let iv = local.map(r => toInstants(d, r.start, r.end, tpl.tz))   // end<start → +1 day; DST-safe
+    iv = subtract(iv, approvedTimeOff(member, d))
+    iv = subtract(iv, externalBusy(member, d))
+    out.push(...iv)
+  }
+  return mergeAdjacent(out)
+}
+```
+03 additionally subtracts its own busy ledger (jobs, travel, buffers) and applies `maxJobsPerDay`.
+
+### 10.11 Geofence evaluation
+```
+allowedPlaces = (shops if 'shops') ∪ (job sites of member's jobs today if 'job_sites_today')
+                ∪ (zone polygons if 'assigned_zones')
+if no location (permission denied/timeout 10 s) → result 'unknown'; mode 'block' → allow with flag (never strand a worker) [I]
+inside = any(place: distance(loc, place) ≤ radiusM + min(loc.accuracyM, 100)) or pointInPolygon(zone)
+mode 'record' → store; 'warn' → worker sees warning + reason field; 'block' → reject clock_in unless
+  worker taps "Request override" → entry created with flag outside_geofence + pending override.
+```
+
+### 10.12 Payroll export
+```
+entries = approved (+paid if included) in [periodStart, periodEnd] by workday
+recompute OT for each affected week (read-only for paid)
+per member: sum buckets; pay per 5.7; tips = 05.tipsPayable(member, period)
+flag members with >1 rate in a workweek → blended_rate_required
+render CSV (5.8) with decimal strings from integer cents; store file; optional markPaid in same txn
+```
+
+### 10.13 Google Calendar push (idempotent)
+```
+on assignment change for worker w and job j:
+  if no active connection or !pushJobs → return
+  link = ExternalEventLink(conn, j)
+  if job no longer assigned to w or cancelled → if link: delete event (404 ok) → delete link
+  else body = maskedEventBody(j); if link: patch(if-match etag) else insert(extendedProperties.private.jobId=j)
+  on 412/409 → refetch & retry once; on 401 → connection.status=error, emit failed
+  version guard: skip if link.lastPushedVersion ≥ job.version
+```
+
+---

@@ -1603,3 +1603,552 @@ Budget controls:
   follows up.
 - **Masked customer↔worker messaging:** Agent 09 requests a relay (09 contact-visibility rule);
   08 provides it via the business number (4.14, 7.5).
+
+---
+
+## 6. State machines
+All transitions are `[I]` designs. Each machine persists `state`, `state_changed_at` and a `version`
+(optimistic concurrency). Every transition appends to an audit trail.
+
+### 6.1 OutboundMessage
+| State | Event | Guard | Next | Side effects |
+|---|---|---|---|---|
+| — | `intent.created` | idempotency key not already present | `pending` | Row inserted; key unique index |
+| `pending` | `eligibility.checked` | consent and suppression OK | `ready` | — |
+| `pending` | `eligibility.checked` | blocked (no consent, opted out, suppressed, invalid endpoint, landline for SMS) | `suppressed` | `comms.message.suppressed{reason}`; fallback channel intent if the entry allows one |
+| `ready` | `quiet_hours.checked` | outside allowed window | `deferred` | `not_before = next_allowed()`; timer |
+| `ready` / `deferred` | `frequency.checked` | cap exceeded (marketing) | `deferred` (drip) / `suppressed` (broadcast) | Reason `frequency_cap` |
+| `deferred` | `timer.fired` | still eligible (re-check consent) | `ready` | — |
+| `ready` | `render.ok` | — | `rendered` | Body, subject and variables snapshot stored; `brand_theme_version` |
+| `ready` | `render.failed` | required variable missing / template error | `failed` | `comms.message.failed{render}`; owner alert if systemic (>5 in 10 min) |
+| `rendered` | `provider.accepted` | — | `sent` | `provider_message_id`; cost estimate; `comms.message.sent` |
+| `rendered` | `provider.error` | retryable (5xx, timeout, 429) and attempts < 5 | `rendered` (retry with backoff) | Same provider idempotency key |
+| `rendered` | `provider.error` | permanent (invalid number, unsubscribed at provider, content rejected) | `failed` | Fallback if allowed |
+| `sent` | `dlr.delivered` / email `delivered` | — | `delivered` | Cost finalized (segments) |
+| `sent` | `dlr.undelivered` / `bounce.hard` | — | `failed` | Suppression add (hard bounce, invalid number); fallback |
+| `sent` | `bounce.soft` | — | `sent` (soft count++) | After 3 soft bounces in 7 days → suppression for 30 days |
+| `delivered` | `email.complaint` | — | `delivered` (+flag) | Marketing revoke; global complaint suppression |
+| `pending` … `deferred` | `subject.canceled` (job canceled, version superseded) | — | `canceled` | — |
+| `sent` | no DLR within 72h | — | `sent_unconfirmed` | Treated as delivered for metrics with a flag |
+
+Engagement events (`opened`, `clicked`, `replied`, `unsubscribed`) are stored as `MessageEvent`
+rows. They are **not** states.
+
+### 6.2 ScheduledNotification (durable timer for catalog entries)
+| State | Event | Guard | Next | Side effects |
+|---|---|---|---|---|
+| — | `schedule` | — | `scheduled` | `due_at`, `subject_version` |
+| `scheduled` | `reschedule` (subject changed) | — | `scheduled` | `due_at` and `subject_version` updated in place (upsert by `(catalog_id, subject_id, recipient_id, slot)`) |
+| `scheduled` | `cancel` | — | `canceled` | — |
+| `scheduled` | `due` | `subject_version` equals the live version and guards pass | `dispatched` | Creates an OutboundMessage intent |
+| `scheduled` | `due` | version mismatch or subject state invalid | `skipped` | Reason logged |
+| `dispatched` | — | — | terminal | — |
+
+### 6.3 Campaign
+| State | Event | Guard | Next | Side effects |
+|---|---|---|---|---|
+| `draft` | `schedule` | compliance checklist green and user has `marketing.campaign.send` | `scheduled` | `marketing.campaign.scheduled` |
+| `draft` | `send_now` | same | `sending` | Audience snapshot |
+| `scheduled` | `time.reached` | sender still verified | `sending` | Snapshot audience |
+| `scheduled` | `time.reached` | sender not verified / budget exhausted | `blocked` | A-17 |
+| `scheduled` | `cancel` | — | `canceled` | — |
+| `scheduled` / `blocked` | `edit` | — | `draft` | — |
+| `sending` | `pause` | — | `paused` | Stop dequeue |
+| `paused` | `resume` | quiet-hours recomputed | `sending` | — |
+| `sending` / `paused` | `cancel` | — | `canceled` | Remaining recipients become `canceled` |
+| `sending` | `all_recipients_terminal` | — | `sent` | `marketing.campaign.completed` |
+| `sending` | `failure_rate > 20%` over the first 200 sends or `complaint_rate > 0.3%` | — | `paused_by_system` | A-15 / A-17; manual review |
+| `sent` | `archive` | — | `archived` | — |
+| Postcard sub-states | vendor webhooks | — | `submitted → in_production → mailed → in_transit → delivered / returned` (per piece) | Costs posted |
+
+### 6.4 DripCampaign and DripVersion
+| State | Event | Guard | Next | Side effects |
+|---|---|---|---|---|
+| `draft` | `launch` | label unique; ≥ 1 message step; senders verified for the channels used; compliance lint passes | `live` | Freeze `DripVersion` v1; `marketing.drip.launched` |
+| `live` | `edit_publish` | lint passes | `live` | New version vN+1; migration choice (4.12 step 11) |
+| `live` | `pause` | — | `paused` | Due steps held |
+| `paused` | `resume` | — | `live` | Held steps processed (skip option) |
+| `live` / `paused` | `archive` | — | `archived` | Active enrollments → `exited(drip_archived)` |
+| `live` | system: sender suspended / budget cap | — | `paused_by_system` | A-15/A-17 |
+| `paused_by_system` | issue resolved and `resume` | — | `live` | — |
+
+### 6.5 Enrollment
+| State | Event | Guard | Next | Side effects |
+|---|---|---|---|---|
+| — | `trigger.matched` | eligible, re-entry policy allows, no active enrollment in this drip | `active` | `marketing.enrollment.started`; `step_index = 0` |
+| — | `trigger.matched` | not eligible | — (no row; counter `ineligible++`) | — |
+| `active` | `step.message` | — | `executing` | Pipeline intent `drip:{enr}:{stepId}` |
+| `executing` | `intent.accepted` (any terminal message outcome) | more steps remain | `active` (next step) | — |
+| `active` | `step.delay` / `step.wait_until` | — | `waiting` | DurableTimer `due_at` |
+| `waiting` | `timer.fired` | drip live | `active` | — |
+| `waiting` | `timer.fired` | drip paused | `held` | — |
+| `held` | `drip.resumed` | — | `active` (or skip-ahead) | — |
+| `waiting` | `event` (for wait-until-event) | event matches | `active` | Cancel timer |
+| any non-terminal | `exit_condition.met` | — | `exited` | Reason stored; `marketing.enrollment.exited`; cancel timers |
+| any non-terminal | `contact.merged` | survivor not enrolled | (moved to survivor) | — |
+| `active` | no more steps | — | `completed` | `marketing.enrollment.completed` |
+| `executing` | worker crash | lease expired | `active` (re-run step; idempotent) | — |
+
+### 6.6 Channel consent (projection per endpoint × purpose; ledger owned by Agent 07)
+| State | Event | Next | Notes |
+|---|---|---|---|
+| `unknown` | transactional context (number given at booking) | `implied_txn` | Transactional only |
+| `unknown` / `implied_txn` | checkbox / keyword / attested consent | `pending_confirm` (if double opt-in on) / `granted` | Evidence required |
+| `pending_confirm` | reply YES within 72h | `granted` | N-M03 |
+| `pending_confirm` | 72h elapsed | prior state | — |
+| `granted` | STOP / unsubscribe / complaint / revoke | `revoked` | STOP revokes **all** SMS from that sender, including transactional |
+| `implied_txn` | STOP | `revoked` | — |
+| `revoked` | START / UNSTOP / YES / new written consent | `granted` (marketing) or `implied_txn` | Staff cannot do this without evidence |
+| any | carrier: number deactivated / reassigned | `invalid` | Requires a new number |
+| any (email) | hard bounce | `suppressed` | Clears if the customer re-verifies the address |
+
+### 6.7 Sender registration (10DLC brand/campaign, toll-free, email domain)
+| Entity | States |
+|---|---|
+| TenDlcBrand | `draft → submitted → (verified / unverified / vetting_pending → vetted) → suspended` |
+| TenDlcCampaign | `draft → submitted → pending_mno_review → approved / rejected (reason) → suspended / expired` |
+| TollFreeVerification | `draft → submitted → in_review → approved / rejected (resubmittable)` |
+| PhoneNumber | `ordering → active → (pending_registration: SMS blocked or filtered) → sms_enabled → released` |
+| EmailDomain | `pending_dns → verifying → verified / failed (after 72h) → degraded (DMARC/SPF break detected by daily check)` |
+Sending gate: an SMS from a business number is allowed only when the number is `sms_enabled`
+(campaign approved or TF approved).
+
+### 6.8 Conversation
+| State | Event | Next | Side effects |
+|---|---|---|---|
+| — | first inbound or outbound | `open` | Assignment rule |
+| `open` | staff reply | `open` (waiting_on = customer) | SLA timer stop |
+| `open` | close | `closed` | — |
+| `open` | snooze(until) | `snoozed` | Timer |
+| `snoozed` | timer or new inbound | `open` | Notify assignee |
+| `closed` | new inbound | `open` | Reassign to last assignee if still active, else unassigned |
+| any | contact merged | (thread merged into survivor's conversation per endpoint) | — |
+
+### 6.9 ReviewRequest and Review
+| State | Event | Next |
+|---|---|---|
+| `scheduled` | due and guards OK | `sent` |
+| `scheduled` | job reopened / canceled / opted out / cooldown | `skipped` |
+| `sent` | rating submitted | `rated` |
+| `sent` | +48h, no rating | `reminded` (N-R02) |
+| `reminded` | rating | `rated` |
+| `sent` / `reminded` | +7 days | `expired` |
+| `rated` | Google link clicked | `rated_public_clicked` |
+| `rated` | rating ≤ threshold | (+ task `low_rating_open` → `resolved`) |
+Review entity: `active → hidden (owner hides from site display; still counted) → deleted
+(customer privacy erasure only)`.
+
+### 6.10 Referral
+`invited → signed_up → booked → qualified → rewarded`. Side branches:
+`rejected(self_referral / existing_customer / cap)`; `reversed` (refund within the reversal window).
+
+### 6.11 Goal
+| State | Event | Next |
+|---|---|---|
+| `active` | progress ≥ target | `achieved` (A-13 once) |
+| `active` | period end, progress < target | `missed` |
+| `achieved` / `missed` | recurring goal and new period begins | new period instance `active` |
+| any | archive | `archived` |
+
+### 6.12 ExportJob
+`queued → running → ready (signed URL, 7 days) → expired`. Errors go `running → failed` (retry up to 2,
+then A-20 with error). Cancel: `queued/running → canceled`.
+
+### 6.13 Rollup partition (reporting freshness)
+`fresh → dirty (fact arrived for the partition) → refreshing → fresh`. A full rebuild runs on
+`stale_rebuild` (tz change, metric definition version bump): `fresh → rebuilding → fresh`.
+Queries during a rebuild serve the previous version (double-buffered).
+
+---
+
+## 7. Data model
+TypeScript-style, stack-agnostic. Common fields on every entity: `id: string` (ULID),
+`business_id: string` (tenant key; every query is tenant-scoped), `created_at`, `updated_at`
+(UTC ISO), `version: number`. Money: `MinorUnits = number` (integer). `Tz = string` (IANA).
+`[I]` throughout.
+
+### 7.1 Notification catalog & settings
+```ts
+type Channel = 'email' | 'sms' | 'push' | 'in_app' | 'postcard';
+type QuietClass = 'CRIT' | 'TXN' | 'MKT' | 'TEAM' | 'OPS';
+type OptClass = 'LOCK' | 'TXN' | 'MKT' | 'OPS' | 'CONV';
+type RecipientRole = 'customer' | 'payer' | 'gift_recipient' | 'lead' | 'assigned_workers'
+  | 'worker_self' | 'approvers' | 'owners' | 'requester' | 'audience' | 'enrollee';
+
+interface NotificationDefinition {          // platform-level, versioned; seeded from 5.1
+  id: string;                               // 'N-B01'
+  def_version: number;
+  name: string;
+  audience: 'customer' | 'team' | 'owner';
+  area: string;                             // 'booking', 'day_of', 'quotes', ...
+  trigger: { event?: string; timer?: { anchor: string; offset_minutes: number; range: [number, number] } };
+  recipient_role: RecipientRole;
+  default_channels: Channel[];
+  optional_channels: Channel[];
+  fallback?: Channel[];                     // ordered
+  quiet_class: QuietClass;
+  critical_if_within_hours?: number;        // TXN* rule
+  opt_class: OptClass;
+  editable: { toggle: boolean; channels: boolean; timing: boolean; text: boolean };
+  variable_set: string[];                   // ['VS-JOB','eta']
+  required_variables: string[];
+  dedupe: { window_seconds: number; max_per_subject?: number };
+  debounce_seconds?: number;
+  tier: 'all' | 'mid' | 'top';
+  default_templates: Record<Channel, string /* TemplateVersion id */>;
+}
+
+interface NotificationSetting {             // per business override
+  business_id: string; definition_id: string;
+  enabled: boolean;
+  channels: Channel[];
+  timing?: { offsets_minutes?: number[]; send_at_local?: string /* 'HH:mm' */; threshold?: number };
+  template_overrides: Partial<Record<Channel, string /* TemplateVersion id */>>;
+  forked_from_def_version?: number;         // for "update available" diff
+  updated_by: string;
+}
+
+interface UserNotificationPreference {      // staff (A/W series)
+  user_id: string; definition_id: string; channels: Channel[]; muted: boolean;
+  dnd?: { start_local: string; end_local: string }; digest?: 'none' | 'hourly' | 'daily';
+}
+```
+
+### 7.2 Templates & rendering
+```ts
+interface Template {
+  id: string; business_id: string | null;   // null = platform default
+  kind: 'system' | 'campaign' | 'drip_step' | 'snippet' | 'gallery';
+  channel: Channel; name: string; category?: string; // 'holiday','welcome',...
+  current_version_id: string; archived: boolean;
+}
+interface TemplateVersion {
+  id: string; template_id: string; number: number;
+  subject?: string; preheader?: string;     // email
+  blocks?: EmailBlock[];                    // email editor JSON (source of truth)
+  html_compiled?: string; text_compiled?: string;
+  sms_body?: string; media_urls?: string[]; // sms/mms
+  push?: { title: string; body: string; deep_link?: string; image_url?: string };
+  postcard?: { size: '4x6' | '6x9' | '6x11'; front: DesignDoc; back: DesignDoc };
+  variables_used: string[];
+  lint: { level: 'ok' | 'warn' | 'error'; issues: LintIssue[] };
+  created_by: string; created_at: string;
+}
+type EmailBlock =
+  | { type: 'header'; logo_placement: 'email_header' }
+  | { type: 'heading' | 'text'; content: RichText }
+  | { type: 'image'; asset_id: string; alt: string; link?: string }
+  | { type: 'button'; label: string; href: LinkSpec }
+  | { type: 'service_card'; service_id: string }
+  | { type: 'coupon'; discount_code_id: string }
+  | { type: 'divider' | 'spacer'; size?: number }
+  | { type: 'social' }
+  | { type: 'conditional'; when: 'has_marketing_consent' | Expr; children: EmailBlock[] }
+  | { type: 'footer'; locked: true };
+type LinkSpec = { kind: 'booking' | 'service' | 'offer' | 'manage' | 'pay' | 'review' | 'custom';
+  ref?: string; url?: string; track: boolean };
+```
+
+### 7.3 Messages, events, scheduling
+```ts
+interface NotificationIntent {               // transient; persisted as OutboundMessage
+  idempotency_key: string; definition_id?: string; campaign_id?: string;
+  drip_id?: string; enrollment_id?: string; step_id?: string;
+  subject: { type: 'job' | 'quote' | 'invoice' | 'payment' | 'subscription' | 'giftcard'
+    | 'timesheet' | 'worker' | 'conversation' | 'review' | 'referral' | 'goal' | 'export' | 'lead';
+    id: string; version?: number };
+  recipient: { kind: 'contact' | 'person' | 'user' | 'raw'; id?: string; endpoint?: string };
+  channel: Channel; purpose: 'security' | 'transactional' | 'conversational' | 'marketing' | 'operational';
+  not_before?: string; context: Record<string, unknown>; // event payload refs
+}
+
+interface OutboundMessage {
+  id: string; business_id: string; idempotency_key: string;           // UNIQUE(business_id, idempotency_key)
+  definition_id?: string; campaign_id?: string; drip_id?: string; enrollment_id?: string;
+  step_id?: string; conversation_id?: string;
+  subject_type: string; subject_id: string; subject_version?: number;
+  recipient_contact_id?: string; recipient_person_id?: string; recipient_user_id?: string;
+  channel: Channel; endpoint: string;          // E.164 / normalized email / device token id / address id
+  purpose: NotificationIntent['purpose'];
+  state: 'pending' | 'ready' | 'deferred' | 'rendered' | 'sent' | 'delivered' | 'sent_unconfirmed'
+    | 'failed' | 'suppressed' | 'canceled';
+  state_reason?: string;
+  not_before?: string; recipient_tz: Tz;
+  template_version_id?: string; brand_theme_version?: string;
+  rendered: { subject?: string; body_text?: string; body_html_ref?: string; media?: string[] };
+  sender: { provider_account_id: string; from: string; number_id?: string; email_domain_id?: string };
+  provider_message_id?: string; attempts: number; last_error?: string;
+  segments?: number; encoding?: 'GSM7' | 'UCS2';
+  cost_estimate_minor?: MinorUnits; cost_final_minor?: MinorUnits; cost_currency: string;
+  sent_at?: string; delivered_at?: string; failed_at?: string;
+  fallback_of?: string;                     // message id this one replaced
+  link_tokens: string[];                    // ShortLink ids embedded
+}
+
+interface MessageEvent {                    // append-only, high volume (partition by month)
+  id: string; business_id: string; message_id: string;
+  type: 'queued' | 'sent' | 'delivered' | 'undelivered' | 'bounced_hard' | 'bounced_soft'
+    | 'complained' | 'opened' | 'clicked' | 'replied' | 'unsubscribed' | 'failed';
+  at: string; provider_payload_ref?: string; link_id?: string; ip_hash?: string;
+  is_machine_open?: boolean;                // privacy-proxy heuristic
+}
+
+interface ScheduledNotification {
+  id: string; business_id: string; definition_id: string;
+  subject_type: string; subject_id: string; subject_version: number;
+  recipient_role: RecipientRole; slot: string;   // e.g. 'reminder_1'
+  due_at: string; state: 'scheduled' | 'dispatched' | 'skipped' | 'canceled';
+  // UNIQUE(business_id, definition_id, subject_id, slot)
+}
+
+interface DurableTimer {                    // shared by ScheduledNotification, drips, deferred msgs, goals
+  id: string; business_id: string; kind: 'notification' | 'drip_step' | 'deferred_message'
+    | 'campaign_start' | 'review_request' | 'conversation_snooze' | 'report_schedule';
+  ref_id: string; due_at: string;           // indexed (due_at, state)
+  state: 'pending' | 'leased' | 'done' | 'canceled';
+  lease_owner?: string; lease_expires_at?: string; attempts: number;
+}
+
+interface ShortLink {
+  id: string; business_id: string; token: string;     // 8–10 chars, base62, UNIQUE per host
+  host: string;                                        // tenant branded host at creation
+  target_url: string; kind: LinkSpec['kind'] | 'tracking' | 'resume_booking' | 'referral' | 'postcard_qr';
+  message_id?: string; contact_id?: string; campaign_id?: string; drip_id?: string;
+  expires_at?: string; click_count: number; first_clicked_at?: string;
+}
+```
+
+### 7.4 Consent, suppression, senders
+```ts
+interface ConsentEvent {                    // written via Agent 07 ledger command (5.15)
+  id: string; business_id: string; contact_id?: string; person_id?: string;
+  endpoint_type: 'phone' | 'email' | 'push_device' | 'postal';
+  endpoint: string; purpose: 'transactional' | 'marketing' | 'review_requests' | 'all_sms';
+  action: 'grant' | 'revoke' | 'confirm' | 'pause';
+  method: 'web_checkbox' | 'keyword_reply' | 'verbal_attested' | 'paper_form' | 'import_attested'
+    | 'app_toggle' | 'preference_center' | 'one_click_unsubscribe' | 'carrier_stop'
+    | 'complaint' | 'hard_bounce' | 'free_text_detected' | 'staff_on_request';
+  disclosure_version_id?: string; disclosure_text_hash?: string;
+  page_url?: string; ip?: string; user_agent?: string; evidence_ref?: string;
+  actor: { type: 'customer' | 'staff' | 'system' | 'carrier'; id?: string };
+  occurred_at: string; source_message_id?: string;
+}
+interface SendEligibility {                 // projection used by the pipeline (fast path)
+  business_id: string; endpoint: string; endpoint_type: string;
+  sms_all: 'ok' | 'revoked' | 'invalid'; sms_marketing: 'none' | 'pending' | 'granted' | 'revoked';
+  email_marketing: 'none' | 'granted' | 'revoked'; review_requests: 'ok' | 'revoked';
+  line_type?: 'mobile' | 'landline' | 'voip' | 'unknown'; tz_hint?: Tz; updated_at: string;
+}
+interface SuppressionEntry {
+  id: string; scope: 'business' | 'platform'; business_id?: string;
+  endpoint: string; endpoint_type: 'phone' | 'email';
+  reason: 'hard_bounce' | 'soft_bounce_threshold' | 'complaint' | 'carrier_block' | 'invalid'
+    | 'reassigned' | 'manual'; until?: string; created_at: string;
+}
+interface ProviderAccount {                 // platform-owned credentials (see 9.6 API key register)
+  id: string; provider: 'telnyx' | 'twilio' | 'bandwidth' | 'plivo' | 'ses' | 'postmark' | 'mailgun'
+    | 'sendgrid' | 'resend' | 'fcm' | 'apns' | 'lob' | 'postgrid' | 'gbp';
+  scope: 'platform' | 'business';           // business = BYO credentials (top tier)
+  business_id?: string; secret_ref: string;  // pointer into secrets manager, never the secret
+  subaccount_id?: string; status: 'active' | 'disabled'; priority: number;
+}
+interface PhoneNumber {
+  id: string; business_id: string; e164: string; provider_account_id: string;
+  type: 'local_10dlc' | 'toll_free' | 'short_code' | 'alphanumeric';
+  state: 'ordering' | 'active' | 'pending_registration' | 'sms_enabled' | 'released';
+  campaign_id?: string; tf_verification_id?: string; mms: boolean; voice_forward_to?: string;
+}
+interface TenDlcBrand { id: string; business_id: string; tcr_brand_id?: string;
+  entity_type: 'private_profit' | 'public_profit' | 'non_profit' | 'sole_proprietor';
+  ein_last4?: string; legal_name: string; state: string; vetting_score?: number; rejection_reason?: string; }
+interface TenDlcCampaign { id: string; brand_id: string; tcr_campaign_id?: string;
+  use_case: 'mixed' | 'customer_care' | 'marketing' | 'account_notification' | 'low_volume_mixed';
+  sample_messages: string[]; opt_in_description: string; opt_in_screenshot_url?: string;
+  help_text: string; stop_text: string; state: string; throughput_mps?: number; monthly_fee_minor?: MinorUnits; }
+interface TollFreeVerification { id: string; number_id: string; state: string; submitted_payload_ref: string; rejection_reason?: string; }
+interface EmailDomain { id: string; business_id: string; domain: string; // e.g. mail.acme.com
+  dkim_records: DnsRecord[]; spf_include: string; return_path: DnsRecord; dmarc_recommended: string;
+  state: 'pending_dns' | 'verifying' | 'verified' | 'failed' | 'degraded'; last_checked_at: string; }
+interface QuietHoursPolicy { business_id: string;
+  windows: Record<'TXN' | 'MKT' | 'TEAM', { days: number[]; start: string; end: string }[]>;
+  blackout_dates: string[]; marketing_caps: { sms_per_24h: 1; sms_per_7d: number; email_per_24h: number }; }
+interface CommsBudget { business_id: string; month: string; cap_minor?: MinorUnits;
+  spent_minor: MinorUnits; alerts_sent: number[]; hard_stop_marketing: true; hard_stop_txn_sms: boolean; }
+```
+
+### 7.5 Conversations
+```ts
+interface Conversation {
+  id: string; business_id: string;
+  kind: 'customer' | 'team_group' | 'team_direct' | 'job_crew';
+  // customer threads are keyed by (business, endpoint) for SMS, or by contact for webchat/app
+  primary_endpoint?: string; contact_ids: string[]; lead_id?: string;
+  linked_job_ids: string[]; title?: string; member_user_ids?: string[];
+  state: 'open' | 'snoozed' | 'closed'; snoozed_until?: string;
+  assignee_user_id?: string; waiting_on: 'business' | 'customer' | 'none';
+  last_message_at: string; last_inbound_at?: string; unread_by: Record<string, number>;
+}
+interface ConversationMessage {
+  id: string; conversation_id: string; business_id: string;
+  direction: 'inbound' | 'outbound' | 'internal_note' | 'system';
+  channel: 'sms' | 'mms' | 'email' | 'webchat' | 'app' | 'team';
+  author: { type: 'contact' | 'user' | 'system' | 'visitor'; id?: string; display_name: string };
+  body_text: string; attachments: { asset_id: string; mime: string; bytes: number }[];
+  outbound_message_id?: string; provider_message_id?: string; // UNIQUE for inbound dedupe
+  job_id?: string; mentions?: string[]; created_at: string; edited_at?: string; deleted_at?: string;
+  intent?: 'confirm' | 'reschedule' | 'cancel' | 'opt_out_possible' | 'stop' | 'help' | 'start';
+}
+interface WebchatSession { id: string; business_id: string; conversation_id: string;
+  visitor_id: string; booking_session_id?: string; contact_capture?: { name?: string; email?: string; phone?: string };
+  last_seen_at: string; }
+```
+
+### 7.6 Marketing: audiences, campaigns, drips, attribution
+```ts
+interface Audience { id: string; business_id: string; name: string; kind: 'dynamic' | 'snapshot';
+  rule?: RuleGroup; snapshot_contact_ids_ref?: string; last_count?: number; last_counted_at?: string; }
+type RuleGroup = { op: 'and' | 'or'; rules: (Rule | RuleGroup)[] };
+type Rule = { field: string /* from semantic field registry */; cmp: 'eq' | 'neq' | 'in' | 'gt' | 'lt'
+  | 'between' | 'within_last_days' | 'not_within_last_days' | 'exists' | 'not_exists'; value?: unknown };
+
+interface Campaign {
+  id: string; business_id: string; name: string; channels: Channel[];
+  state: 'draft' | 'scheduled' | 'blocked' | 'sending' | 'paused' | 'paused_by_system' | 'sent' | 'canceled' | 'archived';
+  audience_id?: string; audience_rule_inline?: RuleGroup;
+  template_versions: Partial<Record<Channel, string>>; offer?: { discount_code_id: string };
+  schedule: { mode: 'now' | 'at' | 'recipient_local' | 'window'; at?: string; local_time?: string;
+    window?: { start: string; end: string } };
+  throttle_per_minute?: number; created_by: string; launched_by?: string; launched_at?: string;
+  stats_ref: string;                        // CampaignStats rollup row
+}
+interface CampaignRecipient { campaign_id: string; contact_id: string; channel: Channel;
+  verdict: 'eligible' | 'no_consent' | 'unsubscribed' | 'suppressed' | 'no_endpoint' | 'frequency_cap' | 'invalid';
+  message_id?: string; }               // PK(campaign_id, contact_id, channel)
+interface PostcardOrder { id: string; campaign_id: string; contact_id?: string; address_id: string;
+  vendor_id?: string; state: string; qr_link_id: string; cost_minor: MinorUnits; expected_delivery?: string; }
+
+interface DripCampaign { id: string; business_id: string; label: string; // UNIQUE(business_id, label)
+  state: 'draft' | 'live' | 'paused' | 'paused_by_system' | 'archived';
+  current_version_id: string; template_gallery_id?: string; priority: 1 | 2 | 3 | 4 | 5;
+  created_by: string; launched_at?: string; }
+interface DripVersion { id: string; drip_id: string; number: number; frozen_at?: string;
+  trigger: DripTrigger; filters?: RuleGroup;
+  reentry: { mode: 'never' | 'after_completion' | 'after_exit' | 'cooldown'; cooldown_days?: number };
+  exit_conditions: ExitCondition[]; goal?: ExitCondition;
+  send_timing: { mode: 'asap' | 'window' | 'local_time'; window?: { start: string; end: string }; local_time?: string };
+  enroll_existing: boolean; steps: DripStep[]; }
+type DripTrigger =
+  | { type: 'event'; event: string; where?: Expr }      // e.g. customer.customer.created
+  | { type: 'date_fixed'; month: number; day: number; local_time: string; recurring_yearly: boolean; holiday_key?: string }
+  | { type: 'date_relative'; field: string; offset_days: number; local_time: string }
+  | { type: 'segment_entry'; audience_id: string; exit_on_leave: boolean }
+  | { type: 'manual' | 'api' };
+type DripStep = { id: string /* stable across versions */ } & (
+  | { type: 'email'; template_version_id: string }
+  | { type: 'sms'; template_version_id: string }
+  | { type: 'push'; template_version_id: string }
+  | { type: 'delay'; minutes: number; align_to_send_window: boolean }
+  | { type: 'wait_until'; at?: { field: string; offset_minutes: number }; event?: string; timeout_minutes: number }
+  | { type: 'branch'; condition: Expr; then_step_id: string; else_step_id: string }
+  | { type: 'action'; action: 'add_tag' | 'remove_tag' | 'create_task' | 'notify_user' | 'set_lead_stage' | 'issue_code'; params: Record<string, unknown> }
+  | { type: 'exit' });
+type ExitCondition = { type: 'event'; event: string; where?: Expr } | { type: 'rule'; rule: RuleGroup };
+
+interface Enrollment { id: string; business_id: string; drip_id: string; version_id: string;
+  contact_id: string; enrollment_key: string;         // UNIQUE(drip_id, contact_id, enrollment_key)
+  state: 'active' | 'executing' | 'waiting' | 'held' | 'completed' | 'exited';
+  step_id?: string; step_entered_at: string; exit_reason?: string; trigger_event_id?: string;
+  trigger_context: Record<string, unknown>;           // e.g. booking session id, service name
+  started_at: string; ended_at?: string; lease?: { owner: string; expires_at: string }; }
+interface EnrollmentStepRun { enrollment_id: string; step_id: string; run_seq: number;
+  outcome: 'sent' | 'skipped' | 'suppressed' | 'failed' | 'action_ok'; message_id?: string; at: string; }
+
+interface Touch { id: string; business_id: string; contact_id: string;
+  source_type: 'campaign' | 'drip'; source_id: string; step_id?: string; message_id?: string;
+  kind: 'click' | 'code' | 'scan' | 'delivered' | 'mailed'; at: string; }
+interface Attribution { job_id: string; business_id: string;          // PK(job_id)
+  source_type: 'campaign' | 'drip' | 'referral' | 'none'; source_id?: string; touch_id?: string;
+  rule: 'direct_token' | 'code' | 'click' | 'scan' | 'delivered'; booked_at: string;
+  pipeline_value_minor: MinorUnits; recognized_value_minor: MinorUnits; // from rollups
+  influenced_source_ids: string[]; model_version: number; }
+```
+
+### 7.7 Reviews, referrals
+```ts
+interface ReviewRequest { id: string; business_id: string; job_id: string; contact_id: string;
+  state: 'scheduled' | 'sent' | 'reminded' | 'rated' | 'rated_public_clicked' | 'expired' | 'skipped';
+  token: string; sent_message_id?: string; }
+interface Review { id: string; business_id: string; job_id: string; contact_id: string;
+  worker_ids: string[]; rating: 1 | 2 | 3 | 4 | 5; comment?: string; source: 'internal' | 'google_matched';
+  public_link_clicked_at?: string; visibility: 'active' | 'hidden'; response?: string;
+  low_rating_task_state?: 'open' | 'resolved'; created_at: string; }
+interface ReferralProgram { business_id: string; enabled: boolean;
+  referrer_reward: RewardSpec; friend_reward: RewardSpec; min_qualifying_net_minor: MinorUnits;
+  reversal_window_days: number; cap_per_referrer_per_year: number; budget_cap_minor?: MinorUnits; }
+type RewardSpec = { kind: 'credit' | 'discount_code' | 'gift_card'; amount_minor?: MinorUnits; percent?: number };
+interface ReferralCode { id: string; business_id: string; contact_id: string; code: string; // UNIQUE ci
+  created_at: string; disabled: boolean; }
+interface Referral { id: string; business_id: string; code_id: string; friend_contact_id?: string;
+  first_job_id?: string; state: 'invited' | 'signed_up' | 'booked' | 'qualified' | 'rewarded'
+    | 'rejected' | 'reversed'; reject_reason?: string; reward_ref?: string; }
+```
+
+### 7.8 Reporting
+```ts
+// Fact contributions: every source event produces signed rows; rollups = SUM(contributions).
+interface FactContribution {
+  business_id: string; source_event_id: string; line_no: number;      // PK — idempotent
+  metric_family: 'money' | 'job' | 'customer' | 'review' | 'marketing' | 'hours' | 'funnel';
+  local_date: string;                       // business-local YYYY-MM-DD at business tz version
+  basis: 'accrual' | 'cash' | 'event';
+  dims: { worker_id?: string; service_id?: string; addon_id?: string; zone_id?: string; shop_id?: string;
+    source?: string; customer_id?: string; job_type?: string; campaign_id?: string; drip_id?: string;
+    payment_method?: string; currency: string };
+  measures: Record<string, number>;         // e.g. { gross_minor: 12000, disc_minor: -1000, jobs_done: 1 }
+  definition_version: number; ingested_at: string;
+}
+interface RollupDaily {                     // one table per grain group; PK(business_id, local_date, dim tuple, basis)
+  business_id: string; local_date: string; basis: string; dim_key: string; // hashed dims
+  dims: Record<string, string>; measures: Record<string, number>; refreshed_at: string; }
+interface RollupPartitionState { business_id: string; month: string; state: 'fresh' | 'dirty' | 'refreshing' | 'rebuilding';
+  watermark_event_seq: number; definition_version: number; }
+interface DashboardLayout { id: string; business_id: string; owner: { type: 'user' | 'business_default'; id: string };
+  tiles: { tile_id: string; instance_id: string; x: number; y: number; w: number; h: number;
+    settings: { metric?: string; group_by?: string; filters?: RuleGroup; period_override?: string; chart?: string } }[];
+  range_default: string; updated_at: string; }
+interface SavedReportView { id: string; business_id: string; name: string; page: string;
+  filters: Record<string, unknown>; group_by: string; columns: string[]; chart: string;
+  shared_with: 'me' | 'admins' | 'all_staff'; created_by: string; }
+interface Goal { id: string; business_id: string; name: string; metric_id: string; // from goal-eligible metrics
+  scope: { type: 'business' | 'worker' | 'zone' | 'service'; id?: string };
+  period: { type: 'week' | 'month' | 'quarter' | 'year' | 'custom'; start: string; end: string; recurring: boolean };
+  target: number; unit: 'minor' | 'count' | 'percent' | 'rating';
+  visibility: 'owners' | 'managers' | 'team'; milestones_notified: number[];
+  state: 'active' | 'achieved' | 'missed' | 'archived'; }
+interface GoalProgressSnapshot { goal_id: string; period_start: string; as_of: string; value: number;
+  expected_value: number; projected_value: number; }
+interface ExportJob { id: string; business_id: string; requested_by: string; kind: 'csv' | 'xlsx' | 'png' | 'svg';
+  query_ref: string; state: 'queued' | 'running' | 'ready' | 'failed' | 'expired' | 'canceled';
+  file_ref?: string; row_count?: number; expires_at?: string; }
+interface ScheduledReport { id: string; business_id: string; view_id: string; cron_local: string;
+  recipients_user_ids: string[]; format: 'email_summary' | 'csv'; last_sent_at?: string; }
+interface PresenceHeartbeat { business_id: string; actor_type: 'customer' | 'visitor' | 'worker' | 'user';
+  actor_id: string; surface: 'portal' | 'customer_app' | 'worker_app' | 'crm'; last_seen_at: string; } // TTL 10 min
+interface InAppNotification { id: string; business_id: string; user_id: string; definition_id: string;
+  title: string; body: string; deep_link: string; read_at?: string; created_at: string; } // TTL 90 d
+```
+
+### 7.9 Key indexes & constraints (logical)
+- `OutboundMessage(business_id, idempotency_key)` UNIQUE. `(business_id, recipient_contact_id,
+  created_at)` for the timeline. `(provider_message_id)` UNIQUE for DLR lookup.
+- `DurableTimer(state, due_at)` partial index on pending rows.
+- `Enrollment(drip_id, contact_id, enrollment_key)` UNIQUE. Partial UNIQUE on
+  `(drip_id, contact_id) WHERE state IN (active, executing, waiting, held)`.
+- `ConversationMessage(provider_message_id)` UNIQUE for inbound dedupe.
+- `ShortLink(host, token)` UNIQUE.
+- `FactContribution(business_id, source_event_id, line_no)` PK.
+- `RollupDaily` PK on `(business_id, basis, local_date, dim_key)`, partitioned by month.
+- Data retention [I]:
+  - MessageEvent: raw events 25 months, aggregated forever.
+  - Rendered bodies: 25 months, then hashed.
+  - Consent evidence: forever (or the legally required period after relationship end, at least 5 years).

@@ -1602,3 +1602,276 @@ or rename in the master event catalog. One fact = one event; no double-publishin
   single atomic reservation point; 05 verifies payment server-side inside it. Same saga is reused
   by MCP agents and by the future native customer app.
 - `portal.bookingBaseUrl` is the only allowed way for any module to generate customer links.
+
+---
+
+## 10. Algorithms / pseudo-code
+
+### 10.1 Edge host resolution + on-demand TLS gate [D]
+
+```ts
+// Runs at every edge POP. KV is a push-replicated map host -> EdgeHostRecord.
+function onTlsClientHello(sni: string): Cert | Reject {
+  const host = normalizeHost(sni);                 // lowercase, strip trailing dot, punycode
+  const cert = certStore.get(host) ?? certStore.get(wildcardOf(host)); // platform hosts use *.book-platform.example
+  if (cert && !isExpired(cert)) return cert;
+  // Miss: only custom hosts can reach here.
+  const allow = cachedAsk(host, 60_000) ?? controlPlane.tlsAsk(host); // portal.tls.ask
+  if (!allow) return Reject('unknown_host');        // fast fail; nothing issued for random names
+  return issuer.issueOrWait(host, { timeoutMs: 8000 }); // single-flight per host across POPs
+}
+
+function onRequest(req): Response {
+  const host = normalizeHost(req.headers.host);
+  if (req.tls && host !== normalizeHost(req.tls.sni)) return 421;    // misdirected / fronting guard
+  const rec = kv.get(host) ?? kv.get(platformSlugKey(host));
+  if (!rec || rec.status === 'inactive') return notSetUpPage(404);   // C5, noindex
+  if (rec.status === 'grace_redirect' || (isPageRoute(req) && host !== rec.canonicalHost))
+     return redirect(301, `https://${rec.canonicalHost}${req.pathAndQuery}`);
+  req.headers.delete('x-tenant-id');               // never trust client
+  req.headers.set('x-tenant-id', rec.tenantId);
+  req.headers.set('x-config-version', rec.configVersion);
+  return cacheOrOrigin(req, rec);
+}
+```
+
+`portal.tls.ask(host)`: `SELECT 1 FROM custom_domain WHERE hostname=$1 AND status IN
+('verifying','issuing','active','renewal_due','detached')` **and** live DNS points to us (cached 5 min).
+`detached` is allowed so a short DNS blip doesn't block re-issuance once DNS returns.
+
+### 10.2 Domain verifier [D]
+
+```ts
+async function verifyDomain(d: CustomDomain): Promise<void> {
+  const answers = await Promise.all([
+    resolve(d.hostname, AUTHORITATIVE), resolve(d.hostname, PUBLIC_A), resolve(d.hostname, PUBLIC_B)]);
+  const diag = buildDiagnostics(answers, await detectProvider(d.hostname), await caa(d.hostname));
+  const pointsToUs = d.mode === 'cname'
+    ? answers.some(a => a.cnameChain?.includes(d.cnameTarget))
+    : answers.every(a => sameSet(a.a, EDGE_V4) && (a.aaaa.length === 0 || sameSet(a.aaaa, EDGE_V6)));
+  const proxied = answers.some(a => a.a?.some(isCloudflareIp)) && !pointsToUs;
+  const txtOk = (await txt(`_platform-verify.${d.hostname}`)).includes(`pv=${d.verifyToken}`);
+  // A direct CNAME to our per-tenant target proves control; TXT required for apex or proxied.
+  const ownershipOk = (d.mode === 'cname' && pointsToUs) || txtOk;
+  if (diag.caaBlocksUs) return transition(d, 'CaaBlocked', diag);
+  if (pointsToUs && ownershipOk) return transition(d, 'DnsCheckPassed', diag);
+  if (proxied && txtOk) return transition(d, 'DnsCheckPassed', { ...diag, hint: 'proxied: DNS-01 path' });
+  if (anyResolves(answers)) return transition(d, 'DnsCheckMismatch', { ...diag, hint: fixHint(diag, d) });
+  return record(d, diag); // still pending_dns
+}
+// Scheduling: 1 min ×15, 5 min ×24, hourly to 72 h, daily to 30 d; active domains daily (+ on any
+// cert renewal), 3 consecutive failures ≥ 2 h apart → detached (avoids flapping on resolver hiccups).
+```
+
+### 10.3 Step plan computation [D]
+
+```ts
+function computeStepPlan(s: BookingSession, cfg: PortalConfig, cat: Catalog): StepPlan {
+  const svc = s.cart.lines.map(l => cat.service(l.serviceId));
+  const steps: StepKey[] = [];
+  if (!s.cart.lines.length) steps.push(cat.categories.length > 1 ? 'category' : 'service');
+  steps.push('service');
+  if (svc.some(x => x.variants.length && !x.priceDependsOnAsset)) steps.push('variant');
+  if (svc.some(x => x.priceDependsOnAsset)) steps.push('assets');      // asset before price
+  if (cat.addonsFor(svc).length) steps.push('addons');
+  if (svc.some(x => x.recurring.enabled) || cat.upsellPackagesFor(svc).length) steps.push('frequency');
+  if (cfg.flow.contactPosition === 'after_service') steps.push('contact');
+  steps.push('location');
+  steps.push('datetime');
+  if (cfg.flow.contactPosition === 'after_datetime') steps.push('contact');
+  if (questionsFor(svc, cfg).length) steps.push('questions');
+  if (cfg.assets.enabled && !steps.includes('assets') && assetsRelevant(svc, cfg)) steps.push('assets');
+  if (intakeIncomplete(s.customerId, cfg)) steps.push('intake');
+  if (cfg.flow.contactPosition === 'before_payment') steps.push('contact');
+  steps.push('review');
+  if (paymentModeFor(s) !== 'none' || !cfg.flow.guestCheckout) steps.push('payment');
+  return dedupe(steps).map(k => ({ step: k, required: true, complete: isComplete(s, k), skippedReason: prefillSkip(s, k) }));
+}
+// Invariants asserted in tests: service < datetime; location < datetime; contact < payment;
+// review < payment; 'assets' < 'review'; plan is deterministic for (session, cfgVersion, catalogRevision).
+```
+
+### 10.4 Online booking saga (commit) [D]
+
+```ts
+async function confirmBooking(sessionId, quoteHash, paymentSessionId?, idemKey = sessionId) {
+  return idempotent(idemKey, async () => {                 // stored result returned on retries
+    const s = await lockSession(sessionId);                 // row lock / version check
+    if (s.status === 'converted') return s.result;          // double-click / retry
+    assert(s.status in ['identified','awaiting_payment']);
+    // 1. Revalidate everything server-side (never trust client state)
+    const q = await requote(s);                             // 02 priceSelection + 05 quoteTotals
+    if (q.hash !== quoteHash) throw Conflict('QUOTE_CHANGED', diff(s.quote, q));
+    validateAnswers(s); validateTerms(s); validateContact(s); await recheckArea(s);
+    // 2. Ensure hold (re-hold same slot if expired)
+    const hold = await ensureHold(s);                       // 03 hold.extend or hold.create(sameToken)
+    if (!hold) { await voidPayment(paymentSessionId); throw Conflict('SLOT_TAKEN', await alternatives(s)); }
+    // 3. Verify payment server-side (05) — succeeded / requires_capture / setup succeeded, amount & currency match q
+    if (q.paymentMode !== 'none') await payments.confirmBookingPayment(paymentSessionId, { expectedHash: q.hash });
+    setStatus(s, 'committing');
+    // 4. Customer upsert (07) — idempotent on (tenant, sessionId)
+    const customer = await customers.upsertFromSession(s, { idempotencyKey: `${idemKey}:customer` });
+    // 5. Atomic reservation + job creation (03 → 04), idempotent on idemKey
+    const appt = await scheduling.bookingCommit(hold.id, jobDraft(s, customer, q), `${idemKey}:commit`);
+    // 6. Post-commit (each idempotent, retried by outbox worker if it fails; never undoes the booking)
+    outbox.add('discounts.commit', { sessionId, jobId: appt.jobId });
+    outbox.add('payments.attachToJob', { paymentSessionId, jobId: appt.jobId });
+    outbox.add('subscriptions.start', s.cart.frequency?.kind === 'package' ? {...} : null);
+    const booking = insertPortalBooking(s, appt, customer);  // unique(sessionId)
+    setStatus(s, 'converted');
+    outbox.add('booking.appointment.created', { source: s.channel, sessionId, jobId: appt.jobId, ... });
+    return { bookingId: booking.id, ...appt, publicToken: booking.publicToken };
+  }, { onUnknownFailure: async (err, s) => {
+      // Payment taken but reservation failed with non-retryable error → never silently drop
+      if (paymentCaptured(paymentSessionId)) await payments.refundOrVoid(paymentSessionId, 'booking_failed');
+      setStatus(s, 'needs_attention'); emit('booking.session.failed', { sessionId, reason: err.code });
+      return { status: 'needs_attention' };                  // UI: "Request received — we'll confirm by text"
+  }});
+}
+```
+Ordering rationale: payment is **authorized/confirmed before** the reservation commit so we never
+create an appointment for a card that will decline; the reservation is the single atomic point; all
+later steps are idempotent outbox jobs, so a crash after step 5 still ends in a converted session
+(the outbox replays). Steps 1–4 failing leave no appointment and void any payment.
+
+### 10.5 Hold handling in the client [D]
+```
+onSlotPick(token):  disable slot list; POST hold → success: show selected; schedule extend at
+                    (expiresAt - 90 s) if user active in last 2 min; on 409 show alternatives inline.
+onVisibilityChange(hidden > 5 min): do nothing (server TTL decides); on visible: GET session; if hold
+                    expired → banner "Your time was released — pick again" and jump to datetime keeping all other data.
+onStepBack(datetime): keep hold until a new slot is picked (avoid losing the slot by browsing back).
+```
+
+### 10.6 Never-lose-a-booking mechanics [D]
+1. **Server-side draft from first selection**; every PATCH saved (debounced 400 ms, flush on blur
+   and on `pagehide` via `sendBeacon`).
+2. **Client mirror** in `sessionStorage` (session id + secret + last known state, wrapped in
+   try/catch) → reload or tab crash resumes instantly; `localStorage` keeps only the session id
+   (30 days) for "Continue your booking?" on return.
+3. **Idempotency key = sessionId** on confirm; payment intents created with idempotency key
+   `sessionId:quoteHash` so retries never double-charge; unique constraint `PortalBooking.sessionId`
+   as final backstop.
+4. **Outbox pattern** for all events and post-commit commands (written in the same transaction as
+   state change; relay retries with exponential backoff + jitter; consumers dedupe by event id).
+5. **Reconciliation job (every 5 min)**: for each payment session in `succeeded/requires_capture`
+   older than 15 min whose booking session isn't `converted` → if a job exists (crash between commit
+   and status write) mark converted; else attempt saga again once with the stored hold token; else
+   void/refund + mark `needs_attention` + alert business + message customer. Mirrors 05's `unknown`
+   state reconciliation.
+6. **Degraded modes**: availability service down → "Request a time" (captures full cart + preferred
+   windows as a booking request/lead, staff confirms); payment processor down → for tenants whose
+   mode is not prepay, allow "pay after service" fallback if the tenant enabled it, else request mode;
+   geocoder down → structured address form, area verified async.
+7. **Client network loss during confirm**: button shows "Still working…" after 5 s; retries the same
+   idempotent call with backoff up to 60 s; result is always the same booking.
+
+### 10.7 Attribution classification [D]
+```ts
+function classify(t: RawTouch, tenant): string {
+  if (t.src) return normalizeSrc(t.src);                          // website, gbp, qr:<id>, short:<slug>, email, sms, embed...
+  if (t.shortLinkId) return `short:${t.shortLinkCode}`;
+  if (t.utm?.utm_medium in {cpc:1, ppc:1, paid:1} || t.clickIds?.gclid || t.clickIds?.msclkid) return 'paid_search';
+  if (t.clickIds?.fbclid || t.clickIds?.ttclid) return 'paid_social';
+  if (t.utm?.utm_source) return `utm:${t.utm.utm_source}`;
+  const r = t.referrerHost;
+  if (!r || r === t.portalHost) return 'direct';
+  if (sameRegistrableDomain(r, tenant.websiteDomain) || t.embedParentOrigin) return 'website';
+  if (/(^|\.)google\.[a-z.]+$/.test(r) && t.landingPath.includes('src=gbp')) return 'gbp';
+  if (SEARCH_ENGINES.has(r)) return 'organic_search';
+  if (SOCIAL.has(r)) return 'social';
+  if (MAIL_HOSTS.has(r)) return 'email';
+  return `referral:${r}`;
+}
+```
+
+### 10.8 Caching & invalidation [D]
+
+| Resource | Edge cache | Browser | Invalidation |
+|---|---|---|---|
+| App JS/CSS bundles (content-hashed) | 1 year, immutable | 1 year | new deploy = new hash |
+| Theme tokens CSS (11) | inlined in HTML; standalone copy 1 year, versioned URL | — | theme version in URL |
+| Fonts/logos/images (via image service: AVIF/WebP, responsive sizes) | 1 year, versioned | 1 year | new asset id |
+| HTML shell + SSR'd catalog pages per host | `s-maxage=300, stale-while-revalidate=86400`, keyed by host + configVersion | `no-cache` (revalidate, ETag) | purge tag `tenant:{id}:config` / `:catalog` on publish (≤ 5 s) |
+| `portal.config.get`, `portal.catalog.get` | same as HTML | ETag | same |
+| Availability | not cached at edge (or ≤ `ttlSec` per (tenant, spec, day) micro-cache, purged on hold/commit) | no-store | 03 events |
+| Session / account / payment APIs | never | no-store | — |
+| Tracking stream | never | no-store | — |
+Stale-if-error: HTML/catalog served stale up to 7 days if origin is down (with "may be out of date"
+banner driven by a header) so the site never shows a blank error page; booking commit still needs origin.
+
+### 10.9 Performance budgets & loading strategy [D] (BRIEF performance bar)
+
+Reference device/network: mid-range Android (Moto G Power class), "Slow 4G" profile (~1.6 Mbps,
+150 ms RTT), cold cache. Measured with lab tests in CI **and** real-user monitoring (RUM) p75.
+
+| Metric | Budget (p75 RUM) | Hard fail in CI (lab) |
+|---|---|---|
+| TTFB (edge-cached HTML) | ≤ 200 ms | ≤ 400 ms |
+| LCP (landing / category / service pages) | ≤ 1.8 s | ≤ 2.5 s |
+| CLS | ≤ 0.02 | ≤ 0.05 |
+| INP | ≤ 150 ms | ≤ 200 ms |
+| Initial JS (gzip) for landing | ≤ 60 KB | ≤ 80 KB |
+| Per-step lazy chunk | ≤ 25 KB | ≤ 40 KB |
+| Total transfer first view (excl. hero image) | ≤ 200 KB | ≤ 300 KB |
+| Embed/popup loader on business site | ≤ 5 KB gzip, 0 render-blocking, 0 main-thread work until idle/interaction | ≤ 7 KB |
+| Availability API p95 | ≤ 400 ms | — |
+| Confirm (commit) p95 excluding 3DS | ≤ 1.5 s | — |
+
+Tactics: server-render landing/catalog/service pages (HTML works before JS); progressive
+hydration per step; route-level code splitting (payment element, map, date picker load only on their
+steps, prefetched one step ahead on idle); map is a static image until interacted with; images via
+`srcset`/`sizes`, explicit width/height, AVIF/WebP, hero `fetchpriority=high`; no third-party script
+before consent/interaction; analytics loaded after `load` + idle; skeletons sized identically to
+content; no web-font FOIT; HTTP/3 + early hints (103) for CSS/fonts; `preconnect` to payment origin
+from the review step.
+
+### 10.10 SEO [D]
+- SSR pages: `/`, `/c/{category}`, `/s/{service}` (service detail with booking CTA), `/gift-cards`,
+  `/plans`. Checkout steps, account, tracking, tokens: `noindex, nofollow`, excluded from sitemap.
+- Per-host `robots.txt` and `sitemap.xml`; platform host returns `noindex` + `rel=canonical` to custom
+  host when one is active (avoids duplicate content).
+- Structured data: `LocalBusiness` (name, address/areaServed from 02 zones, phone, logo from 11),
+  `Service` + `Offer` (price, currency), `BreadcrumbList`; Open Graph/Twitter cards with 11's OG image.
+- Titles/descriptions default from business + service names, overridable (§7 `SeoSettings`).
+- Tenant can set `noindex` for whole portal (e.g. while testing).
+
+### 10.11 Accessibility [D] — WCAG 2.2 AA minimum
+- Every step is a form with a proper `<h1>`, labels, errors linked via `aria-describedby`, error
+  summary focused on submit; step change moves focus to the new heading and announces "Step 4 of 9".
+- Date picker: keyboard (arrows/PageUp/Home/End), `role="grid"`, unavailable days `aria-disabled`;
+  slots are buttons in a list (not a grid of tiny cells), min target 44×44 px (≥ 24 px per 2.5.8).
+- Hold countdown and "slot taken" in `aria-live="polite"`; timeouts warn ≥ 20 s before and allow
+  extension (2.2.1).
+- Brand colors run through contrast check; token pipeline (11) auto-adjusts text-on-primary.
+- Respects `prefers-reduced-motion`, `prefers-color-scheme`, 200 % zoom/reflow at 320 px width
+  without horizontal scroll; no information by color only (selected states have check icon).
+- Embedded iframe has a `title`; popup is a proper modal (focus trap, `Esc`, return focus).
+- Payment element accessibility depends on the processor component — verify during stack choice.
+
+### 10.12 Embed loader (business site) [D]
+```js
+(function(w,d){ if (w.__pb) return; w.__pb = 1;
+  var nodes = d.querySelectorAll('[data-platform-booking]');
+  function mount(el){ var f = d.createElement('iframe');
+    f.src = BASE + (el.dataset.start||'/') + '?embed=1&src=' + (el.dataset.src||'embed')
+          + '&parent=' + encodeURIComponent(location.origin) + passUtm(location.search, d.referrer);
+    f.title = el.dataset.title || 'Book online'; f.allow = 'payment'; f.loading = 'lazy';
+    f.style.cssText = 'width:100%;border:0;min-height:' + (el.style.minHeight||'640px');
+    el.appendChild(f); }
+  w.addEventListener('message', function(e){ if (e.origin !== ORIGIN) return;
+    if (e.data && e.data.type === 'pb:resize') resizeFor(e.source, e.data.height);
+    if (e.data && e.data.type === 'pb:booked') fireHostEvent('booking_confirmed', e.data); });
+  // popup mode binds click on [data-platform-book] / links whose href starts with BASE; falls back to href
+  ('IntersectionObserver' in w) ? observe(nodes, mount) : nodes.forEach(mount);
+})(window, document);
+```
+The `pb:booked` message lets the business's own site fire its ad conversion tags (value, currency,
+booking id hash — no PII) [D].
+
+### 10.13 Abandon sweeper [D]
+Every minute: `SELECT … WHERE status IN ('browsing','identified','awaiting_payment') AND
+lastActivityAt < now() - abandonAfter` (batched, `FOR UPDATE SKIP LOCKED`) → release hold (03) →
+release discount reservations (06) → cancel unconfirmed payment intents (05; never touch `succeeded`
+— those go to reconciliation §10.6) → identified → `abandoned` + `booking.session.abandoned`;
+browsing → `expired_anonymous` (counters only).

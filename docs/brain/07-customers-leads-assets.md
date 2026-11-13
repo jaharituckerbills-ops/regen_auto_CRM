@@ -1857,3 +1857,428 @@ custom icons, logos per placement, copy overrides):
   stage colours and tag colours are validated for contrast against **both** light and dark
   palettes (≥ 4.5:1 text contrast) — auto-adjusted text colour on chips [I].
 - Exports/PDFs (vehicle history PDF) use the tenant's document logo placement.
+
+---
+
+## 10. Algorithms / pseudo-code
+
+All `[I]` (design), referenced from earlier sections by number.
+
+### 10.1 Normalization
+```text
+normalizePhone(raw, ctx):
+  s = trim(raw); ext = extractExtension(s)          // "x123", "ext. 123", ";ext=123"
+  region = s.startsWith('+') ? null : (ctx.addressCountry ?? ctx.businessCountry)
+  parsed = phoneLib.parse(s, region)
+  if !parsed or !phoneLib.isPossible(parsed): return {raw, e164:null, formatStatus:'invalid', ext}
+  status = phoneLib.isValid(parsed) ? 'valid' : 'unverified_format'
+  return {raw, e164: phoneLib.format(parsed,'E164'), formatStatus: status, ext,
+          lineTypeHint: phoneLib.getType(parsed)}   // FIXED_LINE / MOBILE / FIXED_LINE_OR_MOBILE
+
+normalizeEmail(raw):
+  s = NFKC(trim(raw)); [local, domain] = splitLast(s, '@')
+  if !local or !domain or !domain.contains('.'): invalid
+  domain = toASCII(lower(domain))                    // punycode
+  strict = lower(local) + '@' + domain
+  relaxed = domain in {gmail.com, googlemail.com}
+            ? removeDots(lower(local).split('+')[0]) + '@gmail.com' : lower(local).split('+')[0] + '@' + domain
+  typo = suggestDomain(domain)                       // gmial.com → gmail.com (warn only)
+  return {strict, relaxed, typo}
+
+addressKey(a): upper(stripPunct(abbr(a.line1) + '|' + (a.line2 ?? '') + '|' + a.postalCode5 + '|' + a.countryCode))
+```
+
+### 10.2 Matching & duplicate scoring
+Used by live suggestions (mode `suggest`), booking/portal resolution (mode `strict`), imports
+and the nightly batch.
+```text
+signals(candidate, input):
+  +100 verified email equal (strict)            +90 verified phone equal (E.164)
+  +70  unverified email equal (strict)          +60 unverified phone equal
+  +35  relaxed email equal (not strict)         +40 same addressKey
+  +25  same last name (Jaro-Winkler ≥ 0.92)     +15 same first name (JW ≥ 0.9 or nickname map Bob↔Robert)
+  +30  same externalId(system)                  +20 same VIN on an asset (imports with vehicles)
+  −40  phone shared by > 3 customers (household/office line) → treat phone as weak
+  −100 pair previously dismissed ("not a duplicate")
+
+blocking (to avoid O(n²)): candidates = union of
+  index lookups on email.strict, email.relaxed, phone.e164, addressKey, (soundex(last), postal5)
+
+thresholds:
+  suggest:  score ≥ 60 show; ≥ 100 "Very likely the same customer"
+  strict (booking/portal): reuse only if (verified email or phone equal) AND no conflicting
+          verified value of same type on the candidate; else create new + DuplicateCandidate(score)
+  import:   per matchKeys option; exact key equality only (no fuzzy auto-update)
+  nightly:  score ≥ 80 → DuplicateCandidate; auto-merge only if setting on AND score ≥ 190
+            (two verified identifiers equal) AND no conflicting financial/portal state
+```
+
+### 10.3 Merge
+```text
+merge(survivor S, losers L[], decisions):
+  lock rows S ∪ L (ordered by id to avoid deadlocks)
+  assert all status ∉ {merged, erased}; assert no blocking conflicts
+  snapshot = serialize(S, L, children)               // for unmerge
+  for each scalar field f: S.f = decisions[f] ?? S.f ?? firstNonNull(L.f)
+  for child in people, addresses, assets, notes, tags, leads, intakeResponses, portalLinks:
+      reparent child → S; dedupe identical (contact point equal normalized → keep oldest id,
+      merge flags: verifiedAt=min, notifyOnJobs=or, isPrimary=S's)
+  consent: endpoint-keyed ledger needs no move (C1); if contact-point-keyed, re-point events
+  S.preferredWorkerIds ∪=; S.blockedWorkerIds ∪=; S.taxExempt = decision (required if differ)
+  L.status = merged; L.mergedIntoId = S.id
+  write MergeRecord(undoUntil = now + 30d); audit
+  commit; emit customer.customer.merged {S, L}
+  // other modules re-point asynchronously; reads of L resolve mergedIntoId (chain-compressed)
+```
+
+### 10.4 CSV header auto-mapping
+```text
+synonyms = {
+  firstName: [first, first name, fname, given name], lastName: [last, surname, lname, family name],
+  fullName: [name, customer, customer name, client, full name, contact],
+  companyName: [company, business, organization, account name],
+  phone: [phone, mobile, cell, telephone, tel, phone number, primary phone, mobile phone, home phone, work phone],
+  email: [email, e-mail, email address, mail], line1: [address, street, address 1, address line 1, street address],
+  line2: [address 2, apt, suite, unit], locality: [city, town, suburb], region: [state, province, region, county],
+  postalCode: [zip, zip code, postcode, postal code], countryCode: [country],
+  tags: [tags, labels, groups, segments], notes: [notes, comments, memo],
+  externalId: [id, customer id, client id, external id], createdAt: [created, customer since, date added],
+  vin: [vin, vehicle vin], plate: [plate, license plate, rego, registration], year: [year, vehicle year],
+  make: [make, vehicle make], model: [model, vehicle model], color: [color, colour],
+  smsConsent: [sms opt in, sms consent, text opt in, marketing sms], emailConsent: [email opt in, subscribed, accepts marketing]
+}
+score(header, field) = max over synonyms s of similarity(normalize(header), s)  // exact=1, token-set ratio
+assign greedily by highest score ≥ 0.8; numbered duplicates ("Phone 2") map to extra contact points;
+label inferred from header word (mobile/home/work)
+sample-value sniffing overrides: column with ≥ 80 % values matching email regex → email, E.164-parsable → phone,
+  17-char VIN pattern → vin
+```
+Row validation: required = (firstName ∨ lastName ∨ fullName ∨ companyName) ∧ (phone ∨ email ∨
+address); full name split: last token = lastName, rest = firstName, honouring "Last, First".
+Dates parsed with an explicit user-chosen format when ambiguous (01/02/2024) — never guessed
+silently.
+
+### 10.5 Asset matching (booking site / import / lead conversion)
+```text
+matchAsset(customer, hint):
+  if hint.vin: return asset where vin == normalize(hint.vin) (business-wide; if other owner → transfer prompt for staff, new asset for customer flows + duplicate flag)
+  if hint.plateKey: candidates = customer.assets where plateKey == hint.plateKey
+  else candidates = customer.assets where year==hint.year and make≈hint.make and model≈hint.model
+  if exactly 1 → reuse; if > 1 and hint.color → filter by color; still > 1 → ask (CRM) / create new (portal, with duplicate flag)
+  else create
+```
+
+### 10.6 VIN check digit (North American, positions 1–17, check at 9)
+```text
+translit = A1 B2 C3 D4 E5 F6 G7 H8 J1 K2 L3 M4 N5 P7 R9 S2 T3 U4 V5 W6 X7 Y8 Z9, digits = themselves
+weights  = [8,7,6,5,4,3,2,10,0,9,8,7,6,5,4,3,2]
+valid(vin): len==17 and no I/O/Q
+  sum = Σ translit(vin[i]) * weights[i]
+  check = sum mod 11; expected = (check == 10) ? 'X' : str(check)
+  return vin[8] == expected
+// Non-NA VINs (EU/Asia) often don't use the check digit → warn only; pre-1981 VINs < 17 chars → allow with vinValid = null
+```
+
+### 10.7 Projection rebuild (stats robust to out-of-order / reopened jobs)
+```text
+on job event e (completed/reopened/cancelled/rescheduled) for customer c, assets A:
+  if seen(e.eventId): return
+  upsert JobFact(jobId, status, completedAt, totalCents, assetIds, version) if e.version > stored.version
+  recompute CustomerStats(c) from JobFact rows (indexed, per customer ≤ thousands → cheap)
+  for a in A ∪ previousAssetIds(job): recompute AssetStats(a)
+// never increment/decrement counters in place; full recompute per affected entity keeps it correct
+```
+
+### 10.8 Idempotency
+Every command: `(businessId, idempotencyKey)` → stored response for 24 h; replay returns stored
+response; same key with a different payload hash → `409 IDEMPOTENCY_KEY_REUSED`. Import batches
+use deterministic keys `import:{jobId}:{batchNo}`; booking resolution uses `session:{sessionId}`;
+attempt ingestion keyed by `eventId`; enrichment keyed by `(leadId, provider, addressHash)` for 90 days.
+
+### 10.9 Optimistic concurrency & field-level merge
+Updates carry `expectedVersion`. On mismatch, server attempts a **field-level auto-merge**: if
+the fields in the patch were not changed since `expectedVersion` (tracked via audit diff), apply
+and return the new version; otherwise `409` with both values for the UI conflict toast (§3.2).
+
+### 10.10 Offline (team app)
+Device caches the day's jobs' customer cards + assets (encrypted at rest, purged at visibility
+window end). Queued operations (odometer, photo, note, new asset, new lead) carry client UUIDs
+and idempotency keys; on reconnect they replay in order; conflicts (asset edited by office)
+resolved by field-level merge; new-asset duplicates resolved by §10.5 server-side with
+"merged into existing asset" result shown to the worker.
+
+### 10.11 Booking-session → lead upsert
+```text
+onSessionEvent(e):
+  link = upsert BookingAttemptLink by e.sessionId
+  if e.seq <= link.lastSeq and e.type != 'contact_captured': return      // stale
+  link.furthestStepIndex = max(link.furthestStepIndex, e.stepIndex); link.lastEventAt = max(...)
+  if e.type == 'contact_captured':
+      person = normalize(e.contact)
+      lead = findOpenLead(source='booking_site', endpoint ∈ person, createdAt > now-7d) ?? createLead(...)
+      lead.sourceRef.attemptIds ∪= e.sessionId; lead.customerId ?= strictMatch(person)
+  if lead: lead.funnel = {furthestStep, live:true, cart, slot}; activity('attempt_step')
+  if e.type == 'abandoned': lead.funnel.live=false; emit lead.attempt.abandoned
+  if e.type == 'booking_confirmed': win(lead, jobId, 'self_completed')
+// sweeper safety net: every 5 min, live leads with lastEventAt < now − threshold → abandoned (if 01 event lost)
+```
+
+### 10.12 Search ranking
+Query classification: all-digits ≥ 4 → phone-suffix + job number (03) + VIN-suffix; contains '@'
+→ email prefix; 17 alnum → VIN exact; plate-like (2–8 alnum with letters+digits) → plate exact
+first; else text → trigram on displayName/company/address line1 + tag names. Score = field
+weight (exact phone 1.0, exact email 1.0, VIN/plate 1.0, name prefix 0.8, trigram × 0.6) ×
+recency boost (lastActivityAt within 30 days ×1.2) × status (archived ×0.3). Results capped 8
+per type; "See all" opens filtered list.
+
+### 10.13 Lead auto-assignment
+Rule options: none | round-robin among users with `leads.create` in an assignee pool (pointer
+per pipeline, skip inactive/off-shift users per 09 availability) | by service area of lead
+address (zone → pool) | to the worker who created it (field referral). Ties broken by fewest
+open leads. Assignment is a separate transaction after creation so assignment failures never
+lose a lead.
+
+### 10.14 Lead score (optional, explainable) [I]
+`score = 30·hasPhone + 15·hasEmail + 10·hasConsentSms + 20·reachedSlotStep + 15·reachedPaymentStep
++ 10·returningCustomer − 10·outOfArea − daysSinceLastActivity (cap 30)`, clamped 0–100; shown
+with "why" chips. No ML in Phase 1.
+
+---
+
+## 11. Edge cases & failure modes
+
+**Identity & matching**
+1. Household shares one phone across 3 customers (parents, adult child) → phone becomes weak
+   signal (§10.2); portal OTP on that phone → account links only if exactly one customer
+   matches, otherwise staff review; no data leakage across customers.
+2. Office landline shared by 40 business contacts → same; SMS not sent to landline lineType.
+3. Recycled phone number: number previously belonged to another person who consented → new
+   owner receives marketing. Mitigation: honour carrier "number reassigned" data where 08's SMS
+   provider exposes it (FCC Reassigned Numbers Database in US) [I-legal]; any "wrong number"
+   reply → revoke + flag contact point.
+4. Guest books with someone else's email (typo) → strict mode: no auto-link to the real owner's
+   profile; booking linked to a new customer; dupe candidate raised.
+5. Account takeover attempt: attacker signs up with victim's phone unverified → no link
+   (verified-only rule).
+6. Same person is customer of two businesses on the platform → separate tenants; never matched.
+7. Customer changes email; old email in portal identity → 01 must update login identity via
+   verified change flow; 07 keeps old contact point archived for history.
+8. Name with diacritics/apostrophes/hyphens ("Zoë O'Neil-Ávila") → NFC storage, accent-insensitive
+   search and collation.
+9. Single-name customers (mononyms) and businesses with no person → allowed (person optional for
+   business with company-level contact points).
+10. Emoji or RTL text in names/notes → stored as-is; exports UTF-8 with BOM.
+
+**Imports**
+11. Excel-mangled phone numbers (scientific notation `5.12555E+09`, leading zeros dropped for UK
+    `07…`) → detect and error with fix hint; never silently "repair" to a wrong number.
+12. Mixed encodings (Windows-1252 smart quotes) → detected; preview shows mojibake warning.
+13. 200 k-row file → streaming parse, batched commit, progress; worker crash mid-import →
+    resume from `lastCommittedBatch`.
+14. Duplicate rows in file with conflicting values → first-wins per option, conflicts listed.
+15. CSV injection in names (`=HYPERLINK(...)`) → stored as text; escaped on export.
+16. Import triggering "new customer" drip to 5,000 people → default `suppressAutomations = true`.
+17. Re-import of the same file → hash warning; with "update fill blanks" it's idempotent.
+18. Import while the user edits a customer that the import updates → version conflicts handled
+    per row (row result `skipped: concurrent_edit`) rather than overwriting fresh edits.
+19. Undo after jobs were booked for imported customers → those customers are kept and listed.
+20. Attested consent later disputed → evidence (file hash, attestation text, user, time) retained.
+
+**Customers & addresses**
+21. Geocoder down → address saved with `pending`; booking composer warns "location not
+    verified; travel time estimated from postcode"; retried with backoff.
+22. Geocode lands in wrong place (rural, new build) → draggable pin, `geocodeStatus = manual`.
+23. Service area redrawn (02) → thousands of addresses re-resolved in background; filters show
+    "recomputing" state briefly.
+24. Delete customer with future jobs/subscription/balance → blocked with links to resolve.
+25. Two staff edit the same customer simultaneously → field-level merge or conflict toast.
+26. Customer blocked while having a portal session mid-booking → `resolveForBooking` returns
+    blocked at commit; 01 shows neutral message; hold released.
+27. Erasure request for a customer who has an unpaid invoice → partial: marketing data erased,
+    suppression applied, financial data retained with legal basis noted; customer informed (08).
+28. Merge chain (A→B, then B→C) → reads resolve to C (path compression); unmerge of A→B after
+    B→C requires unmerging B→C first (blocked with explanation).
+29. Merging customers with different currencies (multi-region business) → blocked [I].
+30. Timezone: customer address in different TZ than business (border towns) → "last service
+    date" uses business TZ for consistency in reports; customer-facing messages use customer TZ
+    (08). DST: local dates never derived by adding 24 h.
+
+**Assets**
+31. Same VIN entered by two customers (car sold privately without telling the business) →
+    duplicate VIN warning + transfer flow; booking site customer flow creates a new asset with
+    `duplicateOf` flag rather than exposing the other owner.
+32. VIN decoder returns nothing (grey import, motorcycle, trailer) → manual YMM; asset still valid.
+33. Invalid check digit on a genuine non-NA VIN → warn, allow.
+34. Plate lookup provider down or not on plan → graceful fallback message; never block adding.
+35. Odometer rollback / cluster replacement / km↔mi unit mistakes → flagged, not hidden.
+36. Huge fleet (500 vehicles) → garage paginated, search within garage, bulk import vehicles CSV.
+37. Photo upload on weak 4G → resumable/chunked upload, client resize, retry queue; partial
+    uploads never attached.
+38. HEIC photos from iPhone → converted server-side; EXIF orientation applied, GPS stripped.
+39. Asset deleted that is referenced by historical jobs → archive only; jobs keep snapshot.
+40. Property asset whose address is edited → asset follows the address ID; snapshot on old jobs.
+
+**Leads & attempts**
+41. Session events arrive out of order or duplicated → seq/max logic (§10.11).
+42. 01 never sends `abandoned` (crash) → sweeper marks abandoned.
+43. Visitor completes booking on a different device later → matched by endpoint within 7 days →
+    lead Won (`self_completed`), recovery drip cancelled.
+44. Visitor abandons, returns via resume link, abandons again → same lead, attempts appended,
+    funnel shows furthest step ever and latest attempt step.
+45. Bot traffic floods booking site → no leads without contact capture; contact capture
+    rate-limited and bot-scored by 01; leads flagged `suspected_bot` hidden by default.
+46. Spam lead-form submissions with fake phones → invalid phones rejected; honeypot; duplicate
+    throttling per IP/endpoint.
+47. Lead owner deactivated → reassignment (§9.2).
+48. Lead converted while another user is dragging it to Lost → version conflict; Won wins (job
+    exists) and the drag is reverted with toast.
+49. Conversion saga partial failure (job created, lead update failed) → reconciler listens to
+    `jobs.job.created{leadId}` and completes; never two jobs (idempotency key `lead:{id}:convert`).
+50. Pipeline stage deleted with leads in it → must choose destination stage.
+51. Enrichment returns data for the wrong household (stale broker data) → per-field confidence,
+    user must select; "Report wrong data" discards & logs.
+52. Enrichment budget exhausted mid-batch → stop, partial results kept, owner notified.
+53. Postcard QR scanned by a neighbour (postcard passed on) → token maps to the mailed address,
+    but the scanner's typed details create/attach correctly; we never assume scanner = resident
+    for consent purposes.
+54. Out-of-area lead later becomes in-area (zone expanded) → saved filter "out-of-area leads now
+    covered" (02 re-resolve) — great re-engagement list [I].
+
+**Platform**
+55. Export of 100 k customers → async, chunked; link expiry; audit; rate-limited.
+56. Search under heavy load → degrade to prefix-only, never block page.
+57. Event consumer lag (stats stale) → profile shows "updated x min ago" when projection lag
+    > 60 s [I].
+58. Permission change mid-session (worker loses access) → next request 403; cached data purged
+    on device at next sync.
+59. AI assistant mass-update ("tag all customers VIP") → bulk ops from AI require human
+    confirmation step with count preview [I].
+
+---
+
+## 12. Better than Fieldd
+
+Concrete improvements (Fieldd baseline mostly unknown in detail — compare during video review):
+1. **Import dry-run + per-row error report + undo** — Fieldd advertises "one click" CSV [S: T18];
+   we keep one-click auto-mapping but add a safe preview, downloadable failures and 7-day undo.
+2. **Inline duplicate prevention while typing** (phone/email/address) instead of post-hoc cleanup;
+   plus a duplicates queue with reversible merges (30-day unmerge).
+3. **Consent as an auditable ledger** with evidence, region presets and send-time checks — turns
+   a legal liability (TCPA) into a selling point for small businesses.
+4. **Lawful lead capture by default:** first-party, notice-at-collection abandoned capture and
+   per-recipient postcard QR instead of opaque data-broker "magic"; enrichment optional, gated,
+   with cost visible before each call.
+5. **Explainable lead score + funnel analytics** with recovery rate per booking source.
+6. **Universal search that understands phone fragments, VIN/plate, emails** — type "0101" or the
+   last 6 of a VIN and get the customer in < 300 ms.
+7. **Vehicle-first garage:** free NHTSA VIN decode + recall check (no paid provider needed for the
+   basics), camera VIN scan in the team app, colour swatches, staggered tire sizes, odometer trend
+   with rollback detection, pre-existing damage log (detailing disputes).
+8. **Per-asset service timeline shareable as a branded PDF** for the customer (resale value).
+9. **Keyboard-first CRM:** `/` search, `n c` new customer, `n l` new lead, `j/k` navigate list,
+   `e` edit, `m` merge [I].
+10. **Offline team app** for customer cards/assets on job day with queued writes.
+11. **Realtime lead board** (no refresh) with "Live" visitors and optimistic drag-and-drop.
+12. **Accessibility:** WCAG 2.2 AA — board drag-and-drop has keyboard alternative (stage menu),
+    screen-reader announcements on moves, colour never the only signal (tags/stages have text).
+13. **Privacy tooling built-in:** one-click data export/erasure with receipts; retention policies.
+14. **Responsive by design** (owner requirement): list → cards, board → stage list, profile tabs
+    → segmented control; tablet gets two-pane (list + profile) layout [I].
+15. **Native apps later** (owner requirement): API surface (§8) already covers the "staff on the
+    phone builds a booking for the caller" flow — customer quick-create + vehicle lookup +
+    convert in < 60 s; same commands power desktop/iPhone apps.
+16. **Performance budgets:** customer list first page p95 < 400 ms server for 100 k customers;
+    profile open < 500 ms; board with 500 cards virtualized; search p95 < 150 ms server [I].
+
+### 12.1 Budget tier notes [I] (aligns with "affordable for starters")
+| Capability | Starter (cheapest) | Mid | Top |
+|---|---|---|---|
+| Customers, people, multiple phones/emails/addresses, tags, notes, custom fields | ✓ (≤ 10 custom fields) | ✓ (50) | ✓ |
+| CSV import/export, dedupe suggestions, merge/unmerge | ✓ | ✓ | ✓ + scheduled exports |
+| Business customers, multi-site | basic | ✓ | ✓ |
+| Consent ledger, preference centre | ✓ (non-optional — compliance) | ✓ | ✓ |
+| Assets: vehicles via YMM + NHTSA VIN decode, photos (10/asset), recalls | ✓ | ✓ (50 photos) | ✓ |
+| Camera VIN scan (team app) | ✓ | ✓ | ✓ |
+| Plate → VIN lookup, commercial trims/tire data | — | ✓ (metered) | ✓ |
+| Vehicle history reports (CARFAX-like) | — | — | ✓ (metered, partner) |
+| Lead board: 1 pipeline, board + list layouts, manual/form/QR/abandoned leads | ✓ | multiple pipelines, funnel, map, calendar | + custom scoring weights |
+| Abandoned-booking capture | ✓ | ✓ | ✓ |
+| Enrichment connector | — | BYO key | BYO or resold credits |
+| Line-type lookup | — | ✓ | ✓ |
+| Duplicate auto-merge rules | — | ✓ | ✓ |
+| Audit retention | 2 y | 3 y | 7 y |
+Fieldd's own plans: Start $199/mo includes "sales pipelines"; Pro adds heatmaps etc. [S: llms].
+Starter must include the pipeline and abandoned capture because they directly earn revenue.
+
+---
+
+## 13. Open questions
+
+1. **Q1 Fieldd's customer model shape:** is a "contact" a household/company with nested people
+   (our model) or one person with extra phones? [S: llms wording ambiguous]
+2. **Q2 Account status values** shown on Fieldd profiles [S: T09] — active/inactive/blocked? Is
+   "account status" about the portal account (registered/not) instead?
+3. **Q3 "Ratings" on the profile** [S: T09]: ratings the customer gave (reviews), ratings workers
+   give customers, or both? Same field is shown for workers.
+4. **Q4 Magic data mechanics:** what does Fieldd actually do for address-only leads and booking
+   drop-offs (vendor, cost to business, regions)? Owner's appetite for enrichment at all given
+   §5.8 risks — recommend launch without it.
+5. **Q5 Lead creation threshold:** does Fieldd show anonymous booking-page visitors as leads, or
+   only once contact details exist? [S: T10 "visited your online booking page but didn't
+   complete" suggests visitors appear]
+6. **Q6 Vehicle-size pricing:** do prices vary by vehicle size class in Fieldd's auto templates,
+   and is it driven by the selected asset? (02 dependency)
+7. **Q7 Plate lookup provider & regions**, and whether owner wants it at launch.
+8. **Q8 CARFAX partnership** feasibility for a new platform; alternatives (NMVTIS-based reports).
+9. **Q9 Lead board stages:** fixed or user-defined in Fieldd? Which "new layouts" exist [S: llms]?
+10. **Q10 Customer tax & discount fields on profile** [S: D18] — per-customer tax rate override
+    or only exempt flag? Default discount auto-applied to every booking?
+11. **Q11 Customer types** referenced by discounts [S: T09] — fixed list (residential/commercial)
+    or custom?
+12. **Q12 Who receives job notifications** for business customers with multiple people
+    ("contact info to notify" [S: T04]) — per job or per customer default?
+13. **Q13 Consent ownership** (C1) and **lead-won timing** (C3) — Agent 10 to decide.
+14. **Q14 Intake form vs booking questions** storage when the same question appears in both.
+15. **Q15 Data retention defaults** the owner is comfortable with (attempts 30 d, enrichment 90 d).
+16. **Q16 Do workers see customer phone numbers** or only a masked relay? (09 says masked outside
+    window.)
+
+---
+
+## 14. Verify against video
+
+Owner's walkthrough (https://youtu.be/vyELvdWCdnc, customer side) plus any CRM footage. Check:
+
+**Customer side (booking site / account)**
+- [ ] Where account creation happens (before/after service selection; optional or forced) and
+      what identifiers it asks for (email, phone, password vs. code).
+- [ ] Whether a returning customer is recognised by phone/email and what is pre-filled.
+- [ ] Asset step: label used (vehicle/home/equipment), fields asked (YMM? VIN? plate? colour?
+      photo?), whether saved vehicles appear as selectable cards ("garage").
+- [ ] Intake form placement and whether answers are editable later from the account area.
+- [ ] Marketing consent checkbox presence, default state, exact disclosure wording location.
+- [ ] Exact step at which phone/email is requested (determines abandoned-capture point).
+- [ ] Any "finish your booking" message received after abandoning (timing, channel, link
+      restores cart?).
+- [ ] Account area sections: profile, addresses, vehicles, history/rebook, gift cards,
+      subscriptions, payment methods, communication preferences.
+- [ ] Postcard / QR landing behaviour (if shown): pre-filled address? personalised greeting?
+- [ ] Branding applied to these screens (colours, fonts, logo, dark mode) — relevant to §9.7.
+
+**CRM side (if captured)**
+- [ ] People tab: sub-tabs, default columns, filter list, search behaviour, export icon position.
+- [ ] Customer profile: header fields, tabs, where service history, ratings, notes, account
+      status appear [S: T09]; tax/discount/notes fields [S: D18].
+- [ ] Multiple phones/people/addresses UI and business-customer fields [S: llms].
+- [ ] New customer: "Single" vs "CSV" choice [S: T18]; required fields; tag picker; "Next" button.
+- [ ] CSV import screens: mapping UI, duplicate handling, error report.
+- [ ] Vehicles tab: columns, "last service date" filter control, lookup by YMM/VIN/plate, photos,
+      colours, tire sizes, CARFAX entry point [S: llms].
+- [ ] Lead board: columns/stages, card fields, available layouts and sort options [S: llms],
+      lead detail log [S: T10], funnel step display for booking attempts [S: T10].
+- [ ] New lead: from scratch / existing customer / address-only paths [S: T20]; magic data button
+      and what it returns (and any cost prompt).
+- [ ] Convert lead → booking flow without leaving the dashboard [S: T20]: which form opens and
+      what is pre-filled.
+- [ ] Empty states, loading states, and error messages on all of the above.
+- [ ] Mobile/tablet rendering of the People tab, profile and lead board.

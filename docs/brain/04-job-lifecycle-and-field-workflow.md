@@ -1365,3 +1365,271 @@ Relations & keys:
   customer erasure (Agent 07 `customer.customer.erased`) pseudonymises job customer snapshots but keeps
   financial documents where law requires (§13 Q).
 
+---
+
+## 8. API surface
+
+Command/query style, transport-agnostic (REST/RPC/MCP all map onto it). Every mutating command takes
+`idempotencyKey` (or `commandId` from devices) and, where it edits an existing job, `expectedVersion`.
+Errors use stable codes (§8.4). Auth column = permission key (Agent 09 owns the matrix; keys proposed in
+§9.2). The same commands back the CRM web app, the **native desktop and iPhone staff apps** (owner
+requirement 2026-11-13), the worker app, the portal (token-scoped), the public API and the CRM MCP / AI
+assistant `[S: llms]` — no surface gets private logic `[D]`.
+
+### 8.1 Commands — job & lines
+
+| Command | Input | Output | Auth |
+|---|---|---|---|
+| `jobs.create` | `{mode:'appointment'\|'quote'\|'invoice', origin, customerId?, lines[], address?, assetIds[], notifyContacts[], notes, tagIds[], preferredWorkerId?, paymentTiming, discounts[], taxMode, idempotencyKey}` | `{jobId, number, version}` | `jobs.job.create` (quote mode: `quotes.quote.create`; invoice: `invoices.invoice.create`) |
+| `jobs.createFromBooking` | `{bookingSessionId, draft, scheduleHoldId, paymentRefs[], answers[], termsAcceptance, idempotencyKey}` | `{jobId, number}` | service-to-service (Agent 01/03 saga) |
+| `jobs.createOccurrence` | `{seriesId\|subscriptionId, occurrenceIndex, template, localDate}` | `{jobId, number}` | service (Agent 03/06) |
+| `jobs.update` | `{jobId, expectedVersion, patch:{customerId?, address?, assetIds?, notifyContacts?, notes?, tagIds?, preferredWorkerId?, paymentTiming?, taxMode?}}` | `{version}` | `jobs.job.edit` (+ phase locks §5.7) |
+| `jobs.lines.add` | `{jobId, expectedVersion, lines[], source, approvedByCustomer?}` | `{lineIds[], totals, version}` | `jobs.job.edit` or `jobs.addons.add` (WA upsell) |
+| `jobs.lines.update` | `{jobId, expectedVersion, lineId, patch:{qtyMilli?, unitPriceCents?, unitCostCents?, name?, description?, taxable?, assignedWorkerIds?}}` | `{totals, version}` | `jobs.job.edit`; price change: `jobs.price.override` |
+| `jobs.lines.remove` | `{jobId, expectedVersion, lineId, reason?}` | `{totals, version}` | `jobs.job.edit` |
+| `jobs.lines.refreshPrices` | `{jobId, expectedVersion, lineIds?}` | `{diff[], totals}` | `jobs.job.edit` |
+| `jobs.discounts.apply` / `.remove` | `{jobId, discountRef}` | `{totals}` | `payments.discount.apply` (Agent 05/06 key) |
+| `jobs.cancel` | `{jobId, reason, notifyCustomer, feeDecision?:'policy'\|'waive'\|'custom', feeCents?}` | `{masterStatus, invoiceOutcome}` | `jobs.job.cancel` (customer via portal token) |
+| `jobs.void` | `{jobId, sagaId}` | `{}` | service only — booking-saga compensation (Agent 03) |
+| `jobs.discardDraft` | `{jobId}` | `{}` | `jobs.job.create` (own) / `jobs.job.delete` |
+| `jobs.duplicate` | `{jobId, mode}` | `{jobId}` | `jobs.job.create` |
+| `jobs.rebook` | `{jobId}` | `{jobId}` (new, `relatedJobId`) | `jobs.job.create` |
+| `jobs.recordPast` | `{...create, completedAt, markCompleted:boolean}` | `{jobId}` | `jobs.job.backdate` |
+| `jobs.reopen` | `{jobId, reason}` | `{masterStatus}` | `jobs.job.reopen` |
+| `jobs.applySeriesChange` | `{seriesId, fromDate, patch, overwriteDetached:boolean}` | `{updatedJobIds[], conflicts[]}` | service (Agent 03) |
+| `jobs.files.add` / `.remove` | `{jobId, fileUploadId, visibility}` | `{fileId}` | `jobs.job.edit` |
+| `jobs.notes.add` | `{jobId, visibility, body}` | `{noteId}` | `jobs.job.view` (workers: worker/internal only) |
+
+### 8.2 Commands — quotes & invoices
+
+| Command | Input | Output | Auth |
+|---|---|---|---|
+| `quotes.preview` | `{jobId}` | `{html, emailPreview}` (not persisted) | `quotes.quote.create` |
+| `quotes.send` | `{jobId, expectedVersion, recipients[], channels[], subject?, message?, attachPdf, sendAt?}` | `{versionId, publicUrl}` | `quotes.quote.send` |
+| `quotes.revise` | `{jobId}` | `{draftVersionId}` | `quotes.quote.create` (+`quotes.quote.revise_accepted` if accepted) |
+| `quotes.extendExpiry` | `{jobId, expiresOn}` | `{}` | `quotes.quote.send` |
+| `quotes.withdraw` | `{jobId, reason}` | `{}` | `quotes.quote.withdraw` |
+| `quotes.accept` | `{token \| jobId, versionId, acceptorName, signature?, selectedOptionalLineIds[], method}` | `{acceptanceId, next:'book'\|'done'}` | public token scope `accept`; office: `quotes.quote.mark_accepted` |
+| `quotes.decline` | `{token \| jobId, versionId, reason, text?}` | `{}` | token scope `decline`; office: `quotes.quote.send` |
+| `quotes.bookFromQuote` | `{token, versionId, slotHoldId, paymentRefs[]}` | `{jobId, schedule}` | token scope `book` → saga with Agent 03/05 |
+| `invoices.preview` | `{jobId, invoiceId?}` | `{html, emailPreview}` | `invoices.invoice.view` |
+| `invoices.issue` | `{jobId, invoiceId?, send:boolean, recipients[]?, dueTerms?}` | `{versionId, publicUrl}` | `invoices.invoice.send` |
+| `invoices.resend` | `{invoiceId, recipients[]}` | `{}` | `invoices.invoice.send` |
+| `invoices.void` | `{invoiceId, reason}` | `{}` | `invoices.invoice.void` |
+| `invoices.markUncollectible` | `{invoiceId, reason}` | `{}` | `invoices.invoice.write_off` |
+| `invoices.createSupplemental` | `{jobId, lines[]}` | `{invoiceId, suffix}` | `jobs.job.edit_paid` |
+| `invoices.setDueTerms` | `{invoiceId, dueTerms, dueOn?}` | `{}` | `invoices.invoice.send` |
+| `documents.download` | `{jobId, docType, versionId?, format:'pdf'}` | file stream (signed URL, 5 min TTL) | view perm or token |
+| `documents.rerender` | `{renderingId}` | `{renderingId}` | `settings.communication.manage` |
+
+### 8.3 Commands — field execution (worker app; also callable from CRM by office)
+
+| Command | Input | Output | Auth |
+|---|---|---|---|
+| `field.enRoute` | `{jobId, commandId, deviceTime, etaAt, etaSource, location, notifyCustomer}` | `{trackingUrl?, notified:boolean}` | `jobs.workflow.run` (Agent 09 key) + assigned |
+| `field.cancelEnRoute` | `{jobId, commandId}` | `{}` | same |
+| `field.locationPing` | `{trackingSessionId, points[]}` (batched) | `{}` | device token; high-frequency path, not on event bus |
+| `field.arrive` | `{jobId, commandId, method, location}` | `{}` | same |
+| `field.start` | `{jobId, commandId, deviceTime, location, confirmEarly?}` | `{}` | same |
+| `field.pause` / `field.resume` | `{jobId, commandId, reason?}` | `{}` | same |
+| `field.answer` | `{jobId, responseId, itemId, value, na?, photoIds?}` | `{checklistComplete:boolean}` | same |
+| `field.photos.init` | `{jobId, photoId, stage, lineItemId?, sha256, bytes, mime, capturedAt, geo?, fromGallery}` | `{uploadUrl \| alreadyHave:true, chunkSize}` | same |
+| `field.photos.complete` | `{photoId, sha256}` | `{state}` | same |
+| `field.photos.share` / `.delete` | `{photoId, shared}` | `{}` | `jobs.photos.manage` |
+| `field.signature` | `{jobId, purpose, signerName, fileId}` | `{signatureId}` | same |
+| `field.complete` | `{jobId, commandId, deviceTime, location, overrideReason?}` | `{masterStatus, balanceDue, posRequired:boolean}` | same; override: `jobs.requirements.override` |
+| `field.noShow` | `{jobId, commandId, evidencePhotoIds[], note}` | `{}` | `jobs.job.no_show` |
+| `sync.push` | `{deviceId, commands: DeviceCommand[]}` (ordered by deviceSeq) | `{results:[{commandId, outcome, detail, jobVersion}]}` | device session |
+| `sync.pull` | `{deviceId, cursor, window:{from,to}}` | `{changes[], cursor, requirementTemplates, catalogSubset}` | device session |
+
+### 8.4 Queries
+
+| Query | Input | Output | Auth |
+|---|---|---|---|
+| `jobs.get` | `{jobId \| number}` | full Job view model (fields filtered by perms: cost/profit hidden without `settings.catalog.view_cost`) | `jobs.job.view` (workers: assigned only) |
+| `jobs.list` | `{filters:{status[], paymentStatus[], tagIds[], zoneIds[], workerIds[], customerIds[], dateRange, origin[], flags[]}, sort, cursor}` | page of rows | `jobs.job.view` |
+| `jobs.timeline` | `{jobId}` | audit entries + document events + messages summary | `settings.audit_log.view` for full; others see summarized |
+| `quotes.list` | `{state[], expiringWithinDays?, ...}` | rows | `quotes.quote.view` |
+| `invoices.list` | `{state[], overdue?, dueRange, ...}` | rows + totals | `invoices.invoice.view` |
+| `worker.day` | `{workerId, localDate}` | ordered jobs with requirement progress, route info | self or `jobs.job.view` |
+| `public.document` | `{token}` | branded view model (Agent 11 tokens) + allowed actions | token |
+| `public.tracking` | `{token}` | worker first name/photo, vehicle, ETA, last position (coarse), state | token, TTL |
+| `jobs.search` | `{q}` | jobs by number/prefix, customer, address, plate (via 07) | `jobs.job.view` |
+| `jobs.totalsPreview` | `{lines, discounts, zoneId, taxMode}` | totals (delegates to `payments.quoteTotals`) | any authenticated |
+| `invoices.reminderEligibility` | `{invoiceId \| jobId, reminderKind}` | `{eligible:boolean, reason}` | service (Agent 08) |
+
+### 8.5 Error codes
+
+`JOB_VERSION_CONFLICT` (409, includes current version + diff), `JOB_LOCKED_PHASE`, `JOB_CANCELLED`,
+`QUOTE_EXPIRED`, `QUOTE_SUPERSEDED` (includes latest version link), `QUOTE_WITHDRAWN`, `QUOTE_ALREADY_ACCEPTED`
+(200-equivalent for idempotent replays), `INVOICE_HAS_PAYMENTS` (void blocked), `INVOICE_EXPORT_LOCKED`,
+`REQUIREMENTS_UNMET` (lists items), `NOT_ASSIGNED`, `ANOTHER_JOB_EN_ROUTE`, `EARLY_START_CONFIRM_REQUIRED`,
+`NO_DELIVERABLE_CHANNEL`, `NUMBER_PROVISIONAL`, `PHOTO_HASH_MISMATCH`, `RATE_LIMITED`, `PERMISSION_DENIED`,
+`TOKEN_INVALID` (404 shape, no existence leak).
+
+---
+
+## 9. Interfaces with other modules
+
+### 9.1 Ownership boundaries (summary)
+
+| Concern | Owner | 04's role |
+|---|---|---|
+| Job aggregate, number, master status, quote/invoice documents, field execution, photos, checklist responses, audit | **04** | owner |
+| Time window, assignments, schedule blocks, routes, recurring series, availability, dispatch | **03** (`JobSchedule` keyed by `jobId`) | projection only; 03 never changes job status, 04 never changes time/worker (matches 03 §1 boundary) |
+| Totals breakdown, tax order, payments, tips, deposits, refunds, A/R ledger, POS tendering, payment status | **05** (`PriceBreakdown`, ledger) | calls `payments.quoteTotals` / `payments.saveBreakdown`; projects balance; issues invoice documents |
+| Catalog items, prices, durations, checklist/photo/question templates, add-on pairing, inventory, zones, travel fee, zone tax | **02** | snapshots onto lines and requirements |
+| Customers, contacts/people, addresses, consent, assets, leads | **07** | references + snapshots on documents |
+| Discount codes, subscriptions, gift cards | **06** | references; gift card = tender via 05 |
+| Notification templates, channels, consent enforcement, reminders scheduling, inbox/chat, reviews, reports | **08** | emits triggers; supplies view-models |
+| Roles, permission keys, worker profile, timesheets | **09** | checks permissions; prompts clock-in |
+| Booking portal UI, customer accounts, public pages hosting, cancellation policy, tracking page host | **01** | provides document/tracking view-models & commands |
+| Brand tokens, fonts, logos, copy overrides, light/dark, responsive design system, native app shells | **11** | renders documents with resolved tokens |
+
+### 9.2 CONSUMES
+
+| From | Event / API | Use in 04 |
+|---|---|---|
+| 01 | `jobs.createFromBooking` call (inside 03's commit saga); `portal.booking.confirmed` | create job with origin online_booking/quote_booking; booking answers, T&C evidence, source |
+| 01 | `portal.cancellation.completed` / `portal.reschedule.completed` | reflect customer cancellations (cancel via `jobs.cancel{actor:customer}`) and reschedules (via 03) |
+| 01 | `portal.invoice.payment_started` | show "Customer is paying…" lock on invoice edits for 10 min `[D]` |
+| 02 | `catalog.requirements.resolve(serviceIds[], addonIds[], zoneId)` (sync API — **proposed to 02**) | build RequirementsSnapshot: global + service checklists, questions, photo min counts per stage `[S: t06]` |
+| 02 | catalog item lookup with price/cost/duration/taxable/pairing/inventory | line defaults & snapshots `[S: t06, t07]` |
+| 02 | `coverage.zone.resolve(address)` → zone, travel fee, tax rate | fee line + tax rate snapshot `[S: t11]` |
+| 02 | `catalog.service.updated`, `coverage.tax_rate.changed`, `coverage.travel_charge.changed` | no change to snapshotted jobs; draft jobs show "Price/tax updated — refresh?" |
+| 03 | `scheduling.job.scheduled` / `.rescheduled` / `.unscheduled` | schedule projection; invoice auto-create; quote → booked; en-route reset |
+| 03 | `scheduling.assignment.created` / `.removed` / `.changed`, `scheduling.job.split` | assignment snapshot; WA list visibility; split lines `[S: llms]` |
+| 03 | `routing.route.started` / `.optimized` / `.reoptimized` | WA route ordering `[S: t02]` |
+| 03 | `jobs.createOccurrence`, `jobs.applySeriesChange`, `jobs.cancel` (skip), `jobs.void` (saga compensation) | recurring materialisation `[S: t14]` |
+| 05 | `payments.quoteTotals` / `payments.saveBreakdown` (sync) | authoritative totals; 04's §5.2 algorithm is the shared reference implementation (pure library also used offline in WA) |
+| 05 | `payments.payment.succeeded` / `.authorized` / `.reversed`, `payments.refund.succeeded`, `payments.tip.added` | invoice issuance on first payment, allocation, invoice state |
+| 05 | `payments.job.balance_changed` | `paymentStatus` projection & jobs list column `[S: t08]` |
+| 05 | `payments.dispute.opened` / `.updated` | `disputed` flag; evidence pack request (04 supplies job, photos, checklist, signatures, timestamps) |
+| 06 | discount validation API, `subscription.subscription.cancelled/paused` | discount refs; future subscription occurrences cancelled via 03 |
+| 07 | customer/contact/address/asset lookups; `customer.customer.merged` | re-point `customerId` on all jobs (documents keep historical snapshot) |
+| 07 | `customer.consent.changed`, `customer.customer.erased`, `asset.asset.transferred` | send guards; pseudonymisation; asset snapshot unchanged on old jobs |
+| 08 | `comms.message.delivered` / `.failed` (for document sends), `comms.conversation.message_received` (with jobId) | recipient delivery state on quote/invoice; job Messages tab badge |
+| 08 | `invoices.reminderEligibility` call-back pattern | reminders only if still eligible |
+| 09 | permission checks; `team.member.deactivated` | deactivated worker: unassign future jobs (03) and keep their historical visits; in-progress job flagged for office |
+| 11 | `brand.tokens.resolve`, brand version ids, copy overrides | document & public page rendering (§5.11) |
+
+### 9.3 PRODUCES (event catalog)
+
+All events carry `{eventId, occurredAt, businessId, jobId, jobNumber, jobVersion, actor, source}`.
+Payload-heavy events include the minimal fields listed; consumers fetch the rest via `jobs.get`.
+
+| Event | Key payload | Main consumers |
+|---|---|---|
+| `job.job.created` | origin, mode, customerId, leadId?, seriesId?, suppressCustomerNotifications | 03, 07 (lead link), 08 (reporting), 10 |
+| `job.job.updated` | changed fields (material: address, services, notes) | 08 (W-05 worker notice), 03 |
+| `job.job.status_changed` | from, to, cause | 08 dashboards/reporting, 03 calendar colors, 10 |
+| `job.line.added` / `job.line.updated` / `job.line.removed` | line snapshot, source, addedBy | 02 (inventory reserve), 05 (breakdown), 08 (upsell reporting) |
+| `job.job.lines_changed` | durationDeltaMin, totals | 03 (duration conflicts; alias of 03's `job.lines.changed`) |
+| `job.job.totals_changed` | totals | 05, 08 |
+| `job.job.en_route` | workerId, etaAt, trackingUrl, notifyContacts | 08 (N-D01 on-my-way `[S: llms, t11]`), 03 (live ETA); alias of 03's `job.job.on_my_way` and 01's `job.worker.on_my_way` |
+| `job.visit.arrived` / `.paused` / `.resumed` / `.en_route_cancelled` | workerId, at | 03, 08 (optional arrived message) |
+| `job.job.started` | workerIds, startedAt | 03 (actual start, overrun), 08 (N-D03 optional), 09 (timesheet hint) |
+| `job.job.completed` | completedAt, lines, assets, workers, totals, balanceDue, photosShared[], backfilled | 03 (route progress / auto-close `[S: t02]`), 02 (inventory decrement), 05 (auto-charge after job, revenue), 06 (subscription usage), 07 (asset service record, last service date `[S: llms]`), 08 (N-D04, review booster `[S: llms]`, leaderboard `[S: t09]`), 09 (job time) |
+| `job.job.reopened` | reason | 03, 02 (inventory reversal), 08 |
+| `job.job.cancelled` | reason, actor, feeCents (per policy), refundNeeded | 03 (release), 05 (fee/refund), 06, 07, 08 (cancellation notice) — alias of 05's `job.job.canceled` (spelling: we standardise on `cancelled`) |
+| `job.job.no_show` | evidence ids, feeCents | 03, 05, 08 |
+| `job.checklist.completed` / `.reopened` | itemsAnswered | 08 (reporting), office UI |
+| `job.requirements.overridden` | unmet items, reason, by | 08 (owner alert), 09 (audit) |
+| `job.photo.added` / `job.photo.uploaded` | photoId, stage, sharedWithCustomer | 08 (dashboard "all photos" `[S: llms]`, N-D04 wait-for-uploads) |
+| `job.signature.captured` | purpose | 05 (dispute evidence) |
+| `quote.quote.sent` / `.viewed` / `.revised` / `.accepted` / `.declined` / `.expired` / `.withdrawn` / `.expiry_changed` | versionId, recipients, expiresOn, bookOnline, total, reason | 08 (N-Q01, N-Q04, A-04, reminders), 07 (lead pipeline), 03 (`accepted` with bookOnline → book-from-quote entry), 01 |
+| `invoice.invoice.created` | invoiceId (draft) | 05 |
+| `invoice.invoice.issued` | versionId, total, dueOn, breakdownVersion | 05 (revenue recognition — **alias of 05's `job.invoice.finalized`**) |
+| `invoice.invoice.sent` / `.viewed` | recipients | 08 (N-I01, reminder scheduling `[S: t04]`) |
+| `invoice.invoice.payment_applied` / `.paid` / `.refund_applied` | amounts, balance | 08 (receipts, cancel reminders), 07 (customer balance) |
+| `invoice.invoice.revised` | versionNo, delta | 05, 08 ("updated invoice") |
+| `invoice.invoice.overdue` | dueOn, balance | 08 (overdue reminders), 07 |
+| `invoice.invoice.voided` / `.written_off` | reason | 05, 08 |
+
+### 9.4 Contracts with specific agents (as requested)
+
+**Agent 02 — checklists & photo rules**
+- 02 owns *templates*: global checklist items, service-specific items, question types, required flags, photo
+  minimum counts per stage (before/after) `[S: t06]`, and whether a service's photo rule is additive.
+- 04 owns *instances*: the RequirementsSnapshot on each job and all responses/photos.
+- API needed from 02: `catalog.requirements.resolve({serviceIds, addonIds, zoneId}) → {items[], photoRules[], signatureRequired}`
+  with `templateVersion` per item. Deterministic; cacheable on device for offline upsell (WA downloads the
+  requirement templates for every service the worker can sell).
+- Template edits never mutate open jobs' snapshots; office can "Refresh requirements" on a not-started job.
+- Inventory: 02 reserves on `job.line.added` (product add-on), decrements on `job.job.completed`, releases on
+  `job.job.cancelled`/`job.line.removed`, reverses on `job.job.reopened` then re-decrements on next completion.
+
+**Agent 03 — schedule & assignment**
+- 03 owns `JobSchedule`; creation of a booked job is **one commit saga run by 03** (hold → `jobs.createFromBooking`
+  → confirm blocks → payment step by 05 → commit; compensation `jobs.void`). 04 returns `{jobId, number}`.
+- 04 never writes time/worker; 03 never writes status. 03 relies on `job.job.en_route/started/completed/cancelled/no_show`
+  and `job.job.lines_changed` (duration) — names aligned in §9.3.
+- Route close `[S: t02]`: 03 auto-closes on the last stop's terminal event (completed / cancelled / no_show).
+- Recurring "commit to all future" `[S: t14]`: 03 calls `jobs.applySeriesChange`; detached occurrences reported back.
+- Backdated jobs `[S: llms]`: 03 marks `isBackdated` on `scheduling.job.scheduled`; 04 offers completion (W14).
+
+**Agent 05 — payments on the job**
+- 05 is the authority for totals (`PriceBreakdown`), tax order, deposits, pre-auth, tips, tenders and balance.
+  04 keeps `JobLineItem.id` stable so 05's breakdown `line_id` maps 1:1.
+- Invoice *document* lifecycle is 04's; the *ledger* is 05's. 04 emits `invoice.invoice.issued` (= 05's
+  `job.invoice.finalized`) which 05 uses for revenue recognition; 05 emits `payments.payment.succeeded`
+  and `payments.job.balance_changed`, which 04 uses for invoice state.
+- POS hand-off from completion: 04 opens 05's POS with `{jobId, invoiceId, amountDue, allowSendInvoice:true}`;
+  "Send invoice" tender delegates back to `invoices.issue{send:true}` `[S: t16]`.
+- Cancellation/no-show fee amount is computed by policy (01's cancellation policy, 05 charges); 04 records the fee
+  line/revision. 05's dispute evidence pack pulls 04's photos, checklist, signatures, GPS timestamps.
+
+**Agent 07 — customers & assets**
+- Jobs reference `customerId`, `contactId`s, `addressId`, `assetIds`; documents print snapshots.
+- 04 emits `job.job.completed` with assets → 07 writes `asset.service_record.added` / last-service date `[S: llms]`.
+- Merge: 07 emits `customer.customer.merged{from,to}` → 04 re-points jobs idempotently. Erasure: pseudonymise.
+- Lead conversion uses `jobs.create{origin:'lead_conversion', leadId}`; 07 marks lead won on `job.job.status_changed`
+  to `scheduled`/`approved`.
+
+**Agent 08 — notifications**
+- 04 emits; 08 decides channel/consent/template and owns the catalog (IDs N-Q01, N-Q04, N-I01, N-D01, N-D03, N-D04,
+  A-04, W-05 already defined by 08 map to the events above).
+- 04 supplies view-models `VS-QUOTE`, `VS-INVOICE`, `VS-JOB` (document link, totals, balance, ETA, tracking link,
+  shared photos) and the reminder-eligibility query; 08 must re-check eligibility immediately before each
+  reminder send (race with payments).
+- Quiet-hours/backdated suppression flag `suppressCustomerNotifications` honoured by 08.
+- Document style (look of quotes/invoices) lives in Settings → Communication → Email per `[S: t04]` — UI hosted in
+  08's settings area, data model owned by 04 + brand tokens by 11.
+
+**Agent 09 — who can do what** (proposed permission keys; 09 owns final matrix, key format `module.resource.action`)
+
+| Key | Default: Owner/Admin | Manager | Foreman | Worker | Estimator |
+|---|---|---|---|---|---|
+| `jobs.job.view` (all) | ✔ | ✔ | crew | assigned | own + assigned |
+| `jobs.job.create` | ✔ | ✔ | ✔ | ✗ | ✔ |
+| `jobs.job.edit` | ✔ | ✔ | crew | ✗ | own quotes |
+| `jobs.addons.add` (POS upsell) | ✔ | ✔ | ✔ | ✔ | ✔ |
+| `jobs.price.override` | ✔ | ✔ | ✔ | ✗ | ✔ |
+| `jobs.job.cancel` | ✔ | ✔ | ✗ | ✗ | ✗ |
+| `jobs.job.no_show` | ✔ | ✔ | ✔ | ✔ | ✗ |
+| `jobs.job.reopen` | ✔ | ✔ | ✔ | ✗ | ✗ |
+| `jobs.job.edit_completed` / `edit_paid` | ✔ / ✔ | ✔ / ✗ | ✗ | ✗ | ✗ |
+| `jobs.job.backdate` | ✔ | ✔ | ✗ | ✗ | ✗ |
+| `jobs.workflow.run` (en route/start/complete) | ✔ | ✔ | ✔ | ✔ | ✔ |
+| `jobs.requirements.override` | ✔ | ✔ | ✔ | ✗ | ✗ |
+| `jobs.photos.manage` (delete/share) | ✔ | ✔ | ✔ | own, before verify | own |
+| `quotes.quote.create` / `send` | ✔ | ✔ | ✔ | ✗ | ✔ |
+| `quotes.quote.mark_accepted` / `withdraw` / `revise_accepted` | ✔ | ✔ | ✗ | ✗ | own |
+| `invoices.invoice.view` / `send` | ✔ | ✔ | crew | assigned (send only from POS) | ✗ |
+| `invoices.invoice.void` / `write_off` | ✔ | ✗ | ✗ | ✗ | ✗ |
+| `settings.catalog.view_cost` (cost/profit on jobs) | ✔ | ✔ | ✗ | ✗ | ✗ |
+| `wa.payment.skip` (complete without collecting) | ✔ | ✔ | ✔ | ✗ | ✗ |
+
+Also from 09: timesheets — 04 shows a clock-in prompt when `promptClockIn` and the worker has timesheet permission
+`[S: t03]`; 04 never creates timesheet entries.
+
+**Agent 01 — booking portal**: hosts public quote/invoice/tracking pages on the business subdomain using 04's
+`public.document` / `public.tracking` view-models; runs the book-from-quote slot step; enforces cancellation
+policy and passes `jobs.cancel{actor:'customer'}`.
+
+**Agent 11 — branding**: §5.11. 04 needs `brand.tokens.resolve` with surfaces `document`, `document_email`,
+`document_page`, `tracking_page`, `worker_app`; logo placements `invoice`, `email`, `header`, `mobileHeader`;
+font files with licences permitting PDF embedding; copy-override keys for every document label (04 provides the
+key list: `doc.quote.title`, `doc.invoice.title`, `doc.balance_due`, `doc.book_online`, `doc.accept`,
+`doc.decline`, `doc.terms`, `doc.valid_until`, `doc.due_on`, `doc.paid_stamp`, `doc.void_stamp`, …).
+
