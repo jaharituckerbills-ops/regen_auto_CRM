@@ -2455,3 +2455,845 @@ Operational rules:
 - On a secret-read failure, the pipeline fails closed: the message stays `rendered`, then retries,
   then alerts ops. It never falls back to an unsigned or unauthenticated send.
 - Webhooks without a valid signature are rejected with 401 and counted.
+
+---
+
+## 10. Algorithms / pseudo-code
+All `[I]`. Pseudo-code is language-neutral.
+
+### 10.1 Send pipeline
+```
+function process(intent):
+  # 1. idempotent insert
+  msg = insert OutboundMessage(state='pending', key=intent.idempotency_key) ON CONFLICT DO NOTHING RETURNING *
+  if msg is null: return existing(intent.idempotency_key)          # duplicate event / retry
+
+  def = catalog(intent.definition_id)        # may be null for campaign/drip/conversational
+  # 2. recipient endpoint
+  ep = resolveEndpoint(intent.recipient, intent.channel)  # 10.16
+  if ep is null: return fallbackOrSuppress(msg, 'no_endpoint')
+  # 3. eligibility (fast projection + synchronous opt-out table)
+  elig = SendEligibility[business, ep]
+  if suppressed(ep) or !allowed(elig, intent.purpose, intent.channel):
+      return fallbackOrSuppress(msg, reason)
+  if intent.channel=='sms' and elig.line_type=='landline': return fallbackOrSuppress(msg,'landline')
+  if intent.channel=='sms' and !sender(business).sms_enabled: return fallbackOrSuppress(msg,'sender_not_registered')
+  # 4. quiet hours
+  tz = recipientTz(intent, ep)                                 # 5.5.1
+  cls = quietClass(def, intent)                                # incl. TXN* promotion to CRIT
+  t = max(now, intent.not_before)
+  allowed_at = nextAllowed(t, tz, policy(business, cls))       # 10.2
+  if allowed_at > now: msg.state='deferred'; timer(msg, allowed_at); return
+  # 5. frequency cap (marketing)
+  if intent.purpose=='marketing' and capExceeded(ep):
+      if intent.drip_id: defer to nextCapSlot(ep) else suppress('frequency_cap'); return
+  # 6. budget
+  if overBudget(business, intent.purpose, channel): suppress or fallback per policy; return
+  # 7. render (resolve variables NOW)
+  ctx = loadVariables(def.variable_set, intent.subject)        # current state of job/invoice
+  if subjectInvalid(def, ctx, intent.subject.version): cancel(msg,'subject_changed'); return
+  r = render(templateFor(def|campaign|step, business, channel), ctx, brandTheme(business))
+  if r.error: fail(msg,'render'); return
+  if intent.purpose!='marketing': r = stripPromoBlocks(r, elig)          # 5.2 mixed-content rule
+  links = mintShortLinks(r, msg)                                        # tenant host
+  store(msg, r, links, segments(r), costEstimate)
+  # 8. provider send with retry
+  for attempt in 1..5:
+     res = provider(channel).send(r, from=sender, idempotency=msg.id)
+     if res.ok: msg.state='sent'; emit comms.message.sent; return
+     if res.permanent: fail(msg, res.code); fallbackIfAllowed(msg); return
+     sleep(backoff(attempt))   # exponential 2^n s + jitter; via timer, not thread sleep
+  msg.state='failed'; alertOpsIfSystemic()
+
+function fallbackOrSuppress(msg, reason):
+  msg.state='suppressed'; msg.state_reason=reason; emit comms.message.suppressed
+  for ch in def.fallback where ch != msg.channel and not alreadySentVariant(msg.subject, def, ch):
+     enqueue intent(channel=ch, key=msg.key+':fb:'+ch); break
+```
+Concurrency: workers lease messages (`state=ready`, `lease_expires_at`). A provider call is made
+only by the leaseholder. If a crash happens after the provider accepted the message but before the
+DB update, the message is re-sent under the same provider idempotency key where the provider
+supports one (Postmark/SES lack this). Otherwise the per-recipient duplicate guard (5.4) catches
+the repeat: body hash plus 10-minute window. That guard is best effort, so accept rare duplicates
+over losing messages.
+
+### 10.2 Quiet hours — `nextAllowed(t, tz, policy)` (DST-safe)
+```
+function nextAllowed(t_utc, tz, windows, blackout_dates):
+  if windows == ALWAYS: return t_utc
+  local = toZoned(t_utc, tz)                     # wall clock
+  for d in 0..14:                                # search horizon
+     day = local.date + d
+     if day in blackout_dates: continue
+     for w in windows where day.weekday in w.days (sorted by start):
+        start = zonedDateTime(day, w.start, tz, disambiguation='later')   # nonexistent 02:30 → 03:00+
+        end   = zonedDateTime(day, w.end,   tz, disambiguation='earlier')
+        candidate = (d==0) ? max(t_utc, start) : start
+        if candidate < end: return candidate
+  return null   # no window in 14 days → suppress('no_send_window')
+```
+- Windows are defined in wall-clock time, so a 08:00 start stays 08:00 on DST-change days.
+- Ambiguous times (fall back): use the later instant for starts and the earlier instant for ends.
+  This shortens the window and never lengthens it.
+- Multi-tz area codes use the intersection of windows (5.5.1 step 4).
+
+**Reminder pull-forward** (5.5.2):
+```
+due = start - offset
+if !inWindow(due): prev = previousAllowedEnd(due) - 1min
+   due = (prev >= booked_at + 5min) ? prev : SKIP
+```
+
+### 10.3 Reminder scheduling with superseding versions
+```
+on booking.appointment.created/rescheduled/reassigned(job, version):
+  for slot in enabledReminderSlots(business):           # reminder_1, reminder_2, pre_visit, review...
+     due = computeDue(slot, job)                         # 10.2 pull-forward
+     if due == SKIP or due <= now: cancel(slot); continue
+     upsert ScheduledNotification(definition, job.id, slot) set due_at=due, subject_version=version
+on booking.appointment.canceled(job): cancel all slots for job
+on timer due(sn):
+  job = load(sn.subject_id)
+  if job.version_for_schedule != sn.subject_version or job.status in (canceled, completed): skip
+  comms.notify(sn.definition_id, subject={job, version}, key=sn.id+':'+sn.subject_version)
+```
+Debounce for change notices (N-B06, W-03/W-04):
+- Upsert `pending_change(job)` with `not_before = now + 120s` and `latest_version`.
+- When the timer fires, send if `latest_version` equals the current job version. Otherwise the newer
+  change has re-armed the timer.
+- If the net effect returned to the original time and workers, send nothing. Compare
+  `first_seen_state` with `final_state`.
+
+### 10.4 Drip engine (durable timers, enrollment, exits, idempotency)
+**Components:**
+- **Trigger Matcher** (event consumer).
+- **Scheduler** (date and segment triggers).
+- **Step Executor** (worker pool).
+- **Timer Service** (shared `DurableTimer` table, polled every 5s with leased batches; at higher
+  scale, a time-bucketed queue).
+These map onto any workflow runtime (a Temporal-style engine, or a DB-backed queue). Choosing one is
+deferred to the stack decision. The guarantees below are required regardless.
+
+Guarantees:
+- **At-least-once execution**, with **effectively-once sends** via idempotency keys
+  `drip:{enrollment_id}:{step_id}:{run_seq}`. `run_seq` increments only for loops (none in v1),
+  so retries reuse the same key.
+- **Durable timers** survive deploys and crashes. A timer is `pending → leased(60s) → done`. An
+  expired lease returns the timer to pending.
+- **Ordering per enrollment.** Only one executor may hold an enrollment lease, so steps never run in
+  parallel for the same contact.
+
+```
+on event E:                                  # Trigger Matcher
+  for drip in liveDripsWithTrigger(E.type, E.business_id):   # indexed by (business, trigger event)
+     v = drip.current_version
+     if !matches(v.trigger.where, E) or !matchesRule(v.filters, contactOf(E)): continue
+     key = enrollmentKey(v, E)               # 'once' | E.occurrence_id | floor(now/cooldown)
+     if !reentryAllows(drip, contact, v.reentry): continue
+     if !anyStepSendable(v, contact): count ineligible; continue
+     insert Enrollment(... state='active', step_id=v.steps[0].id) ON CONFLICT DO NOTHING
+     if inserted: enqueue execute(enrollment)
+  for enr in activeEnrollmentsAffectedBy(E):  # exit conditions & wait_until events (indexed by contact)
+     if exitConditionMet(enr, E): exit(enr, reason) ; continue
+     if enr.state=='waiting' and enr.wait_event==E.type: resume(enr)
+
+execute(enr):                                # Step Executor (leased)
+  lock enr (lease); if enr.state in terminal: return
+  drip = load(enr.drip_id); if drip.state in (paused, paused_by_system): enr.state='held'; return
+  step = version(enr).step(enr.step_id)
+  if now - enr.step_due_at > 72h and !step.always_send and isMessage(step): record skipped_late; advance(enr); return
+  switch step.type:
+   case email|sms|push:
+      if !eligible(contact, step.channel, 'marketing'): record skipped; advance(enr); return
+      comms.process(intent(channel, purpose='marketing' unless drip.transactional,
+              key='drip:'+enr.id+':'+step.id+':0', not_before=sendTiming(drip, contact)))
+      record EnrollmentStepRun(sent|suppressed); advance(enr)
+   case delay:
+      due = now + step.minutes
+      if step.align_to_send_window and nextIsMessage: due = nextAllowed(due, tz, sendWindow)
+      timer(enr, due); enr.state='waiting'
+   case wait_until: timer(enr, computeAt or now+timeout); enr.wait_event = step.event; enr.state='waiting'
+   case branch: enr.step_id = eval(step.condition, contact) ? then : else; enqueue execute(enr)
+   case action: doAction idempotently (key enr.id+step.id); advance(enr)
+   case exit: complete(enr)
+
+advance(enr): next = nextStep(enr); if none: complete(enr) else enr.step_id=next; enqueue execute(enr)
+```
+Date triggers:
+- A nightly scheduler, run per business at 00:10 local, finds contacts whose date field plus
+  offset equals today.
+- It enqueues enrollments with the `enrollment_key = YYYY` (yearly) or the date.
+- Sends are spread with send timing, e.g. 10:00 local.
+- Fixed holiday dates use a holiday table per country, including movable holidays (Thanksgiving,
+  Easter, Mother's Day), computed yearly.
+
+Segment-entry triggers:
+- Incremental: on any contact change event, re-evaluate segment membership for the segments that
+  reference the changed fields (field→segment index).
+- Time-relative rules ("no booking in 90 days") are evaluated by a nightly sweep.
+- Membership transitions emit `segment.entered` and `segment.left` internally.
+
+Version migration (4.12 step 11):
+- In-flight enrollments map `step_id` to the new version.
+- If the step was deleted, move to the next surviving step in the old order that exists in the new
+  version.
+- If none remains, the enrollment completes.
+
+### 10.5 Attribution assignment
+```
+on booking.appointment.created(job):
+  c = job.customer_id; t = job.booked_at
+  if job.session.link_token → touch = touchOf(token); rule='direct_token'
+  elif job.discount_redemption.issued_by_source → touch = codeTouch; rule='code'
+  else:
+     cands = touches(c) where t - touch.at <= window(touch.kind) and touch.at <= t
+             and (touch.source is drip → enrollment.started_at <= t)
+     touch = argmax over cands by (precedence(kind), touch.at)
+  if job.series_id and not firstOfSeries(job): attribution none (series_parent=…)
+  upsert Attribution(job_id, …, model_version=1)          # idempotent on job_id
+on job canceled → Attribution.pipeline_value=0 (kept for audit)
+recognized value comes from rollups joined on job_id (accrual M-NET per job incl. later refunds)
+```
+Model changes bump `model_version`. Historical attributions are recomputed in a backfill job, and
+the UI labels the model in use.
+
+### 10.6 Inbound keyword handling (STOP/HELP/START)
+```
+normalize(body): trim, strip punctuation/emoji, uppercase, collapse spaces
+STOP_SET  = {STOP, STOPALL, UNSUBSCRIBE, CANCEL, END, QUIT, REVOKE, OPTOUT, OPT OUT, STOP ALL,
+             ARRET (fr-CA), ALTO/PARAR (es)}
+START_SET = {START, UNSTOP, YES, SUBSCRIBE, RESUME}      # YES only when a double-opt-in is pending or after STOP
+HELP_SET  = {HELP, INFO, AIDE, AYUDA}
+if norm in STOP_SET (exact match, or first word in STOP_SET and ≤ 3 words):
+    write revoke(all_sms) synchronously to SendEligibility + ledger via 07; cancel queued SMS to that endpoint
+    send N-M04 STOP confirmation once (no further messages)
+elif norm in START_SET and endpoint revoked: grant (transactional restored; marketing only if prior written consent
+    existed and the reply is to the business's number → treat START as renewed express consent for marketing? NO:
+    restore only the purposes that were granted before STOP; record method=keyword_reply)
+    send START confirmation
+elif norm in HELP_SET: send HELP response (business name, phone/email, "Reply STOP to opt out")
+else: pass to conversation; run free-text opt-out detector:
+    regex on phrases ("stop texting", "remove me", "don't text", "unsubscribe", "wrong number")
+    → pause marketing consent + inbox task "Possible opt-out"; "wrong number" → mark endpoint invalid for that contact
+```
+Carrier-level STOP (some providers auto-handle STOP and block further sends) is mirrored. A provider
+error "recipient opted out" during a send also triggers a revoke.
+
+### 10.7 Inbound routing & conversation threading
+```
+on inbound sms(from, to, body, sid):
+  dedupe on sid
+  biz = businessByNumber(to)
+  convo = conversation(biz, endpoint=from) or create
+  contacts = contactsByPhone(biz, from)               # may be 0..n
+  convo.contact_ids ∪= contacts
+  job = activeJobFor(contacts, window ±4h of now) or nextJob(contacts, 48h)
+  msg = append(convo, inbound, job_id=job?.id)
+  assignee = convo.assignee if active(convo.assignee)
+           else (job and job.workers.length==1 and perm(worker,'inbox.view_assigned')) ? worker
+           else null (Unassigned)
+  notify assignee or owners (A-10, W-11)
+```
+Masked worker relay:
+- A worker reply from the worker app is sent from the business number. The customer never sees the
+  worker's number.
+- A worker "Call" uses the business number via a voice proxy (future; voice is out of scope for v1).
+
+Email replies:
+- Reply-To is `reply+{conversation_token}@inbound.{platform}`. The inbound parser strips quoted
+  history (heuristics plus `In-Reply-To` headers) and appends to the conversation.
+- Unknown tokens go to the business's unassigned folder.
+
+### 10.8 Throttling (sender capacity)
+- A token bucket per sender (number, TF number, email domain/IP pool, postcard vendor).
+- Capacity comes from the registration: 10DLC throughput per campaign/brand score; TF verified rate;
+  ESP rate.
+- Campaign sends draw tokens. Transactional sends have **priority lanes**: CRIT > TXN > CONV > MKT,
+  with marketing limited to 70% of capacity so a broadcast never delays on-my-way texts.
+- Example: a business with a 4 msg/s cap sending to 2,000 → ~12 minutes. The UI shows the estimated
+  finish time.
+
+### 10.9 SMS segment & cost calculation
+```
+gsm7_basic = GSM 03.38 basic set; gsm7_ext = { ^ { } \ [ ~ ] | € }  (each counts 2 septets)
+if all chars in gsm7_basic ∪ gsm7_ext:
+   units = Σ (char in ext ? 2 : 1)
+   segments = units <= 160 ? 1 : ceil(units / 153)
+   encoding = GSM7
+else:
+   units = UTF-16 code units (emoji = 2)
+   segments = units <= 70 ? 1 : ceil(units / 67)
+   encoding = UCS2
+cost = segments * (rate(provider, country, encoding) + carrierFee(dest carrier, registration))
+```
+Smart-character normalization (optional, default on):
+- Curly quotes → straight, en/em dashes → "-", ellipsis → "...", non-breaking space → space.
+- This keeps the message in GSM-7 and roughly halves cost.
+- Applied at render, never to user-visible names unless the setting is on.
+
+### 10.10 Reporting rollups (fast dashboards, incremental refresh)
+**Goal** [I]:
+- p95 tile response < 300 ms.
+- Dashboard of 12 tiles < 1.5 s on 4G.
+- Freshness: money and jobs within 60 s of the source event; marketing within 5 min.
+
+**10.10.1 Pipeline**
+```
+source events (outbox) → Fact Mapper (pure function per event type, versioned)
+   → FactContribution rows (signed measures, keyed by source_event_id+line_no → idempotent)
+   → mark RollupPartitionState(business, month) dirty
+Rollup Refresher (every 10–30 s per dirty partition, or on read if older than SLA):
+   for each dirty (business, month): recompute affected days only:
+     DELETE FROM rollup WHERE business, local_date IN affected_days
+     INSERT … SELECT business, local_date, basis, dims…, SUM(measures) FROM FactContribution
+            WHERE business AND local_date IN affected_days GROUP BY …
+   (or an incremental UPSERT adding deltas: rollup.measure += contribution, exactly-once guaranteed by
+    "insert contribution then apply delta" in one transaction with a processed-marker)
+```
+- **Late-arriving / retroactive events.** Example: a refund posted today against a job completed last
+  month. Accrual "posted" view: contributes on the refund date. Restated view: contribution dated
+  to the original recognition date, which marks last month's partition dirty.
+- **Corrections.** If a source event is voided, a compensating contribution with negated measures is
+  inserted. Rows are never updated in place.
+
+**10.10.2 Grains** (separate rollup tables; each tile maps to the smallest table that answers it):
+| Rollup | Grain (dims) | Serves |
+|---|---|---|
+| R1 money_daily | business, date, basis | Revenue trend, KPIs |
+| R2 money_by_worker_daily | + worker | Leaderboard revenue, worker summary |
+| R3 money_by_service_daily | + service/add-on | Top services, attach rate |
+| R4 money_by_zone_daily | + zone/shop | Service areas |
+| R5 jobs_daily | business, date, status-transition, source, job_type, zone, worker | Jobs, sources, cancellations |
+| R6 customer_daily | business, date (new, returning, active counts) + customer_ltv table (per customer running totals) | Customer KPIs, best customers |
+| R7 reviews_daily | business, date, worker, rating bucket | Reviews, leaderboard |
+| R8 marketing_daily | business, date, campaign/drip, step, channel (sent, delivered, clicks, unsub, cost, attributed bookings/revenue) | Marketing |
+| R9 funnel_daily | business, date, source (visits, started, captured, booked, abandoned, recovered) | Funnel |
+| R10 hours_daily | business, date, worker (hours, labor cost) | Utilization, labor |
+Month and year totals are computed by summing days (≤ 366 rows per series), which is cheap. For
+multi-year ranges a monthly rollup R*_monthly is maintained by the same refresher.
+
+**10.10.3 Top-N and ranking queries** (best customers, top services): served from R3/R6 with
+`ORDER BY sum DESC LIMIT N`, using the index on `(business, local_date)`. For "all time" queries,
+use the customer_ltv running-total table.
+
+**10.10.4 Time-zone change.** If a business changes `timezone`, `local_date` shifts. Bump the business
+tz version, rebuild all partitions from FactContribution (`occurred_at` is kept UTC), and
+double-buffer the rollups. The UI shows "Recalculating reports…" (typically minutes).
+
+**10.10.5 Semantic layer (custom analytics, top tier).** A registry maps metric IDs to
+`{rollup, measure expression, allowed dims, basis}`. Custom metrics are formulas over registered
+measures (e.g. `M-NET / M-W-HOURS`), validated with no division by zero. Custom metrics are never
+SQL typed by the user, which prevents tenant-escape and slow queries.
+
+**10.10.6 Caching.**
+- Tile responses are cached by `(business, tile config hash, range, as_of watermark)`. The cache
+  is invalidated when the partition watermark advances.
+- Browser: ETag / 304.
+- "Today" tiles poll every 60 s when the tab is visible; otherwise there is no polling. Server-sent
+  "rollup advanced" pings are an option.
+
+**10.10.7 Reconciliation (zero-drift).**
+- Nightly per business: compare R1 cash M-COLLECTED against Agent 05 ledger totals per day, and
+  R5 job counts against the job store.
+- On mismatch: rebuild the affected days and log a `reporting.reconciliation.mismatch` metric.
+- Alert ops if more than 0.1% of businesses mismatch.
+
+### 10.11 Leaderboard & MVP
+```
+rows = for w in eligibleWorkers(range): {w, jobs: M-W-JOBS, reviews_n, reviews_bayes, revenue: M-W-REV}
+if metric == 'composite':
+   for m in metrics: pct_m(w) = percentRank(rows, m)       # 0..1, ties averaged
+   score(w) = Σ weight_m * pct_m(w) / Σ weight_m
+sort desc by metric, then revenue, jobs, name
+rank = competition ranking (1,1,3)
+mvp = rows[0] if rows[0].jobs >= 5 else null
+delta_rank = rank in previous equivalent period − current rank
+```
+Workers who can see the leaderboard but lack the financial permission get the revenue column
+hidden, not zeroed.
+
+### 10.12 Forecasting (explainable, cheap)
+[S: LLMS "forecasting"] — method `[I]`. Forecast for the next H days (30/60/90) of M-NET (and of job
+counts), as a sum of components:
+1. **Committed.** Σ expected value of jobs already scheduled in the horizon (status scheduled or
+   confirmed; job total excluding tax and tip). Each job is multiplied by (1 − historical
+   cancellation-plus-no-show rate for its source and lead-time bucket).
+2. **Recurring not yet materialized.** For each active series (Agent 03), project occurrences in
+   the horizon that are not yet generated. Each is multiplied by the series' historical completion
+   rate (default 0.92).
+3. **Subscriptions.** Expected renewal charges (Agent 06) are shown separately on the cash basis.
+   On the accrual basis they are already reflected via auto-scheduled jobs, so they are not double
+   counted.
+4. **Not-yet-booked demand.** For each future day d:
+   `baseline(d) = mean over last 8 same-weekdays of (net from jobs booked < lead_time(d) days before service)`.
+   Seasonality index = last year's same-week ÷ last year's average week, if ≥ 1 year of history
+   (clamped 0.5–2.0).
+   The pickup curve is the share of a day's final revenue typically booked by k days before:
+   `unbooked(d) = baseline_final(d) × (1 − pickup(k_d))`.
+5. **Band.** ±1.28 σ of the residuals of the same method backtested over the past 12 weeks (an 80%
+   interval). If there are fewer than 8 weeks of history, show only the committed and recurring
+   components, labeled "Not enough history for a full forecast".
+
+Output per day: `{committed, recurring, projected_unbooked, low, high}`. The tile shows the
+components stacked, so the owner sees why a number is what it is.
+
+### 10.13 Goal progress & pacing
+```
+value = metric(goal.metric_id, scope, period.start → min(now, period.end))
+elapsed = businessDaysOrCalendarDays(period.start, now) / total(period)     # calendar default
+expected = target * elapsed                           # linear; option "seasonal pacing" uses last year's shape
+projected = value + forecastRemaining(goal.metric_id, now → period.end)   # 10.12 for money/jobs; linear run-rate otherwise
+status = value >= target ? achieved : (projected >= target ? on_track : (value >= expected*0.9 ? at_risk : behind))
+milestones: for m in (50,75,100) if pct >= m and m not in notified: notify A-13 (key goal:id:period:m)
+```
+For "lower is better" metrics (e.g. cancellation rate), the comparisons are inverted.
+
+### 10.14 Audience evaluation at send time
+- Compile the RuleGroup into a query over the contact read-model, which is a denormalized
+  `contact_marketing_view` maintained by consuming events from 07/03/04/05/06. It has columns
+  last_job_at, next_job_at, lifetime_net, jobs_count, tags[], zone_id, has_subscription,
+  app_installed, consent flags, asset summaries.
+- Always AND in the implicit consent filter.
+- For counts above 50k, return an approximate count (HyperLogLog sketch) while typing and an exact
+  count at launch.
+
+### 10.15 Resolving recipients for a job (multiple people per contact)
+- Each job has `notify_contacts[]` (Agent 03/04: chosen people and endpoints; "contact info to notify
+  the customer" [S: T04]). If none are chosen, use the contact's primary person, primary mobile and
+  primary email.
+- Business customers [S: LLMS] can have a site contact (receives day-of messages) separate from a
+  billing contact (receives invoices and receipts). The mapping is per catalog area: day_of → site
+  contact; quotes/invoices/payments → billing contact; booking → both.
+- Duplicate endpoints across people (a shared family phone) are deduped per message. The first
+  person's name is used in variables.
+
+### 10.16 Endpoint resolution
+- `resolveEndpoint(recipient, channel)` picks the endpoint flagged for the channel.
+- SMS: mobile line type preferred. A number never looked up is looked up once (async; first message
+  proceeds).
+- Email: the verified address is preferred.
+- Push: all active device tokens of the user or contact. Push "delivered" means at least one
+  device acknowledged. Tokens invalidated by FCM/APNs are deleted.
+
+---
+
+## 11. Edge cases & failure modes
+All `[I]`. Each item gives the expected behavior.
+
+### 11.1 Notifications & scheduling
+1. **Job booked less than the reminder offset before start:** skip the reminder (no instant
+   "reminder" after the confirmation).
+2. **Job booked in the past** (allowed by Fieldd [S: LLMS]): no customer messages
+   (`suppressCustomerNotifications`). Workers are notified only if the job is still open.
+3. **Drag-reschedule bounced back and forth within the debounce:** net no-change → no message.
+4. **Reschedule across a DST change:** the time renders in the job tz with the correct offset.
+   The reminder `due_at` is recomputed from wall-clock time.
+5. **Job in another time zone than the business** (mobile crew crossing a tz line; shop in another
+   state): message times use the job tz plus its abbreviation. Reports bucket by business tz.
+6. **Recurring series of 52 occurrences created at once:** one series confirmation only. Reminders
+   are scheduled lazily as occurrences materialize (Agent 03), not 52 timers upfront.
+7. **Series edited "all future":** cancel or reschedule timers per occurrence through events, and
+   send one "plan changed" message (N-B10), not N messages.
+8. **Customer has no mobile, only a landline:** SMS suppressed (landline), email fallback.
+9. **Customer has no email and no phone:** nothing can be sent. The job shows a warning chip
+   "Customer can't be notified". The owner can add contact info.
+10. **Same person is both the customer and a worker** (employee booking a service): both message
+    sets are sent. Endpoints are deduped only within the same message.
+11. **On-my-way pressed twice, or for two jobs at once:** dedupe per job (once per 30 min unless the
+    ETA changes by ≥ 15 min). For a route with 2 jobs at the same address, one message.
+12. **ETA unavailable** (routing provider down): send without ETA ("on the way now"). Never
+    block the on-my-way text.
+13. **Job completed offline in the worker app and synced 6 hours later:**
+    - The job-complete message uses the actual `completed_at`.
+    - The review request is due at `completed_at + 2h`, which has already passed, so it sends now
+      if within 24h, else it is skipped.
+    - No "on my way" is sent after completion.
+14. **Job reopened after completion** (Agent 04): the pending review request is canceled. A rating
+    already given is kept.
+15. **Cancellation with a fee, refund processing async:** N-B09 says "A refund of $X is being
+    processed". A separate N-P05 is sent on refund success.
+16. **Invoice partially paid between scheduling and sending a reminder:** the reminder renders the
+    current balance. If the balance is 0, the reminder is skipped.
+17. **Invoice voided, or job deleted:** subject validity check at render time → cancel.
+18. **Quote revised after send** (`jobs.quote.revised`): reminders point to the latest version
+    link. The old link redirects.
+19. **Worker invite to an email already used by another business's worker:** the invite is still
+    sent (identity is per user; tenancy membership is handled by 09).
+20. **Invite bounces:** `comms.message.failed` maps to Agent 09 `Invite.deliveryStatus='bounced'`.
+    Owner sees an "Invite bounced — fix email" chip.
+21. **Timesheet approved and then changed to rejected within a minute:** debounce of 60s on W-07/W-08.
+    Only the final state is sent.
+22. **Worker deactivated while timers are pending for them** (daily agenda): skip. They are also
+    removed from team chats.
+23. **Business disables a notification while messages are deferred** (quiet hours): re-check at
+    dispatch → canceled.
+24. **Business edits a template while a reminder is scheduled:** the template is resolved at send
+    time, so the latest version is used.
+25. **Template renders over 10 SMS segments:** hard cap. Truncate optional sections (service list →
+    "+2 more"). Block publishing if the required content exceeds 6 segments.
+26. **Unicode customer name** (e.g. "José", "Nguyễn"):
+    - "é" is in the GSM-7 basic set, so it stays GSM-7.
+    - "ễ" is not in GSM-7 and forces UCS-2 (cost doubles).
+    - Names are never transliterated. Cost is shown to the business.
+27. **Very long business names in the SMS prefix:** use the SMS short name (≤ 20 chars).
+
+### 11.2 Compliance
+28. **STOP sent while a broadcast is mid-flight:** synchronous revoke plus cancellation of queued
+    SMS to that endpoint. The in-flight provider call may still deliver one message (unavoidable).
+    Audit shows the ordering.
+29. **STOP to one business's number:** affects only that business (separate brand). Another business
+    using the platform is unaffected.
+30. **STOP and then an upcoming appointment:** all SMS halts. The job page shows "SMS opted out".
+    Transactional messages go by email/push. If no channel remains → warning to staff on the job.
+31. **Customer texts "Stop" inside a sentence** ("Can you stop by at 3?"): not an opt-out, because
+    it is not a keyword-only message. The free-text detector marks it low confidence and does
+    nothing.
+32. **Customer texts "STOP" and then books online with the SMS checkbox ticked:** new written consent
+    → marketing re-granted and SMS restored. The provider-level block is cleared via the provider
+    API or by the customer texting START. Show "Reply START to receive texts" guidance on the
+    confirmation page.
+33. **Shared family phone; one person opts out:** the opt-out is per endpoint, so it applies to
+    everyone using that number.
+34. **Number reassigned to a new owner** (old customer's number): carrier deactivation data or RND
+    → mark invalid. "Wrong number" replies → invalidate that endpoint for the contact.
+35. **Imported list without consent attestation:** SMS marketing ineligible. The audience count shows
+    "no consent: N".
+36. **Staff attests verbal consent for SMS marketing:** allowed only as "express consent" for
+    transactional purposes. Marketing needs written evidence (upload or web/keyword). The UI explains.
+37. **Quiet hours with an unknown recipient tz:** area-code fallback. For multi-tz area codes, use
+    the restrictive intersection. Unknown country code → business tz with the strictest window.
+38. **Holiday blackout** (e.g. Dec 25): marketing deferred to the next allowed day. A drip step due
+    on the blackout day shifts. Campaigns scheduled on blackout days are blocked at scheduling with
+    a warning.
+39. **10DLC campaign rejected:**
+    - SMS stays disabled.
+    - All transactional messages fall back to email, and marketing SMS steps are skipped.
+    - The wizard shows the rejection reason and a resubmit option.
+    - A-15 is sent.
+40. **10DLC suspended for complaints:** drips and campaigns auto-pause (`paused_by_system`),
+    transactional falls back to email, and the owner gets a remediation checklist.
+41. **Email domain DNS removed later** (DKIM fails): the daily check marks it `degraded`. Sending
+    switches back to the platform shared domain automatically and the owner is alerted.
+42. **Gmail/Yahoo bulk sender thresholds** (complaints > 0.3%): auto-pause marketing for that
+    business, with a review.
+43. **Marketing email to a Canadian or EU recipient without opt-in:** blocked by the policy pack
+    based on the recipient country (address/phone country).
+44. **Customer requests data erasure** (07 `customer.customer.erased`):
+    - Delete rendered bodies, conversation contents and attachments; anonymize the conversation.
+    - Keep the consent ledger revocation and suppression of the hashed endpoint, so the person is
+      never contacted again (legal basis: legitimate interest / record keeping).
+    - Rollups keep aggregates. Customer-level rows are anonymized as "Deleted customer".
+45. **Review incentive language in a template** ("leave a 5-star review for 10% off"): linter
+    error, cannot publish.
+
+### 11.3 Drips & campaigns
+46. **"New customer" drip launched, then a CSV import of 3,000 customers:** 07 marks import-created
+    customers with `createdVia=import`. Drip triggers exclude imports by default (07 already
+    defaults "send welcome drip? off"), so there is no accidental blast. Option to include them, with
+    a confirmation showing the count and cost.
+47. **Contact merged during an enrollment:** move it to the survivor, or exit as a duplicate if the
+    survivor is already enrolled. Never send twice.
+48. **Contact enrolled, then deleted:** exit and cancel timers.
+49. **Drip edited to remove the step a contact is waiting on:** migration rule (10.4).
+50. **Drip paused for 2 weeks with steps due:** held. On resume, steps more than 72h late are skipped
+    unless flagged "always send". Delays after resume are recomputed from the resume time.
+51. **Timer service outage for 3 hours:**
+    - On recovery, process the backlog in `due_at` order with a rate limit.
+    - Quiet hours are re-checked.
+    - The 72h late-skip prevents stale promos.
+    - Transactional reminders whose subject time has passed are skipped (subject validity).
+52. **Duplicate trigger events** (at-least-once bus): idempotent enrollment key → no duplicate.
+53. **Abandoned booking followed by booking via a phone call 10 minutes later:** exit on
+    `booking.appointment.created` for any source. The SMS is not sent if the booking arrives
+    before the 2h delay.
+54. **Abandoned session with only an email captured:** SMS steps skipped; email steps proceed.
+55. **Holiday drip for a business in the Southern Hemisphere or another country:** the holiday table
+    is per business country. Templates are flagged by region.
+56. **Campaign scheduled at 09:00 "recipient local time" spanning 4 US time zones:** 4 waves. The
+    campaign stays `sending` until the last wave.
+57. **Audience changes between scheduling and send:** a dynamic audience is evaluated at send time
+    (the UI says so). A snapshot audience is frozen.
+58. **Budget cap reached mid-campaign:** pause with "Budget reached" → owner can raise the cap and
+    resume.
+59. **Two campaigns plus a drip all eligible for the same contact on the same day:** the frequency
+    cap allows 1 SMS. Drip priority, then earliest scheduled, wins. Others are deferred or skipped.
+60. **Postcard returned undeliverable:** the address is marked `undeliverable` (07). It is excluded
+    from future postcards.
+61. **Postcard QR scanned by someone other than the addressee** (neighbor): a lead is created with the
+    address context and flagged "scan, not verified identity". The household match is hinted, not
+    assumed.
+62. **Short link clicked by a link-preview bot or email security scanner:**
+    - Bot user agents are ignored, as are clicks within 2 seconds of delivery from known scanner
+      IP ranges. A HEAD request is not a click.
+    - These clicks are excluded from metrics and attribution, but the redirect still works.
+
+### 11.4 Inbox & chat
+63. **Inbound SMS from an unknown number:** new "Unknown" conversation with a lead suggestion. If the
+    body contains a name or address, the AI may propose one (optional).
+64. **Same phone belongs to 2 different customers:** one conversation listing both. The staff
+    composer shows a "Which customer?" chip for linking a job.
+65. **MMS image from a customer:** stored, virus-scanned, max 5 MB. HEIC is converted to JPEG for
+    preview.
+66. **Customer replies to an automated reminder with "C" or "Yes":** confirmation intent (emits an
+    event). A thumbs-up "Liked …" iMessage tapback text is detected and treated as acknowledgment.
+67. **Customer replies after hours:** at most one auto-reply per 12h. An SLA timer runs only within
+    business hours.
+68. **Worker leaves the company while assigned to conversations:** reassign them to Unassigned and
+    notify the owner.
+69. **Webchat spam or bot:** rate limits, honeypot field and a challenge after 3 messages/10s.
+    Messages with links from anonymous visitors are held for review.
+70. **Two staff replying simultaneously:** both send (no lock), with a "collision" indicator shown when
+    another user is typing in the same thread.
+71. **Email reply with a giant quoted history or signature:** the parser strips it. Raw source is
+    available on demand.
+72. **Provider delivers an inbound message twice:** dedupe by provider SID.
+
+### 11.5 Reporting
+73. **Refund posted for a job in a closed period:** posted view → refund-date bucket. Restated view →
+    original period changes. Goals already closed are not re-opened (snapshot kept).
+74. **Job reopened and re-completed in a later month:** the job count moves to the latest completion
+    date. Revenue follows the ledger (Agent 05 reversal and repost, if any).
+75. **Split job with 3 workers and $100.00 net:** shares of 3333/3333/3334 bp → $33.33/$33.33/$33.34.
+    The remainder goes to the lead worker. Each worker gets 1 job count.
+76. **Worker removed from a job after completion** (correction): the attribution contribution is
+    reversed and re-added for the new assignment through compensating rows.
+77. **Business with 0 data:** every tile shows its designed empty state. Ratios show "—".
+78. **Comparison with a previous period of different length** (Feb vs Jan): compare equal-length
+    windows aligned by day index. "Same period last year" aligns by weekday when the grain is week.
+79. **Business timezone changed:** full rebuild (10.10.4). Exports during the rebuild are marked with
+    the as-of time.
+80. **Currency change** (rare; new business setup): blocked once any money exists. A multi-business
+    hub sums only within a currency.
+81. **Huge export** (2M message events): async, gzip CSV, split files of 1M rows, and an expiry
+    notice.
+82. **Leaderboard with worker privacy:** workers in the team view see ranks and jobs. Revenue is
+    hidden unless the owner opts in.
+83. **Clock skew between worker devices:** reporting uses server-received timestamps for ordering.
+    Device times are used only for the offline-completion `completed_at`, clamped to ≤ server
+    receive time.
+84. **Forecast with insufficient history:** components only (10.12).
+85. **Rollup drift detected nightly:** auto-rebuild of the affected days, with an ops alert.
+86. **Daylight-saving day:** day buckets of 23/25 hours. Hourly charts show the duplicated 01:00
+    hour twice with offsets.
+
+### 11.6 Providers & infrastructure
+87. **SMS provider outage:**
+    - Transactional falls back to email/push after 2 failed attempts or 5 minutes, whichever is
+      first.
+    - Marketing is held, with a 72h skip rule for drips.
+    - Status banner in the CRM.
+88. **Email provider outage:** fail over to the secondary ESP (dual DKIM). Marketing waits.
+89. **DLR webhooks delayed or missing:** `sent_unconfirmed` after 72h.
+90. **Webhook replay or forgery:** signature check plus timestamp tolerance (5 min) plus event-id
+    dedupe.
+91. **Secret rotation mid-traffic:** dual keys accepted during the overlap.
+92. **Provider rejects content** (carrier spam filter, error 30007-style):
+    - Mark the message failed with the reason "Carrier filtered".
+    - After 3 or more filtered sends of the same template, auto-pause that template's campaign and
+      show content advice (remove link shorteners, ALL CAPS, etc.).
+93. **Cost estimate differs from the actual cost** (segments recalculated by the provider): the
+    actual cost from the provider wins in billing. Estimates are labeled "est."
+
+---
+
+## 12. Better than Fieldd
+
+### 12.1 Concrete improvements (all `[I]`; contrasted with what sources show)
+1. **One explainable catalog.**
+   - Every automated message is listed in one settings screen with trigger, timing, channels,
+     quiet-hours class and a "Send test" button.
+   - Fieldd mentions automated updates and settings scattered around Settings → Communication →
+     Email [S: T04].
+   - Owners can answer "what does my customer receive and when?" in one place.
+   - Includes a **customer journey preview**: pick a sample job and see the full message timeline.
+2. **Reminders that can't arrive late or at night.** Pull-forward quiet-hours logic, job-tz
+   rendering and DST-safe math (10.2).
+3. **Drag-reschedule without spam.** A 2-minute debounce and net-change detection (Fieldd notifies
+   "automatically" [S: T08], which can mean several texts if the user adjusts twice).
+4. **Drip engine with branches, goals and safe edits.**
+   - If/else, wait-until-event and exit on booking are included.
+   - Versioned edits with an explicit in-flight migration choice. Fieldd shows linear steps
+     [S: T12].
+   - A test run with compressed delays.
+5. **Honest "revenue generated".**
+   - The attribution rule is visible in the UI ("Last touch: click 7d / code 30d / delivered 3d").
+   - Pipeline (booked) value is separate from realized value.
+   - Refunds are subtracted and there is no double counting across drips.
+   - Fieldd shows a "business generated" number with no definition [S: T12].
+6. **Compliance by construction.**
+   - Consent ledger with evidence, keyword handling and free-text opt-out detection.
+   - One-click unsubscribe headers, a toll-free starter path and a guided 10DLC wizard.
+   - Owners cannot accidentally break TCPA. Imports default to no marketing consent.
+7. **Ungated review booster.** Policy-safe by default. It protects the business's Google profile
+   while still catching unhappy customers privately (5.9).
+8. **Cost transparency.** Live segment counter, per-campaign cost and a monthly budget cap that pauses
+   marketing but never on-my-way texts. GSM-7 normalization roughly halves SMS cost.
+9. **Unified inbox with context.**
+   - Automated messages appear inline in the thread, so staff see what the customer already got.
+   - Job, invoice and consent context sit in a side panel.
+   - Masked worker messaging protects staff numbers.
+   - "C to confirm" replies update the job.
+10. **Every number is defined.**
+    - An "i" popover on every tile shows its formula, basis (accrual/cash), time zone and as-of
+      time.
+    - Cash and accrual are never silently mixed.
+    - CSV headers include the basis.
+11. **Fast dashboards.**
+    - Pre-aggregated, incrementally refreshed rollups with p95 < 300 ms per tile.
+    - Tiles load independently with skeletons and no layout shift.
+    - Nightly reconciliation against the payments ledger means the dashboard never disagrees with
+      Transactions.
+12. **Explainable forecast.** Committed + recurring + projected components with a confidence band,
+    instead of a black-box line.
+13. **Fair leaderboard.**
+    - The Bayesian rating average stops a single 5★ review from winning.
+    - Split-job crediting is defined.
+    - An optional composite score.
+    - Team view can hide revenue.
+14. **Brand-perfect messages** (owner requirement). Every email, landing page and SMS link is on the
+    tenant's domain and theme, including dark-mode logo variants and font fallbacks (5.13).
+15. **Accessibility.**
+    - Emails pass contrast checks (with auto-fix), and alt text is enforced.
+    - Landing pages work without JavaScript (unsubscribe, preferences).
+    - Inbox is keyboard-navigable with screen-reader labels.
+    - Charts have data-table equivalents (also used for CSV).
+16. **Reliability.**
+    - Idempotent sends, durable timers and an outbox-based event intake.
+    - Provider failover for email, and channel fallback for SMS outages.
+    - Status banners instead of silent failures.
+17. **AI with guardrails.** The AI marketing builder [S: LLMS] produces drafts only. The same lint and
+    compliance checks apply. A launch from MCP/Darwin requires human confirmation.
+18. **Offline-tolerant worker flows.** Messages triggered by offline actions use actual event times,
+    and stale ones are suppressed (11.1 #13).
+
+### 12.2 Budget tier notes (starter vs. higher plans) — proposal `[I]`
+| Capability | Starter (new solo business) | Mid | Top | Rationale |
+|---|---|---|---|---|
+| Full transactional catalog (confirmations, reminders, on-my-way, receipts, invoices, quotes) | ✔ | ✔ | ✔ | Core value; Fieldd includes this in Start [S: LLMS] |
+| SMS sender | Toll-free verified number (no monthly campaign fee) | TF or local 10DLC | Multiple numbers, local presence per zone | Cheapest compliant path first |
+| Included usage | ~500 SMS segments, 5k emails/mo | ~2,500 segments, 25k emails | ~10k segments, 100k emails | Pass-through overage plus small margin |
+| Email campaigns | ✔ (unlike Fieldd Start) | ✔ | ✔ | Email is nearly free; grows small businesses |
+| SMS campaigns | ✔ | ✔ | ✔ | Fieldd Start includes SMS marketing [S: LLMS] |
+| Postcards | Pay per piece | Pay per piece | Neighbor-marketing automation | Variable cost |
+| Engage drips | 3 live drips, templates | Unlimited, branches | + API/MCP triggers, priority | Fieldd gates drips at Scale [S: LLMS] |
+| Push marketing | — (needs app) | ✔ with branded app | ✔ | Depends on customer app |
+| Review booster | ✔ | ✔ + GBP review sync | ✔ + reply from CRM | Fieldd Start [S: LLMS] |
+| Referrals | — | ✔ | ✔ | Fieldd Scale [S: LLMS] |
+| Inbox, two-way SMS, webchat, team chat | ✔ | ✔ | ✔ + SLA rules, routing | Communication is core |
+| Dashboard and core reports, CSV | ✔ | ✔ | ✔ | Fieldd shows these broadly [S: T09] |
+| Goals | 2 active | 10 | 20 | — |
+| Custom report views, forecasting, MVP | MVP ✔; views 3 | ✔ | ✔ | — |
+| Heatmaps, custom metrics, multi-business hub | — | — | ✔ | Fieldd Pro [S: LLMS] |
+| Scheduled report emails | Weekly summary | ✔ | ✔ | — |
+| BYO provider credentials, RND checks, SMS redundancy | — | — | ✔ | Cost/complexity |
+| Remove "Powered by" | — | — | ✔ (or per Agent 01/11) | Fieldd Pro [S: LLMS] |
+
+---
+
+## 13. Open questions
+1. **Default revenue basis.** Should the Dashboard "Revenue" default to **accrual (net sales on
+   completion)** or **cash (collected)**? Fieldd's Transactions is payment-based [S: T17], but its
+   dashboard definition is unknown. This affects every tile and goal.
+2. **SMS sender strategy for starter.** Toll-free verification for every new business (cheap and fast;
+   some carriers filter TF marketing more strictly), or local 10DLC numbers (better recognition;
+   monthly fees and Sole Proprietor limits)? Do we let businesses port in their existing number
+   (two-way texting on their current business line)?
+3. **Who pays for messaging:** included allowances plus pass-through overage, or BYO provider
+   accounts? What margin? What hard cap behavior is acceptable for transactional SMS when a budget
+   runs out?
+4. **Review booster policy.** Confirm the owner accepts the **ungated** default (no rating-based
+   routing to Google), given competitors may gate. Also: should we pursue Google Business Profile
+   API verification for review sync and replies?
+5. **Attribution windows and model.** Accept last-touch with click 7d / code 30d / delivered 3d? Should
+   recurring-series value be attributed (first job only vs 90-day value)?
+6. **Fieldd's actual notification defaults:** which messages exist, their wording, reminder offsets,
+   and whether the business can edit SMS text for each. This needs the owner's CRM video and
+   Settings → Communication screens.
+7. **Online booking approval mode:** does Fieldd support "request" bookings that need approval
+   (N-B02/N-B03)? Coordinate with Agents 01/03.
+8. **Worker-facing leaderboard:** should workers see it by default, and should revenue be visible to
+   them?
+9. **International scope for v1:** US and Canada only, or also UK/AU (alphanumeric sender IDs,
+   different consent regimes)? Fieldd claims 37 countries [S: LLMS].
+10. **Postcard vendor and payment flow:** charge the business per order on their card, or deduct
+    from a prepaid balance? Is minimum order size acceptable?
+11. **Voice:** do we need call tracking or masked calling (worker → customer via business number) in
+    v1? It is out of scope here.
+12. **Consent at CRM booking:** when staff book by phone [S: T15], may they tick "customer agreed to
+    texts" for transactional SMS (yes) and for marketing (we propose no without written evidence)?
+    Confirm this UX with the owner.
+13. **Event-name ratification** (9.1): Agent 10 to pick canonical names. Requested new events
+    from 05/06/09: `payment.card.expiring`, `subscription.renewal.upcoming`,
+    `subscription.dunning.exhausted`, a commitment pre-end event, and
+    `timesheet.punch.open_too_long`.
+14. **AI features at launch:** AI marketing builder and AI opt-out intent classification. Are
+    LLM costs per business acceptable on the starter tier?
+15. **Data retention periods** for message bodies and conversations (we propose 25 months), and
+    whether businesses can export all conversations.
+
+---
+
+## 14. Verify against video
+Check each item in the owner's Fieldd CRM walkthrough (CRM side) and the swash.co walkthrough
+(customer side). Record findings next to each item.
+
+### 14.1 Notifications & settings
+- [ ] Exact Settings path and sub-pages under **Settings → Communication** (Email, SMS, Push?) [S: T04]. List every toggle shown.
+- [ ] Full list of automated customer notifications Fieldd offers, with names, channels and default on/off. Map each to catalog IDs (5.1) and add any missing.
+- [ ] Reminder timing options: how many reminders, offsets (24h? 2h?), day-before at fixed time?
+- [ ] Can the business edit SMS text per notification? Which variables (dynamic fields) are offered, and what is the variable picker UI?
+- [ ] Quote and invoice email look and "reminder settings" screen [S: T04]: fields and defaults.
+- [ ] Drag-to-reschedule [S: T08]: is there a confirm dialog with a "notify customer" checkbox, or does it notify silently? Who gets notified?
+- [ ] Booking from CRM [S: T15]: is there a "notify customer" toggle? Which messages fire?
+- [ ] On-my-way: worker app button label, ETA shown to the customer, tracking page look (swash.co side).
+- [ ] Job-complete message: does it include photos? A receipt? A review request?
+- [ ] Review booster: settings screen, delay, message text, rating page look, whether it gates low ratings.
+- [ ] Worker invite email content and app-download flow [S: T13].
+- [ ] Timesheet approve/reject push wording in the worker app [S: T03].
+- [ ] In-app notification bell: what appears, grouping, read states (new dashboard "notifications" [S: LLMS]).
+- [ ] Opt-out UI: how a customer unsubscribes; preference page look; STOP auto-reply wording.
+- [ ] SMS sender setup: does Fieldd show 10DLC/toll-free registration screens, or a number assignment?
+
+### 14.2 Marketing & Engage
+- [ ] Marketing tab layout: tabs/sections (Campaigns, Engage/drip window, Templates, Postcards, Referrals?) [S: T10, T12].
+- [ ] `New → Drip` flow screens [S: T12]: template gallery categories and count, trigger types list (all "action" options; date options), step types offered (email, delay, SMS, anything else: push, branch?).
+- [ ] Delay units available (minutes/hours/days?) and max.
+- [ ] Review screen: the "label" field, the send-timing options besides ASAP [S: T12], and any audience or "apply to existing" options.
+- [ ] Drip metrics window: exact labels for "in drip", "completed", "revenue generated" [S: T12]. Is a definition or window shown? Is there a per-step breakdown?
+- [ ] Editing a live drip: warnings shown, and what happens to contacts in flight.
+- [ ] Email editor [S: T12]: block types, template list, how brand logo and colors are applied, mobile preview, test send.
+- [ ] SMS composer: character/segment counter? Booking link insertion? Opt-out text auto-added?
+- [ ] Campaign wizard for email/SMS/postcard [S: T10]: targeting options (tags, last booked, service area, etc.), scheduling, cost display.
+- [ ] Postcard designer and ordering flow: sizes, pricing, QR generation, proof [S: T20].
+- [ ] Campaign analytics view: which metrics are shown (sent, opened, clicked, booked, revenue?) [S: T10].
+- [ ] AI marketing builder entry point and output [S: LLMS].
+- [ ] Referral settings and referral tracking screen [S: LLMS].
+- [ ] Abandoned booking follow-up: is it a drip template or a separate automation? Default delay? [S: T12]
+
+### 14.3 Communication
+- [ ] Live chat / conversations screen layout [S: LLMS]: list, thread, channels shown, assignment, search.
+- [ ] Team group chats: creation, membership, job-linked threads [S: LLMS].
+- [ ] Worker app "message the client" [S: T02]: does it reveal numbers? Does it use the business number?
+- [ ] Two-way SMS: do customer replies to reminders land in the inbox? Any auto-confirm keywords?
+- [ ] Booking-site live-chat widget on swash.co: position, offline behavior, contact capture.
+
+### 14.4 Dashboard & reporting
+- [ ] Dashboard tile list and default layout [S: T09, LLMS]: goals, all reviews, all photos, team availability, notifications, active now. Record each tile's chart type and period selector.
+- [ ] Customize flow: add/remove/reorder/resize tiles? Per-user or per-business?
+- [ ] Goals: creation form fields, metrics available, progress display [S: LLMS].
+- [ ] Reporting tab: list of report pages, filters, group-by options, custom views save flow [S: T09, LLMS].
+- [ ] Download behavior: CSV vs image, filename, columns [S: T09].
+- [ ] Revenue definition hints: does the tile say gross/net, or include tips/tax? Compare a known job's numbers between the dashboard and Transactions to infer the basis.
+- [ ] Forecasting view: what is forecast and how it is shown [S: LLMS].
+- [ ] MVP view and leaderboard: metrics, period options, tie display, whether workers can see it [S: T09, LLMS].
+- [ ] Service-area performance view and heatmap (Pro) [S: T09, LLMS].
+- [ ] Booking sources view on the dashboard [S: T05]: source names and how they are captured.
+- [ ] Transactions → worker summary week picker [S: T17]: confirms default week and week start day.
+- [ ] Data freshness: does a new booking appear instantly on the dashboard? Is any "as of" time shown?
+
+### 14.5 Customer side (swash.co video)
+- [ ] Consent checkboxes on the booking flow (SMS and email), with wording and default state.
+- [ ] Confirmation email and SMS received after booking: sender name/number, branding, links on the business's subdomain or Fieldd domain.
+- [ ] Reminder and on-my-way messages as received, with timing relative to the appointment.
+- [ ] Link domains in messages (branded subdomain vs platform domain); look of the tracking, rating, pay and manage pages.
+- [ ] Unsubscribe link in marketing emails and the preference page look.
