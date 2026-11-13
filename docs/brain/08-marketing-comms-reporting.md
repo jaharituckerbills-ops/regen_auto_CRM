@@ -2152,3 +2152,306 @@ interface InAppNotification { id: string; business_id: string; user_id: string; 
   - MessageEvent: raw events 25 months, aggregated forever.
   - Rendered bodies: 25 months, then hashed.
   - Consent evidence: forever (or the legally required period after relationship end, at least 5 years).
+
+---
+
+## 8. API surface
+These are commands and queries, not wire format. Auth = permission key from Section 2 (Agent 09 RBAC).
+All are tenant-scoped. All mutations accept `Idempotency-Key`. Commands marked **MCP** are
+candidates for the CRM MCP / Darwin action set [S: LLMS "CRM MCP: 150+ actions … analyzing business
+data"]. Commands marked **BMCP** are candidates for the customer-level Bookings MCP. `[I]` throughout.
+
+### 8.1 Internal (module-to-module) — the only way other modules send messages
+| Name | Input | Output | Auth |
+|---|---|---|---|
+| `comms.notify` | `{definition_id, subject{type,id,version}, recipients?: override[], context, not_before?, suppress_customer?: boolean}` | `{intent_ids[]}` | service token |
+| `comms.schedule` | `{definition_id, subject, slot, due_at, subject_version}` | `{scheduled_id}` (upsert) | service |
+| `comms.cancelScheduled` | `{subject{type,id}, definition_ids?: string[]}` | `{canceled: n}` | service |
+| `comms.sendDirect` | `{conversation_id?, endpoint, channel, body, purpose:'conversational'|'security', attachments?}` | `{message_id}` | service (auth codes from 01; worker relay) |
+| `comms.eligibility` | `{business_id, endpoint, channel, purpose}` | `{allowed, reason?, next_allowed_at?}` | service (01 shows "SMS opted out" states; 07 badges) |
+| `links.create` | `{kind, target, contact_id?, message_id?, expires_at?}` | `{url, token}` | service (01 owns resolution route) |
+| `reviews.recordRating` | `{token, rating, comment?}` | `{review_id, public_url?}` | public (token) |
+| `referrals.validateCode` | `{code, friend: {email?, phone?, address?}}` | `{valid, friend_offer, reason?}` | public (rate-limited) / service |
+| `reporting.ingest` | (event bus subscription — not callable) | — | — |
+
+### 8.2 Notifications settings
+| Name | Input | Output | Auth |
+|---|---|---|---|
+| `notifications.catalog.list` | `{audience?, area?}` | definitions + business settings merged | `comms.notifications.configure` (read: manager) |
+| `notifications.setting.update` | `{definition_id, enabled?, channels?, timing?}` | setting | `comms.notifications.configure` |
+| `notifications.template.fork` / `.update` / `.reset` | `{definition_id, channel, version payload}` | TemplateVersion + lint | `comms.notifications.configure` |
+| `notifications.template.preview` | `{template_version_id, sample_subject_id?}` | rendered output (desktop/mobile/dark, SMS segments) | same |
+| `notifications.test.send` | `{definition_id, channel, to_self: true}` | message id | same |
+| `notifications.userPrefs.get/update` | per-user | — | self |
+| `notifications.inApp.list/markRead` | `{cursor}` | items | self |
+
+### 8.3 Marketing
+| Name | Input | Output | Auth | MCP |
+|---|---|---|---|---|
+| `audiences.count` | `{rule}` | `{eligible_by_channel, excluded_by_reason}` | `marketing.campaign.create` | MCP |
+| `audiences.preview` | `{rule, limit:20}` | contacts | same | — |
+| `audiences.save` / `.list` / `.delete` | — | — | same | MCP |
+| `audiences.fields` | — | semantic field registry (fields from 07/02/03/05/06) | same | MCP |
+| `campaigns.create/update` | Campaign draft | Campaign | `marketing.campaign.create` | MCP (draft only) |
+| `campaigns.lint` | `{campaign_id}` | checklist results + cost estimate | same | MCP |
+| `campaigns.testSend` | `{campaign_id, to_user_id, sample_contact_id}` | — | same | — |
+| `campaigns.launch` / `.schedule` | `{campaign_id, at?}` | state | `marketing.campaign.send` (**MCP launches require human confirmation in UI**) | MCP (confirm) |
+| `campaigns.pause/resume/cancel/duplicate/archive` | `{campaign_id}` | state | `marketing.campaign.send` | MCP |
+| `campaigns.stats` | `{campaign_id}` | 5.7 metrics | `marketing.analytics.view` | MCP |
+| `postcards.proof` / `postcards.order` | `{campaign_id}` | proof URL / order ids, total cost | `marketing.campaign.send` + billing | — |
+| `drips.templates.list` | `{category?}` | gallery | `marketing.drip.manage` | MCP |
+| `drips.create/update` (draft) | DripVersion draft | Drip | same | MCP |
+| `drips.launch` | `{drip_id, enroll_existing?}` | state, version | same (confirm for MCP) | MCP (confirm) |
+| `drips.publishEdit` | `{drip_id, version draft, migrate_in_flight: boolean}` | new version | same | — |
+| `drips.pause/resume/archive` | — | state | same | MCP |
+| `drips.metrics` | `{drip_id, range?}` | in drip, completed, exited by reason, revenue generated, per-step funnel | `marketing.analytics.view` | MCP |
+| `drips.enrollments.list` | `{drip_id, state?, q?}` | enrollments + timeline | same | — |
+| `drips.enrollments.add` (manual) / `.remove` | `{drip_id, contact_ids}` | results | `marketing.drip.manage` | MCP |
+| `drips.testRun` | `{drip_id, compress: true}` | test enrollment for self | same | — |
+| `ai.marketing.draft` | `{goal prompt, channel(s), audience hint}` | Draft campaign/drip (never launched automatically) [S: LLMS AI marketing builder] | `marketing.campaign.create` | MCP |
+| `templates.*` | CRUD + gallery | — | `comms.templates.edit` | — |
+| `referrals.program.get/update` | ReferralProgram | — | `referrals.manage` | — |
+| `referrals.list` | filters | referrals | `referrals.manage` | MCP |
+| `referrals.myCode` | — | code + link + stats | customer (portal/app) | BMCP |
+| `reviews.list` / `.respond` / `.hide` | filters / text | — | `reviews.view` / `reviews.respond` | MCP |
+| `reviews.settings.update` | booster settings, google URL / GBP connect | — | `comms.notifications.configure` | — |
+
+### 8.4 Compliance & senders
+| Name | Input | Output | Auth |
+|---|---|---|---|
+| `senders.status` | — | numbers, registrations, email domains, gates | `compliance.sender.manage` (read: all staff badge) |
+| `senders.sms.start` | `{route:'toll_free'|'10dlc', identity}` | registration records | same |
+| `senders.sms.updateSubmission` / `.resubmit` | — | — | same |
+| `senders.email.addDomain` / `.verify` / `.remove` | `{domain}` | DNS records / state | same |
+| `consent.record` (staff attestation) | `{contact_id, endpoint, purpose, method, evidence_ref}` | ConsentEvent (via 07) | `compliance.consent.override` |
+| `consent.history` | `{contact_id}` | events | `inbox.view_all` or 07 profile perm |
+| `preferences.get/update` | signed token | categories | public (token) / customer session |
+| `unsubscribe.oneClick` | POST signed token | 200 | public |
+| `quietHours.get/update` | QuietHoursPolicy (narrowing only) | — | `comms.notifications.configure` |
+| `budget.get/update` | cap, alerts | — | owner/admin |
+| `usage.get` | `{month}` | segments, emails, postcards, cost | owner/admin |
+
+### 8.5 Inbox & chat
+| Name | Input | Output | Auth |
+|---|---|---|---|
+| `inbox.conversations.list` | `{folder, channel?, assignee?, q?, cursor}` | conversations | `inbox.view_all` / `.view_assigned` (server filters) |
+| `inbox.conversation.get` | `{id, cursor}` | messages incl. system notification bubbles | same |
+| `inbox.message.send` | `{conversation_id, channel, body, attachments?, template_id?}` | message (pipeline: conversational) | `inbox.reply` |
+| `inbox.note.add` | `{conversation_id, body, mentions}` | note | `inbox.reply` |
+| `inbox.conversation.assign/snooze/close/reopen` | — | state | `inbox.reply` |
+| `inbox.newConversation` | `{contact_id or phone/email, channel, body}` | conversation | `inbox.reply` (eligibility check; marketing intent blocked without consent) |
+| `chat.team.createGroup/addMembers/removeMember/leave` | — | conversation | `chat.team.create_group` / participate |
+| `chat.team.send` | `{conversation_id, body, mentions, urgent?}` | message | `chat.team.participate` |
+| `webchat.start/send/poll` (public widget; WebSocket/SSE) | visitor token | messages | public (rate-limited, captcha on abuse) |
+| `webhooks.sms.inbound` / `.status`, `webhooks.email.events` / `.inbound`, `webhooks.postcard.events` | provider payloads | 200 | provider signature verification |
+
+### 8.6 Reporting
+| Name | Input | Output | Auth | MCP |
+|---|---|---|---|---|
+| `reports.metric.query` | `{metric_ids[], range, basis?, group_by?, filters?, compare?}` | series + totals + `as_of` + definition versions | `reports.view_*` per metric | MCP (Darwin "analyzing business data") |
+| `reports.metric.define` | `{metric_id}` | human definition (5.10) | any staff | MCP |
+| `dashboard.layout.get/save/resetDefault/saveAsDefault` | layout | — | `dashboard.customize(_default)` | — |
+| `dashboard.tile.data` | `{instance_id}` | tile payload | per metric | — |
+| `reports.views.save/list/delete` | SavedReportView | — | `reports.view_*` | MCP |
+| `reports.export` | `{query or view_id, format}` | `{export_id}` or stream | `reports.export` | MCP |
+| `reports.export.get` | `{export_id}` | status, signed URL | requester | — |
+| `reports.schedule.create/update/delete` | ScheduledReport | — | `reports.export` | — |
+| `leaderboard.get` | `{metric, range, scope?}` | ranked list, MVP | `leaderboard.view` (revenue column requires financial perm) | MCP |
+| `goals.create/update/archive/list` | Goal | progress | `goals.manage` / view by visibility | MCP |
+| `forecast.get` | `{metric:'M-NET'|'M-JOBS-SCHED', horizon_days: 30|60|90}` | expected + band + components | `reports.view_financial` | MCP |
+| `presence.heartbeat` | `{surface}` | — | any session (01 portal, 09 apps) | — |
+| `presence.activeNow` | — | counts + lists | dashboard viewers | — |
+
+Rate limits [I]: metric queries 10/s per business. Exports: 5 concurrent per business. Public
+endpoints (webchat, rating, unsubscribe, code validation): IP + token limits.
+
+---
+
+## 9. Interfaces with other modules
+
+### 9.1 Canonical event names and aliases (for Agent 10 reconciliation)
+The catalog (5.1) uses **canonical names**. Specs 01–07 and 09 were written in parallel and
+emit slightly different names. The table maps canonical names to the names found in each spec.
+Agent 10 should choose one, and 08 subscribes to whatever Agent 10 ratifies. Until then, the
+Notification Router subscribes to **all aliases** and de-duplicates by `event_id`.
+
+| Canonical (08) | Emitted as (found in specs) | Producer |
+|---|---|---|
+| `booking.appointment.created` | `scheduling.job.scheduled`, `jobs.job.created`, `booking.job.created`, `portal.booking.confirmed`, `booking.appointment.created` (07) | 03 (system of record) / 04 / 01 |
+| `booking.appointment.rescheduled` | `scheduling.job.rescheduled`, `schedule.job.rescheduled`, `portal.reschedule.completed` | 03 / 01 |
+| `booking.appointment.reassigned` | `scheduling.assignment.changed`, `.created`, `.removed`, `dispatch.job.reassigned` | 03 / 09 |
+| `booking.appointment.canceled` | `jobs.job.cancelled`, `job.job.cancelled`, `booking.job.cancelled`, `portal.cancellation.completed` | 04 / 01 |
+| `dispatch.job.unassignable` | `scheduling.dispatch.failed`, `scheduling.job.at_risk` | 03 |
+| `recurring.series.created/updated/ended` | `scheduling.series.created/updated/ended/paused/resumed`, `scheduling.occurrence.skipped` | 03 |
+| `route.route.started` | `routing.route.started`, `schedule.route.started` | 03 / 04 |
+| `job.job.en_route` | `job.job.on_my_way`, `job.worker.on_my_way` | 04 (03, 01 consume) |
+| `schedule.eta.updated` | `routing.route.reoptimized`, `routing.route.progressed`, `team.location.pinged` (derived) | 03 |
+| `job.job.started` | `jobs.visit.started`, `job.job.started`, `job.work.started` | 04 / 09 |
+| `job.job.completed` | `jobs.job.completed`, `job.job.completed`, `job.work.completed` | 04 |
+| `job.job.reopened` | `jobs.job.reopened`, `job.job.reopened` | 04 |
+| `job.job.no_show` | `job.job.no_show` | 03/04 |
+| `job.job.updated` (material) | `jobs.lineitem.added`, `job.line.added/removed/qty_changed`, `job.lines.changed`, `jobs.job.totals_changed` | 04 |
+| `job.photo.added` | `jobs.photo.added`, `jobs.photo.uploaded` | 04 |
+| `job.intake.incomplete` | `customer.intake.updated` (absence-derived) | 07 / 01 |
+| `quote.quote.sent/viewed/accepted/declined/expired/withdrawn` | `jobs.quote.sent/viewed/accepted/declined/expired/withdrawn`, `jobs.quote.revised` | 04 |
+| `invoice.invoice.sent/overdue/paid` | `jobs.invoice.sent/issued/overdue/paid/payment_applied` | 04 |
+| `payment.payment.captured` | `payments.payment.succeeded`, `payments.charge.succeeded`, `payments.cash.collected` | 05 |
+| `payment.payment.failed` | `payments.charge.failed`, `payments.authorization.failed`, `payment.deposit.failed` | 05 |
+| `payment.preauth.created` | `payments.authorization.placed` | 05 |
+| `payment.refund.created` | `payments.refund.succeeded` (send on success, not on creation) | 05 |
+| `payment.dispute.opened` | `payments.dispute.opened`, `charge.dispute.created` | 05 |
+| `payment.payout.paid/failed` | `payments.payout.paid/failed` | 05 |
+| `payment.card.expiring` | (not yet in 05) — **request** | 05 |
+| `payment.tip.added` | `payments.tip.added` | 05 |
+| `subscription.subscription.activated` | `subscriptions.subscription.activated`, `portal.subscription.purchased` | 06 |
+| `subscription.renewal.upcoming` | (not yet in 06) — **request**; related `subscription.price_change.notice` | 06 |
+| `subscription.renewal.charged` | `subscriptions.subscription.renewed` | 06 |
+| `subscription.payment.failed` | `subscriptions.subscription.payment_failed`, `subscription.subscription.past_due` | 06 |
+| `subscription.dunning.exhausted` | (derive from 06 dunning terminal state) — **request** | 06 |
+| `subscription.subscription.canceled/paused/resumed` | `subscriptions.subscription.cancel_scheduled`, `subscription.subscription.cancelled/paused`, `subscriptions.subscription.resumed` | 06 |
+| `subscription.commitment.ending` | `subscriptions.commitment.ended/renewed` (need a *pre*-end event) — **request** | 06 |
+| `giftcard.giftcard.purchased` | `portal.giftcard.purchased`, `giftcards.card.issued` | 01 / 06 |
+| `giftcard.giftcard.delivery_due` | (06 issues with `deliver_at`; 08 schedules its own timer) | 06 |
+| `giftcard.giftcard.redeemed` | `giftcards.card.redeemed` | 06 |
+| `customer.customer.created` | `customer.customer.created`, `customers.customer.created` | 07 |
+| `customer.customer.merged/erased` | `customer.customer.merged/unmerged/erased` | 07 |
+| `customer.account.created` | `portal.account.created`, `portal.account.registered` | 01 |
+| `customer.consent.changed` | `customer.consent.changed` | 07 (ledger), triggered by 08 commands |
+| `customer.tag.added/removed` | `customer.tags.bulk_changed` (+ per-customer update) | 07 |
+| `lead.lead.created/stage_changed/converted` | `lead.lead.*` | 07 |
+| `booking.session.contact_captured` | `portal.session.contact_captured`, `booking.attempt.contact_captured` | 01 / 07 |
+| `booking.session.abandoned` | `portal.session.abandoned`, `lead.attempt.abandoned`, `booking.attempt.expired`, `booking.session.abandoned` (03) | 01 / 07 |
+| `portal.visit.recorded` | `portal.visit.recorded`, `portal.session.started/step_reached` | 01 |
+| `marketing.postcard.scanned` (08 produces) | consumed by 07 as `portal.qr.scanned` | 08 → 07 |
+| `catalog.addon.stock_low` | `inventory.stock.low`, `inventory.stock.depleted` | 02 |
+| `catalog.service.published` | `catalog.service.published`, `catalog.revision.published` | 02 |
+| `team.worker.invited` | `team.member.invited`, `team.invite.sent` | 09 |
+| `team.worker.activated` | `team.member.activated`, `team.invite.accepted` | 09 |
+| `team.worker.deactivated` | `team.member.deactivated`, `team.worker.deactivated` | 09 |
+| `timesheet.timesheet.submitted/approved/rejected/paid` | `timesheet.entry.submitted/approved/rejected/paid` | 09 |
+| `timesheet.punch.open_too_long` | `timesheet.entry.auto_closed` (post-hoc); need a pre-close reminder event — **request** | 09 |
+| `team.pay_rate.effective` | `timesheet.compensation.activated` | 09 |
+| `team.availability.changed` | `team.availability.changed/updated`, `team.timeoff.*` | 09 |
+
+### 9.2 CONSUMES (by module)
+| From | What | Why (08 feature) |
+|---|---|---|
+| **01 Booking portal** | Events: visits, sessions (started/step/contact_captured/abandoned), account created, booking confirmed, cancellation feedback [S: T05], referral used, gift-card purchase, domain activated/detached. Data: branded host per tenant, consent-checkbox disclosure versions, booking-session cart (for resume links), auth challenges | Funnel metrics, abandoned drips, link host, consent evidence, N-A02 codes |
+| **02 Catalog & coverage** | Services/add-ons (name, image, price, cost [S: T06, T07]), categories, zones/shops with tz and geometry versions, travel fees, stock-low events | Email service cards, reporting dims (service, zone), M-COST, A-16 |
+| **03 Scheduling & dispatch** | Job scheduled/rescheduled/assignment/canceled, series lifecycle, route started/progress/ETA, dispatch failed, availability (with 09) | Catalog N-B*, N-D*, W-02..06, A-18, utilization, forecast inputs (future schedule, series) |
+| **04 Job lifecycle** | Job status changes, on-my-way, started, completed, reopened, no-show, line changes (`addedByWorkerId`), photos, quotes & invoices lifecycle, document URLs, job-scoped conversation link | Day-of messages, quotes/invoices messaging, review requests, upsell metrics, photos tile |
+| **05 Payments** | Ledger postings (revenue/contra/tax/tips by effective_date), payments, refunds, disputes, payouts, RevenueAttribution, processing fees, pay links, card-expiry | All money metrics (5.10.2), receipts, A-05/06/07, cash tiles |
+| **06 Subscriptions, discounts, gift cards** | Subscription lifecycle and dunning schedule, MRR inputs, discount redemptions with `source_campaign_id`, gift card issue/delivery/redeem, reward issuance results | N-S*, N-G*, code-touch attribution, M-MRR, referral rewards |
+| **07 Customers & leads** | Customer/people/contact points (multiple phones/emails [S: LLMS]), addresses with tz, tags, types, consent ledger state, merges/erasures, leads and stages, assets/vehicles (last service date) | Recipient resolution, audiences, timelines, consent enforcement, drip triggers, privacy erasure |
+| **09 Team** | Members, roles/permissions (RBAC keys from §2), invite tokens, worker tz, shift/availability/DND, timesheet events, pay rates, presence, split shares (`share_bp`) | W-series, A-09/11/19, leaderboard eligibility, M-W-*, team chat membership |
+| **11 Branding** | `BrandTheme` (palettes light/dark, logos per placement incl. email + dark variant, fonts + fallbacks, radius/shadow, icons, copy overrides), theme version events `branding.theme.published` | 5.13 rendering of every email, landing page, SMS name prefix |
+| **10 Integrator** | Ratified event catalog & envelope (event_id, occurred_at, business_id, causation_id), outbox guarantees, tenant registry | Router subscriptions & dedupe |
+
+### 9.3 PRODUCES
+| Event | Payload (key fields) | Consumers |
+|---|---|---|
+| `comms.message.sent` / `.delivered` / `.failed` / `.suppressed` | message_id, definition_id/campaign/drip, subject, recipient, channel, reason | 07 (timeline), 04 (job activity "Reminder sent"), 09 (`notification.delivery.failed` alias for invite bounce → Invite.deliveryStatus) |
+| `comms.consent.changed` → via 07 `customer.consent.record` | ConsentEvent | 07 (ledger), 01 (preference UI) |
+| `comms.suppression.added` | endpoint, reason | 07 (badge "email bouncing"), 01 (ask for new email at login) |
+| `comms.conversation.message_received` / `.message_sent` | conversation_id, contact_ids, job_id?, channel | 07 (last-contacted, lead activity auto-advance), 04 (job thread), 09 (worker notifications) |
+| `comms.reply.confirmation_received` / `.reschedule_requested` | job_id, contact_id | 03/04 (mark confirmed; reschedule flow) |
+| `comms.link.clicked` | link kind, contact, message | 07 (lead engagement), 01 (attribution handoff via token) |
+| `marketing.campaign.scheduled/launched/completed/failed` | campaign_id, counts | 10 audit; owner notifications |
+| `marketing.drip.launched/paused/archived` | drip_id, version | 10 audit |
+| `marketing.enrollment.started/completed/exited` | enrollment_id, drip_id, contact_id, reason | 07 (customer timeline "In drip: Welcome") |
+| `marketing.touch.recorded` | Touch | internal attribution; 07 timeline |
+| `marketing.attribution.assigned` | job_id, source, rule | 05/06 (optional campaign ROI), reporting |
+| `marketing.postcard.scanned` | campaign_id, link token, address_id?, contact_id? | 07 (create/update lead, source=postcard [S: T20]) |
+| `review.request.sent` / `review.review.received` / `review.public_link.clicked` | job_id, worker_ids, rating | 04 (job card), 07 (profile ratings [S: T09]), 09 (worker profile ratings) |
+| `referral.code.issued` / `referral.referral.qualified` / `.reversed` | referrer, friend, job | 06 (issue/claw back reward via `rewards.issue` command), 07 |
+| `reporting.goal.milestone_reached` / `.period_closed` | goal, value | notifications (A-13/W-16) |
+| `reporting.export.ready` | export_id | notifications (A-20) |
+| `compliance.sender.status_changed` | business, entity, state | 01 (hide "text me" options until enabled), owner alerts |
+
+### 9.4 Contracts we REQUIRE from each agent (acceptance criteria)
+1. **All producers:** emit through a transactional outbox with a stable `event_id` and `occurred_at`.
+   Payloads carry `business_id`, ids (not only names) and **versions**: `job.version`,
+   `schedule_version`. 08 never parses UI text.
+2. **01:**
+   - Consent checkbox with versioned disclosure text. The `contact_captured` event includes the
+     consent state and disclosure version.
+   - Hosts the preference, unsubscribe, rating, tracking and webchat routes on the tenant host.
+   - Resolves `/s/{token}` short links via 08 `links.resolve`.
+   - Booking sessions persist 7 days for resume links.
+   - Lazy-loads the webchat widget so it stays within the widget performance budget.
+3. **03:** `notify_customer` flag on create/reschedule (CRM toggle). Debounce-friendly versioning.
+   ETA source.
+4. **04:** `suppressCustomerNotifications` on past-dated jobs (already in 04, aligned). Job state
+   machine names (`completed`, `reopened`, `no_show`) are stable. `addedByWorkerId` on lines.
+5. **05:**
+   - Ledger `effective_date` in business-local date.
+   - Revenue split by account classes 4000–4030, 4900, 4950 and tax/tip accounts.
+   - `payment.card.expiring` event.
+   - `source_campaign_id` passthrough on payments that used a tracked offer.
+6. **06:**
+   - Renewal-upcoming, commitment-ending and dunning-exhausted events.
+   - `discounts.redemption.committed` carries `issued_by_source {campaign|drip|referral, id}`.
+   - Command `rewards.issue(referral_id, spec)`, idempotent on referral_id.
+7. **07:**
+   - `customer.consent.record` command that accepts 08's ConsentEvent.
+   - Contact-point lookup by E.164 across people.
+   - Merge events with survivor id.
+   - Address tz.
+   - Field registry for audiences.
+   - Erasure event: 08 deletes rendered message bodies and conversation content for that
+     contact and keeps hashed audit rows.
+8. **09:**
+   - RBAC keys listed in §2.
+   - Worker tz and DND/shift windows.
+   - `share_bp` for split jobs.
+   - Presence heartbeat source.
+   - Invite token lifecycle (`team.invite.*`).
+   - Deactivation event (remove from chats and from the current-period leaderboard).
+9. **11:** `BrandTheme` API with email-specific logo/placement sizing, dark logo, font fallback
+   mapping, copy-override keys, and theme versioning.
+
+### 9.5 What other agents should NOT do
+- Do not call SMS/email/push providers directly or store templates. Always call `comms.notify` with a
+  catalog ID (new IDs are requested from 08).
+- Do not compute dashboard metrics in their own modules. Use `reports.metric.query`. Exception:
+  Agent 05's Transactions views read the ledger directly, and their totals must equal
+  M-COLLECTED (reconciliation test).
+
+### 9.6 API keys & integrations register (owner requirement 2026-11-13)
+Storage principle [I]:
+- All secrets live in a **secrets manager / KMS-encrypted vault** (infra TBD, stack-agnostic).
+- The database stores only `secret_ref` pointers.
+- Secrets are never sent to browsers or mobile apps. Mobile apps receive only public config such as
+  FCM sender IDs.
+- Access is least-privilege per service, with an audit log on every read.
+
+| # | Service | Purpose (08) | Keys / secrets | Owner | Stored where | Rotation |
+|---|---|---|---|---|---|---|
+| K1 | Telnyx (primary SMS) | SMS/MMS send and receive, number ordering, 10DLC/TF registration (ISV) | API key v2 (bearer); webhook **public key** for Ed25519 signature verification; messaging profile IDs (non-secret); per-business **managed sub-account** IDs | Platform | Vault (`sms/telnyx/api_key`); public key in config | API key every 90 days, dual-key overlap; webhook key on provider rotation |
+| K2 | Twilio (alternate SMS / optional BYO top tier) | Same | Account SID (non-secret), **Auth Token** or **API Key SID + Secret** (preferred); webhook signature uses the Auth Token; sub-account SIDs per business | Platform (BYO: business) | Vault; BYO under `business/{id}/sms/twilio` | API keys every 90 days; Auth Token rotation via secondary token |
+| K3 | Bandwidth / Plivo (optional alternates) | SMS | Bandwidth: API client ID/secret (OAuth), account ID, application ID, webhook basic-auth credentials. Plivo: Auth ID + Auth Token | Platform | Vault | 90 days |
+| K4 | The Campaign Registry (via provider) | 10DLC brand/campaign | Normally none of ours (provider proxies). If going direct: TCR API key + secret | Platform | Vault | Yearly / per TCR policy |
+| K5 | Amazon SES (primary email) | Transactional + marketing email, inbound reply parsing (SES receiving → storage → webhook), event notifications (SNS/EventBridge) | IAM role (preferred, no static keys) or access key ID + secret; SNS topic subscription confirmation; **DKIM private keys** if using BYODKIM (else SES-managed Easy DKIM) | Platform | IAM role on workload identity; BYODKIM keys in KMS | Static keys 90 days (avoid with roles); DKIM key rotation yearly with dual selectors |
+| K6 | Postmark (alternate transactional email) | Higher-deliverability transactional stream | Server API token (per stream/server), Account API token (domain management) — separate; webhook basic-auth credentials | Platform | Vault | 180 days; account token restricted to ops |
+| K7 | Mailgun / SendGrid / Resend (alternates) | Email | API key (scoped: send-only), webhook signing key | Platform | Vault | 90 days |
+| K8 | Firebase Cloud Messaging | Push to Android/web (worker app + customer app) | Service account JSON (private key) per Firebase project; for **tenant-branded apps** a project per tenant app or one project with multiple apps | Platform (branded app: platform-managed per tenant) | Vault (`push/fcm/{project}`) | Service account keys 90 days or Workload Identity Federation (no key) |
+| K9 | Apple Push Notification service | Push to iOS | **APNs auth key (.p8)** + Key ID + Team ID (token-based; one key works across apps of the same team). Tenant-branded apps published under a **tenant's own Apple developer account** need that tenant's .p8 | Platform; Business for own-account branded apps | Vault (`push/apns/{team}`) | No expiry; rotate yearly or on staff change (Apple allows 2 active keys) |
+| K10 | Lob (primary postcards) | Print & mail, address verification | Live + test secret API keys; webhook signing secret | Platform | Vault | 180 days |
+| K11 | PostGrid / Click2Mail (alternates) | Same | API key; webhook secret | Platform | Vault | 180 days |
+| K12 | Google Business Profile API | Read reviews, reply, deep link to review form | Platform OAuth **client ID + client secret**; per-business **OAuth refresh token** (scope business.manage) | Platform app; Business grants token | Vault (`business/{id}/gbp/refresh_token`, envelope-encrypted) | Client secret yearly; refresh tokens revocable by business; re-consent on error |
+| K13 | Phone lookup (line type/carrier) | Avoid texting landlines; tz hint | Provider API key (Telnyx/Twilio Lookup reuse K1/K2) | Platform | Vault | with K1/K2 |
+| K14 | FCC Reassigned Numbers Database | Consent hygiene (top tier) | RND account credentials / API token | Platform | Vault | Per RND policy (annual) |
+| K15 | LLM provider (AI marketing builder, opt-out intent, Darwin) | Drafting copy, classification | API key (server-side only), org/project id | Platform | Vault | 90 days; spend limits |
+| K16 | Platform internal signing keys | Unsubscribe/preference/rating/tracking tokens, short-link tokens, webchat visitor tokens, ICS links | HMAC keys (≥ 256-bit) with `kid`; Ed25519 for signed URLs to exports | Platform | KMS | 90 days with `kid` overlap (old keys verify-only for token lifetime, e.g. unsubscribe tokens: never-expiring links → keep verify keys for 10 years or use DB-backed tokens) |
+| K17 | Webhook ingress secrets (all providers above) | Verify inbound webhooks | Per-provider signature secret / public key | Platform | Vault | With each provider |
+| K18 | Export storage | Signed URL generation for CSV/PNG exports | Object-store credentials (role-based) | Platform | Workload identity | Roles, no static keys |
+| K19 | Analytics pixels (business-provided, via 01) | Not 08's — listed for completeness | Business's GA4/Meta IDs (non-secret) | Business | 01 config | n/a |
+| K20 | BYO sender credentials (top-tier option) | Business uses own Twilio/SendGrid | Business-provided API keys | Business | Vault namespace `business/{id}/byo/*`, envelope-encrypted with per-tenant DEK | Business-managed; we alert on auth failures and expiry; never displayed after save (last 4 only) |
+
+Non-secret identifiers that still need management: phone numbers, 10DLC brand/campaign IDs, SES
+configuration-set names, Lob template IDs, FCM sender IDs, APNs bundle IDs. These are stored in
+DB config, not the vault.
+Operational rules:
+- On a secret-read failure, the pipeline fails closed: the message stays `rendered`, then retries,
+  then alerts ops. It never falls back to an unsigned or unauthenticated send.
+- Webhooks without a valid signature are rejected with 401 and counted.

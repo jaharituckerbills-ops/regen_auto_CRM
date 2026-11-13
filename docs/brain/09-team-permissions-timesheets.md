@@ -2352,3 +2352,326 @@ on assignment change for worker w and job j:
 ```
 
 ---
+## 11. Edge cases & failure modes
+
+### 11.1 Tenancy, accounts, auth
+1. Same email invited to two businesses → one User, two memberships; switcher appears after second accept.
+2. Invite sent to an email that already belongs to a **customer** account of the same business → separate
+   principal pools; staff invite proceeds; UI never merges the two `[I]`.
+3. Invite link forwarded to someone else → acceptance requires proof of the invited email/phone (OTP);
+   forwarded recipient cannot claim.
+4. Invite accepted after the inviter was deactivated → still valid (invite belongs to the business).
+5. Invite accepted after the role was changed meanwhile → membership gets the current role (not the one
+   at send time).
+6. Invite accepted after plan downgrade made the business over cap → accepted anyway (seat was reserved);
+   downgrade wizard already accounted for invited seats.
+7. Owner tries to deactivate themselves / leave → blocked; must transfer ownership first.
+8. Owner's account locked (failed logins) → business continues to operate; owner recovers via OTP;
+   platform support recovery requires documented identity verification `[I]`.
+9. Owner deletes their user account → blocked while owning a business; error lists businesses.
+10. Last Operator/Admin deactivated → allowed (Owner remains).
+11. Email change to an address already used by another User → blocked; offer "merge accounts" via support.
+12. Phone number recycled by carrier (new person gets old worker's number) → SMS OTP login for a
+    deactivated membership grants nothing; for active memberships, SMS-only login requires second factor
+    after 90 days of no use `[I]`.
+13. OTP brute force → 5 attempts/code, 5 codes/hour/identifier, IP + device velocity limits.
+14. SMS pumping (fraud traffic to premium numbers) → country allowlist = business countries + CAPTCHA.
+15. Clock skew on the client affecting OTP/TOTP → ±1 step TOTP window; OTP codes server-timed.
+16. Refresh-token reuse (stolen token) → family revoked, user emailed.
+17. Session active in a business where membership was just deactivated → next request 403
+    `membership_inactive`; websocket closed; native app purges that business's offline cache.
+18. User belongs to 30+ businesses (agency/consultant) → switcher with search; no limit `[I]`.
+19. Business suspended for non-payment mid-day → team app keeps job workflow & clock working (grace),
+    CRM read-only, banner to owner.
+20. Two admins edit the same profile → `VERSION_CONFLICT` with diff; no silent overwrite.
+21. Hub owner loses Owner role in one business (transfer) → that business leaves the hub automatically.
+22. Native desktop app offline for days then reconnects with a revoked device → purge cache before
+    showing any data (revocation check is first call on reconnect).
+
+### 11.2 Team management & RBAC
+23. Manager tries to grant `payments.refund` above own cap → `ESCALATION_DENIED`.
+24. Admin tries to edit Operator's compensation → masked/forbidden (rank).
+25. Custom role edited while members use it → permsVersion bump for all; preview diff shown.
+26. Downgrade removes custom roles entitlement → custom roles frozen (read-only) and still evaluated
+    (no sudden lock-out) until changed to a preset.
+27. Override grants a key whose module feature isn't in plan → key shown locked; evaluation removes it.
+28. Worker with zone scope moves to a different zone → their `:zone`-scoped visibility changes on next
+    request; already-downloaded offline data for old zone purged on next sync.
+29. Removing the last zone from a dispatchable member → warning "Will receive no auto-assigned jobs".
+30. Removing a service skill while future jobs require it → keep + flag ineligible (03 conflict).
+31. Member with `allServices=true` → newly published services immediately assignable (documented).
+32. Calendar color collision → allowed with warning; color-blind accessible patterns optional `[I]`.
+33. Photo upload HEIC from iPhone → server converts; EXIF stripped; >10 MB rejected client-side first.
+34. Phone without country code → parse with business country; ambiguous → validation error.
+35. Duplicate name ("Alex" ×2) → list shows last initial + avatar; search matches both.
+36. Member deactivated while a job is **in progress** (worker on site) → wizard warns; effective time
+    options: "after current job completes" `[I]`.
+37. Deactivated member had cash on hand (05) → warning blocks nothing but is shown in wizard and on profile.
+38. Deactivation scheduled for Friday 18:00 but worker clocked in until 19:00 → auto clock-out at 18:00
+    with flag; approver can extend (edit) before approving.
+39. Reactivation when the previous email now belongs to another user → link to existing membership's user
+    (membership retains userId); no re-invite unless user deleted.
+40. Bulk invite (CSV of 50 workers) `[I]` → per-row validation, partial success report, seat check per row.
+41. API key owner deactivated → all their API/MCP credentials disabled instantly (principal inactive).
+42. AI assistant (in-app) asked by a worker "show revenue" → denied by the same `authz.check`; AI never
+    has elevated rights.
+43. "View as" used to try a write → read-only token rejects all mutations.
+
+### 11.3 Availability, time off, calendar sync
+44. Weekly range crossing midnight (22:00–06:00) → stored on the starting weekday; materialized into
+    two calendar days correctly; DST night lengths differ (9 h / 7 h).
+45. Template change effective "today" while jobs already booked outside new hours → those jobs flagged,
+    not moved.
+46. Time off overlapping existing jobs → approver sees list; approving without reassigning leaves
+    conflicts flagged in 03.
+47. Time off requested for the past (sick yesterday) → allowed for type sick/unpaid, admin approval;
+    doesn't touch timesheets.
+48. Overlapping time-off requests → merged display; second request validated "already off".
+49. Member timezone ≠ business timezone (remote area) → availability in member tz; display shows both.
+50. Google token revoked by user in Google → 401 → status error → member + admin notified; busy blocks
+    retained but marked stale after 24 h (03 treats as soft) `[I]`.
+51. Google watch channel expires silently → renew 24 h before `watchExpiresAt`; 5-min polling fallback.
+52. Same job pushed twice (event replays) → `ExternalEventLink` + version guard → idempotent.
+53. Recurring personal Google event "Gym 6–7am daily" → expanded busy instances only within the
+    scheduling horizon (03's `horizonDays`).
+54. Worker connects a calendar shared by many people → we only read free/busy of selected calendars.
+55. maxJobsPerDay reduced below already-booked count for a date → existing kept; no new assignments.
+56. Vehicle assigned to two members same day → allowed for crews; warn otherwise.
+
+### 11.4 Clock & timesheets
+57. Double-tap Start → client debounce + server partial unique open entry → second rejected
+    `already_clocked_in`, UI reconciles.
+58. Clock in on two devices (phone + tablet) → second device gets current state on open; never two
+    open entries.
+59. Clock in in business A while open in business B → blocked with message (unless setting) `[I]`.
+60. App killed / phone dies while clocked in → server entry stays open; reopening app restores timer
+    from server `startAt` (not local).
+61. Device time manually changed → monotonic timer unaffected; trustedTime via offset; flag `clock_skew`.
+62. Offline for a whole shift → all four event types queued; synced later; entry `offline_synced`.
+63. Offline > 7 days → events rejected `too_old`; worker shown instruction; manager adds manually.
+64. Offline clock_in while admin had meanwhile added a manual entry covering the same period → overlap
+    flag; approver resolves (void one).
+65. Late clock_out (offline) after server auto-closed at 12 h → suggested correction, not overwrite.
+66. Break started but never ended, then Stop → break closed at stop instant; if break > 2 h, warn on
+    summary "Long break — correct?" `[I]`.
+67. Paid break > policy cap → excess becomes unpaid (5.2), shown on summary.
+68. Multiple breaks (paid + unpaid) in one shift → all listed in summary `[S: T03]` ("if there was any
+    breaks for the day").
+69. Shift > 24 h (left clocked in over weekend) → auto-closed at maxShiftHours (≤ 24 h hard cap).
+70. Shift crossing midnight on a pay-period boundary → entry belongs to its workday's period (5.5); weekly
+    OT split at workweek instant.
+71. Shift during DST fall-back (01:00–02:00 repeated) → elapsed time correct; display shows "1:30 AM
+    (CDT)" / "(CST)" disambiguation on that night `[I]`.
+72. Shift during DST spring-forward → 7 h for a 22:00–06:00 shift; not 8.
+73. Rounding to 15 min making a 5-minute accidental clock-in 0 or 15 min → if endAt ≤ startAt after
+    rounding → no rounding; if 0-length raw → entry flagged; worker can request void.
+74. Accidental Start (immediately Stop) → summary offers "This was a mistake" → `void_requested`; admin
+    voids (no deletion — audit).
+75. Worker submits then wants to fix (no edit permission) → "Ask manager" sends a note to approvers.
+76. Admin edits an entry while the worker is offline and later syncs a break event for that entry →
+    event rejected `entry_locked` (entry no longer `in_progress`); suggestion attached.
+77. Approve while another admin edits → version conflict; approve requires current version.
+78. Bulk approve 500 entries → processed in chunks of 100, per-entry results, idempotent retries.
+79. Mark paid on an unapproved entry → blocked (`STATE_INVALID`); combined "Approve & mark paid" exists.
+80. Edit of a paid entry → blocked; create `adjustment` entry (+/−) in current period referencing it.
+81. Rate added with effective date in the past (retro raise) → entries in `submitted/approved` for those
+    dates recomputed (audit), `paid` ones unaffected → suggestion "Create adjustments for 6 paid entries
+    (+$84.00)" `[I]`.
+82. Two rates with the same effective date → unique constraint; UI asks "Replace existing rate for that date?".
+83. Rate deleted that was used by approved entries → recompute warning; by paid entries → blocked.
+84. No rate on file → `missing_rate`; export blocked until fixed or override.
+85. Effective date displayed off-by-one (Fieldd narration Oct 20 vs "Oct 19" `[S: T03]`) → date-only
+    storage + display without timezone conversion.
+86. Timesheets disabled company-wide while entries are pending → existing entries remain approvable/
+    payable; clock UI hidden; open clocks handled per 3.6 modal.
+87. Worker's clock permission revoked while clocked in → auto clock-out now, flag; notify worker.
+88. Geofence: GPS denied by OS → `unknown`; mode block still allows with flag (never strand); approver
+    sees "Location unavailable".
+89. GPS spoofing apps → mock-location detection on Android (`isFromMockProvider`), flag only `[I]`.
+90. Clock-in photo required but camera denied → allow with flag `photo_missing` (configurable to block).
+91. Overtime week spanning a rate change (Mon $20, Thu $25) → OT hours priced at the rate in effect for
+    those hours (v1) + `blended_rate_required` flag (FLSA regular-rate) — documented limitation.
+92. California 7th consecutive day where workweek starts mid-sequence → 7th-day rule counts days within
+    the workweek only (per CA rule) `[I]`.
+93. Contractors (`otExempt`) with timesheets → hours tracked, no OT.
+94. Owner as solo worker → can self-approve (solo mode) — needed so a one-person business isn't blocked.
+95. Payroll export run twice for same period → second export lists the same entries; if first marked
+    paid, second includes paid only if selected; exports immutable and listed with timestamps.
+96. Money rounding: 7 h 59 m at $17.33/h → 479 min × 1733 / 60 = 13835.12 → 13835 cents ($138.35).
+97. Huge rates (typo $2,500/h) → soft warning > 3× member's previous rate; hard cap $10,000/h.
+
+### 11.5 Concurrency & reliability
+98. All writes via outbox → events published after commit exactly-once-effect (consumers idempotent by
+    eventId).
+99. Permission cache stale on a node → cache key includes permsVersion; versions pushed via pub/sub,
+    fallback TTL 30 s.
+100. Clock endpoint is on the critical path for workers at 7 am (thundering herd) → stateless, batched,
+     idempotent, < 150 ms p95; app retries with jittered backoff; offline queue covers outages.
+101. Calendar provider outage → jobs never blocked; push queue retries with backoff up to 24 h.
+102. Event consumer for 03 down → 03 reconciles from `team.scheduleProfiles{since: version}` (pull
+     catch-up), never depends on events alone.
+
+---
+
+## 12. Better than Fieldd
+
+Concrete improvements (practical, not fluff) `[I]` unless noted:
+
+**Team setup**
+1. Invited members visible immediately with status, resend, copy-link, bounce detection (Fieldd: "after
+   they log in, you'll see them appear" `[S: T13]`).
+2. "Save without inviting" (draft) for owners setting up before hiring day.
+3. Bulk add via CSV or paste list; bulk-assign zones/services/permissions.
+4. Calendar color auto-suggested (least used, accessible contrast) + dark-mode variant.
+5. Impact-aware deactivation wizard (jobs, routes, series, quotes, leads, cash, open clock) with
+   auto-reassign — offboarding in one screen.
+6. "View as this member" preview to verify permissions before they log in.
+7. Role presets with clear plain-language summaries; permission diff before applying a role change.
+8. Pending invites reserve seats so caps are predictable; deactivated members never consume seats.
+
+**Permissions & security**
+9. Server-side field masking everywhere incl. exports, push previews, MCP, calendar events — revenue and
+   cost never leak to worker devices.
+10. Time-boxed customer contact visibility for workers (privacy, reduces poaching).
+11. Passkeys, step-up auth for refunds/payroll/role grants, device list with remote sign-out, native app
+    keychain storage, cache purge on revoke.
+12. MCP/AI bound to the human's permissions; sensitive operations human-only.
+13. Full audit log with before/after diffs for team, permission, rate and punch changes.
+
+**Timesheets**
+14. Offline-first clock with monotonic timer — works in basements/rural routes; never loses a punch.
+15. Forgotten clock-out reminders tied to the actual last job/route end, auto-close with one-click
+    correction suggestion (Fieldd shows only a manual "add" for forgotten time `[S: T03]`).
+16. Overtime presets (FLSA, daily, California), rounding (neutral only), paid-break caps, meal auto-deduct.
+17. Approve & pay in bulk, with keyboard shortcuts (J/K to move, A approve, R reject) on desktop.
+18. Status shown by icon **and** text label (accessibility), and by color + text in the worker app.
+19. Job-linked time → labor cost per job → real profit (services already carry cost `[S: T06, T19]`).
+20. Pay period summaries with tips pulled from payments ledger; CSV export now, payroll integrations later.
+21. Effective-dated rates as date-only values (no off-by-one), retro-raise adjustments computed for you.
+22. Geofence and clock-in photo optional, with "never strand a worker" fallback.
+23. Route start / job start prompt "Clock in?" — one tap, no forgotten starts.
+
+**Availability**
+24. 14-day availability preview showing exactly what dispatch sees (hours − time off − Google busy).
+25. Time-off requests with conflict list and one-click reassignment.
+26. Per-weekday location (shop vs mobile zone) — matches mixed shop/mobile businesses `[S: T11]`.
+
+**Performance & reliability**
+27. Permission checks in-process with versioned cache (< 1 ms); team list virtualized for 5,000 members.
+28. Clock endpoint p95 < 150 ms; idempotent batch API; outbox events; pull-based catch-up for consumers.
+
+### 12.1 Budget-tier notes
+- A **solo** operator needs: owner membership that is also dispatchable, availability, Google Calendar
+  sync, optional self timesheets (to see hours per job), CSV export. No roles UI noise: hide Team
+  sections until the first member is added.
+- A **small crew (2–3)** needs: invites, Worker preset, clock in/out with breaks, approve/pay, weekly OT,
+  CSV export, time off. All in Starter.
+- Gate to higher tiers: custom roles, zone-scoped managers, geofence/photo, all OT presets, payroll
+  integrations, SSO, longer audit retention, multi-business hub/profile cloning, native CRM device
+  restrictions (5.9 table).
+- Keep timesheets in the lowest paid tier: Fieldd includes timesheets even in Start `[S: llms]`, so
+  gating them would make us look worse than Fieldd for the starter audience.
+
+---
+
+## 13. Open questions
+
+1. **Role names & defaults:** Fieldd names owner/operator/admin/foreman/manager/worker and estimators
+   (`[S: T03, T04, T13]`) but not their exact rights. Is "operator" a co-owner or an office dispatcher?
+   Should we ship all 8 presets (incl. Bookkeeper) or a smaller set? Reconcile defaults that differ from
+   02/05/06/07/08 proposals (e.g., 02 lets Manager edit catalog drafts; 2.4 says no).
+2. **What counts as a "user" seat** on Fieldd plans (10/30/30+) — all workers, or CRM users only? Our
+   proposal counts active + invited, excluding Bookkeeper. Pricing for our tiers is an owner decision.
+3. **Can invited (not yet logged-in) workers be assigned jobs?** Fieldd implies members appear only after
+   login `[S: T13]`; we propose allowing assignment by default.
+4. **Timesheet granularity:** is a Fieldd "time sheet" one per shift (stop → save) or one per day/period?
+   Can a worker clock in more than once a day (split shift)? We assume per shift, multiple per day.
+5. **Approval before pay:** Fieldd's admin-added entry shows approve/reject/**pay** side by side
+   `[S: T03]` — can it be paid without approval? We require approval (with combined action).
+6. **Rejected entries:** what can the worker do after rejection in Fieldd — edit & resubmit, or only see
+   it? Does "edit timesheets" let foremen edit **other** workers' time or only their own?
+7. **Ownership of fleet vehicles** ("the vehicle on every job" `[S: llms]`): 09 (assignment to people) or
+   03 (assignment to jobs/routes)? Proposed: entity in 09, job stamping in 03.
+8. **Live location (`team.location.pinged`)**: owned by 04 (on-my-way) — 09 only stores consent. Confirm,
+   and whether clock-in location may be reused for dispatch "who is free" maps.
+9. **Overtime & payroll scope for v1:** which jurisdictions does the owner need first (US federal only?
+   California? Canada/Australia — Fieldd operates in 37 countries `[S: llms]`)? Is FLSA blended regular-
+   rate needed in v1?
+10. **Revenue share default for split jobs** (equal vs by line duration) and whether commissions/per-job
+    pay are in scope (common in detailing/cleaning) — currently out of scope v1.
+11. **Multi-business hub & "profile cloning"** `[S: llms]`: does cloning mean business setup clone or
+    worker profile clone? Does a hub share staff across businesses with one login (we assume yes via
+    memberships)?
+12. **Calendar sync direction:** does Fieldd push jobs to Google, pull busy time, or both `[S: T13]`?
+    Outlook/Apple needed at launch?
+13. **Pay period settings:** where does Fieldd define pay periods, if anywhere ("once the pay period has
+    ended" `[S: T03]`)? Weekly vs biweekly default?
+14. **Native apps (2026-11-13):** will the desktop/iPhone CRM apps be separate apps from the team app, or
+    one app with role-based modes? Session/keychain design assumes separate CRM and team-app clients.
+15. **Brand kit ownership:** single owner for theme/branding engine across 01/04/08 (6.10)?
+16. **Worker earnings visibility:** should workers see their pay rate, hours × rate, and tips in the app
+    by default?
+17. **Geofence privacy/legal:** consent text per jurisdiction (e.g., employee GPS monitoring laws) —
+    legal review needed before enabling `block` mode.
+18. **Data retention:** confirm payroll/timesheet retention (proposed 3 years min) vs erasure requests.
+
+---
+
+## 14. Verify against video
+
+Team member creation & profile `[S: T13]`
+- [ ] Exact path: **New → Worker**; and the second path implied by chapters "Open the Worker Settings"
+      → "Tap 'Add New Worker'" (is there a Settings → Workers list? is it done in the mobile app?).
+- [ ] Field list and order on the new-worker form: name (one field or first/last?), phone, email,
+      address, photo; required markers; validation messages.
+- [ ] Is there a **role** dropdown ("Set Role and Permissions" chapter)? Which role names are listed
+      (owner, operator, admin, manager, foreman, worker, estimator, others)?
+- [ ] Service area selection UI (checkboxes? map?), shops listed alongside zones `[S: T11]`.
+- [ ] Services selection UI: per-service toggles? "all services" option? categories?
+- [ ] Permissions section: list every **Mobile app** toggle and every **CRM** toggle verbatim;
+      scope options; any limits (discount %, refund).
+- [ ] Calendar color picker: palette vs free color; uniqueness enforced?
+- [ ] After Save: toast text; does the worker appear in People immediately (as invited) or only after
+      login `[S: T13]`? Is there "resend invite"?
+- [ ] Invite email content & branding; team app download links; login method (password, code, link).
+- [ ] Worker profile layout: tabs or single page; sections (service history, ratings, notes, account
+      status `[S: T09]`), Save button position ("save button at the top" `[S: T03]`).
+- [ ] People tab: customers and workers in one list or separate tabs; filters; export of worker data
+      `[S: T09]`; global search finds workers.
+- [ ] Deactivate/delete worker: button label, confirmation, what happens to future jobs.
+- [ ] Availability UI in the worker app and/or CRM: weekly hours, time off, max jobs/day.
+- [ ] Google Calendar sync: where connected, which direction, which calendar.
+- [ ] Vehicle assignment to a worker/job (`[S: llms]` "the vehicle on every job").
+- [ ] Dashboard "team availability" and "active right now" tiles `[S: llms]`.
+
+Timesheets `[S: T03]`
+- [ ] Settings → Account → **Workers** page: exact label of the timesheet toggle and any other settings
+      on that page (pay period? overtime? rounding?).
+- [ ] Profile → Permissions → Mobile app: exact labels "View time sheets" / "Edit time sheets"; are they
+      checkboxes or toggles; can Edit be enabled without View?
+- [ ] Worker app: clock card position (top), Start button color (blue), working border (green), break
+      border (orange), timer format, pause icon, stop icon.
+- [ ] Break chooser: wording for paid/unpaid; can type change after starting?
+- [ ] Time track summary: fields shown (shift start/end, breaks, total hours), edit ability, Save label,
+      confirmation message.
+- [ ] Worker app timesheet list: statuses/icons, rejection reason display, notifications wording.
+- [ ] CRM timesheet entry screen: navigation path, columns, status icons for paid/approved/rejected
+      (and submitted/pending?), filters, period selector, totals.
+- [ ] Admin **Add** button at the bottom: modal fields (date, start, end, breaks, hourly rate for this
+      punch); resulting status "submitted".
+- [ ] Edit punch UI: which fields editable; is a reason required; audit visible?
+- [ ] Approve / reject / pay controls: per entry or bulk; can pay without approve; rejection reason input.
+- [ ] Profile → Time sheets → **Compensation**: "Edit rate", rate + effective date inputs, "Add" button,
+      list of current and future rates; check the **Oct 20 vs Oct 19** effective-date behaviour.
+- [ ] Any overtime, rounding, geofence, auto clock-out, or payroll export features (not mentioned in the
+      tutorial — confirm absence).
+- [ ] Mobile responsiveness of timesheet screens in the CRM.
+
+Tenancy, auth, branding (2026-11-13 requirements)
+- [ ] Login screen for CRM and team app: methods offered (password, code, SSO), business switcher if
+      one user has multiple businesses.
+- [ ] Multi-business hub (Pro) presence and look, if visible in the owner's account.
+- [ ] Dark mode toggle in the side menu `[S: llms]`; whether staff theme is per-user or per-business;
+      which branding controls exist for the CRM workspace itself.
+- [ ] Settings → MCP / API connection screen and what permissions it grants `[S: llms]`.
+- [ ] Session behaviour: how long the CRM stays signed in; sign-out-everywhere; device list.

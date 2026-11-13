@@ -1633,3 +1633,540 @@ font files with licences permitting PDF embedding; copy-override keys for every 
 key list: `doc.quote.title`, `doc.invoice.title`, `doc.balance_due`, `doc.book_online`, `doc.accept`,
 `doc.decline`, `doc.terms`, `doc.valid_until`, `doc.due_on`, `doc.paid_stamp`, `doc.void_stamp`, …).
 
+---
+
+## 10. Algorithms / pseudo-code
+
+### 10.1 Master status derivation
+
+Pure function, run inside every job transaction after sub-states change; result persisted with the job and
+`job.job.status_changed` emitted only if it changed.
+
+```ts
+function deriveMasterStatus(j: Job): MasterStatus {
+  if (j.cancelledAt) return 'cancelled';
+  if (j.workState === 'no_show') return 'no_show';
+  const workDone = j.fieldWork === 'none' || j.workState === 'completed';
+  if (workDone) {
+    switch (j.invoiceState) {
+      case 'paid': case 'partially_refunded': return netPaid(j) >= j.totals.total ? 'paid' : 'partially_paid';
+      case 'refunded': return j.totals.total === 0 ? 'paid' : 'invoiced';     // money returned, still owed
+      case 'partially_paid': return 'partially_paid';
+      case 'open': case 'viewed': return 'invoiced';
+      case 'written_off': return 'written_off';
+      case 'void': return j.fieldWork === 'none' ? 'cancelled' : 'completed';
+      default: /* draft|none */
+        if (j.totals.total === 0) return 'paid';
+        if (j.fieldWork === 'none') return 'draft';
+        return 'completed';
+    }
+  }
+  switch (j.workState) {
+    case 'paused': return 'paused';
+    case 'in_progress': return 'in_progress';
+    case 'arrived': return 'arrived';
+    case 'en_route': return 'en_route';
+  }
+  if (j.scheduleState === 'scheduled') return 'scheduled';
+  if (j.quoteState === 'accepted') return 'approved';
+  if (j.quoteState === 'sent' || j.quoteState === 'viewed') return 'quoted';
+  if (j.quoteState === 'declined') return 'declined';
+  if (j.quoteState === 'expired') return 'expired';
+  if (j.quoteState === 'withdrawn') return 'cancelled';
+  if (j.fieldWork === 'required' && hasBeenBooked(j)) return 'unscheduled';  // e.g. unscheduled by 03
+  return 'draft';
+}
+// flags computed alongside: overdue, unassigned (scheduled && no workers), requirementsIncomplete, ...
+```
+
+### 10.2 Invoice sync with job lines
+
+```ts
+onJobLinesOrTotalsChanged(job):
+  inv = primaryInvoice(job)
+  if (!inv || inv.state === 'draft') return        // draft invoice is a live view; nothing to do
+  if (inv.state in ['void','refunded'] ) -> reject edit (JOB_LOCKED_PHASE) unless creating rebook
+  if (inv.exportLockedAt) {
+    delta = diffLines(currentVersion(inv).linesSnapshot, job.lines)
+    createSupplementalInvoice(job, delta.addedOrIncreased)      // #N-2 in draft; decreases → credit note via 05
+    return
+  }
+  breakdown = payments.saveBreakdown(job.id, inputs(job), expectedVersion)   // Agent 05 authority
+  v = new InvoiceVersion(inv, job.lines, breakdown, reason:'revision')
+  inv.balanceDue = max(breakdown.total - inv.amountPaid, 0)
+  inv.state = recomputeInvoiceState(inv)            // paid -> partially_paid if balance > 0
+  emit invoice.invoice.revised { delta: breakdown.total - previousTotal }
+  if (inv.amountPaid > breakdown.total) set flag creditDue; emit for 05 refund/credit decision
+```
+
+#### 10.2.1 Largest-remainder allocation (discounts and tax back to lines)
+
+```ts
+function allocate(totalCents: number, weights: number[]): number[] {
+  const sumW = weights.reduce((a, b) => a + b, 0);
+  if (sumW === 0) return weights.map(() => 0);
+  const raw = weights.map(w => (totalCents * w) / sumW);       // use bigint/rational in impl
+  const floors = raw.map(Math.floor);
+  let remainder = totalCents - floors.reduce((a, b) => a + b, 0);
+  const order = raw.map((r, i) => ({ i, frac: r - floors[i] }))
+                   .sort((a, b) => b.frac - a.frac || a.i - b.i);   // deterministic tie-break by line order
+  for (let k = 0; k < remainder; k++) floors[order[k].i] += 1;
+  return floors;
+}
+```
+
+### 10.3 Accept-and-book saga (quote → booked job), idempotent
+
+```
+bookFromQuote(token, versionId, slot, paymentInput, key):
+  1. resolve token → job; assert scope 'book'; lock job row (SELECT … FOR UPDATE semantics or equivalent)
+  2. if quote.acceptance exists for versionId → reuse; else AcceptQuote(...) (step validated: latest, not expired)
+  3. hold = scheduling.hold.create(jobId, slot, durationMin, preferredWorkerRule)   // Agent 03, TTL 10 min
+        on failure → return SLOT_UNAVAILABLE + fresh suggestions (job stays 'approved')
+  4. if deposit/card-on-file/pre-auth required → Agent 05 payment step with idempotencyKey = key+':pay'
+        on failure → scheduling.hold.release; return PAYMENT_FAILED (job stays 'approved')
+  5. scheduling.booking.commit(holdId)  → emits scheduling.job.scheduled
+        on failure after payment → 05 voids/refunds authorization (compensation); return BOOKING_FAILED
+  6. 04 handler of scheduling.job.scheduled: quote → booked; create invoice draft; derive status
+  7. respond with confirmation view-model
+  Replays with the same key at any step return the stored outcome of that step.
+```
+
+### 10.4 Completion gate
+
+```ts
+function completionCheck(job, visit, settings): { ok: boolean; unmet: Unmet[]; mode: 'block'|'warn'|'off' } {
+  const unmet: Unmet[] = [];
+  for (const rule of job.requirements.photoRules) {
+    const have = photosFor(job, rule.stage).filter(p => p.uploadState !== 'failed_permanent' && !p.deletedAt
+                    && (!rule.sourceLineIds.length || !p.lineItemId || rule.sourceLineIds.includes(p.lineItemId))).length;
+    if (have < rule.minCount) unmet.push({ kind: 'photo', stage: rule.stage, have, need: rule.minCount });
+  }
+  for (const item of job.requirements.items.filter(i => i.required && appliesToWorker(i, visit.workerId))) {
+    const r = latestResponse(job, item.id);
+    if (!r || (!r.na && isEmpty(r.value)) || (r.na && !item.allowNA)) unmet.push({ kind: 'checklist', itemId: item.id });
+  }
+  if (job.requirements.signatureRequired && !hasSignature(job, 'completion')) unmet.push({ kind: 'signature' });
+  const mode = strictestMode(settings.field.photoEnforcement, settings.field.checklistEnforcement, unmet);
+  return { ok: unmet.length === 0 || mode === 'off', unmet, mode };
+}
+// Server re-runs the check on CompleteJob; WA runs the same function offline (shared library).
+// If the server sees unmet items that the device thought were met (e.g. photo later failed_permanent),
+// completion is still applied (never bounce a worker's completion after the fact) but flagged
+// requirementsIncomplete + job.requirements.overridden{reason:'post_sync_mismatch'} for the office.
+```
+
+### 10.5 Requirements resolution
+
+```
+resolveRequirements(job):
+  lines = active service + addon lines
+  tpl = catalog.requirements.resolve({serviceIds, addonIds, zoneId})        // Agent 02
+  items = dedupe(tpl.globalItems ∪ tpl.serviceItems) by templateItemId     // global items appear once
+  photoRules per stage:
+     base = tpl.global.minCount[stage]
+     svc  = tpl.services.map(s => s.minCount[stage])
+     need = max(base, max(svc)) + Σ(svc where rule.additive)               // default: max; additive opt-in
+  snapshot = { items, photoRules, signatureRequired: settings.requireCompletionSignature || tpl.signature }
+  on upsell line added → union new items / recompute need (never decrease below already-satisfied)
+  on line removed → drop unanswered items sourced only from that line
+```
+
+### 10.6 On-my-way: ETA, staleness and live tracking
+
+```
+enRoute(cmd):
+  if job not in [scheduled] or workState not in [not_started] → if workState beyond en_route: outcome superseded
+  serverLag = now - cmd.deviceTime (skew-corrected)
+  eta = cmd.etaAt
+  if cmd.etaSource == 'gps_route' and online: recompute with routing provider from cmd.location (cap ±50%)
+  notify = cmd.notifyCustomer && settings.liveTracking
+  if serverLag > 10 min → notify = false; record 'eta_not_sent_stale'                         // offline queue
+  if eta < now → eta = now + max(5 min, remainingDriveTime(lastPing))                      // never send past ETA
+  if job.flags.backfilled or schedule.start < now - 12h → notify = false
+  if onMyWayLeadWorkerOnly and another visit already en_route → notify = false
+  session = tracking.create(jobId, workerId, ttl = settings.trackingLinkTtlMin)
+  emit job.job.en_route {etaAt: eta, trackingUrl: notify ? session.url : null}
+
+tracking pings (every 15 s or 50 m; batched upload when signal is poor):
+  store last N points (ring buffer, 24 h retention), recompute ETA every 60 s server-side,
+  if |eta - lastNotifiedEta| > 10 min → emit schedule.eta.updated (Agent 08 "running late" per its catalog)
+  stop on arrived/started/cancel/reschedule or TTL; public.tracking shows coarse position (≈100 m) only
+  while en_route; after stop shows state text only.
+```
+
+### 10.7 Offline-first sync and conflict rules (worker app, estimator, native staff apps)
+
+Device model: local database mirroring the worker's jobs in the window [today − 2 days, today + 14 days] plus
+all non-terminal assigned jobs; catalog subset (sellable items + prices + requirement templates); customers and
+assets for those jobs only (minimised PII; encrypted at rest; wiped on logout/deactivation).
+
+Every user action = append a `DeviceCommand` to the outbox (with client-generated ids for any new entity) and
+apply optimistically to the local store. Sync loop: `sync.push` in `deviceSeq` order (one in flight per job to
+preserve order; different jobs in parallel), then `sync.pull` from cursor. Triggers: connectivity regained,
+app foreground, every 60 s while active, background fetch, after each command when online.
+
+Server application of a command (inside the job transaction):
+
+```
+apply(cmd):
+  if seen(cmd.commandId) → return stored outcome ('duplicate')
+  job = load(cmd.jobId)
+  switch conflictClass(cmd.type):
+    case APPEND_ONLY:      // notes, photos.init, checklist answers, signatures, location pings
+      accept regardless of baseVersion unless job is hard-deleted; if job cancelled/reassigned → accept
+      and mark 'conflict_preserved' (data attached to job audit; office notified once per job)
+    case STATE_TRANSITION: // enRoute, arrive, start, pause, resume, complete, noShow
+      if transition valid from current server state → apply (use skew-corrected deviceTime as event time,
+         clamped to [lastStateChangeAt, serverNow])
+      elif already in target or later state → 'superseded' (e.g. start after office completed)
+      elif job cancelled → 'conflict_preserved' (store visit data; tell worker "Job was cancelled at 10:12")
+      elif worker unassigned → if (cmd is complete|start) and work evidence exists → apply as
+           'performed by unassigned worker' + office alert; else 'conflict_preserved'
+    case LINE_EDIT:        // upsell add / qty change / price change
+      add: apply if workState != completed-by-office and invoice not void; if invoice issued → revision
+      qty/price update on a line also changed by office since baseVersion → office wins; device change
+           recorded as rejected suggestion with diff (worker sees "Office changed price to $X")
+      remove: allowed only for lines the device added and that are unchanged on server
+    case PAYMENT_RECORD:   // cash/check only offline (card requires connectivity — Agent 05)
+      forward to Agent 05 with idempotency key = commandId; never dropped
+    case QUOTE_DRAFT:      // estimator offline quotes
+      create job with number on sync; acceptance (in_person) applied if version content hash matches
+  bump job.version; append audit with actor.deviceId and both times
+```
+
+Field-level policy summary:
+
+| Data | Who wins on conflict |
+|---|---|
+| Schedule, assignment, address, customer | Office/server (03/07 authority) |
+| Field state transitions | State machine order; later state wins; never regress |
+| Checklist answers | Last answer by deviceTime per item, all answers kept in history |
+| Photos, notes, signatures | Union (append-only) |
+| Prices | Office; device price edits require permission and lose to concurrent office edits |
+| Added lines | Union, unless job closed by office → preserved as suggested lines for office approval |
+
+Clock skew: each sync request carries device clock; server estimates offset (median of last 5 round trips) and
+stores `deviceTime`, `correctedTime`, `serverTime`. Reports use corrected time; audit shows all.
+
+### 10.8 CRM concurrent edits (optimistic concurrency + field merge)
+
+```
+save(jobId, expectedVersion, patch):
+  if job.version == expectedVersion → apply
+  else:
+    changedSince = auditFieldsChangedAfter(expectedVersion)
+    if patch.fields ∩ changedSince == ∅ → auto-merge (apply patch to latest), return new version + "merged" notice
+    else → 409 JOB_VERSION_CONFLICT with {theirs, yours, base} per conflicting field; UI shows 3-way choice
+  Lines are merged per line id (two users editing different lines merge cleanly).
+```
+
+### 10.9 Job number allocation
+
+```
+allocateNumber(businessId):
+  in its own short transaction: UPDATE number_sequence SET next = next + 1 WHERE businessId=? AND kind='job'
+  RETURNING next - 1      // row-level lock; ~1 ms; gaps possible only if the outer txn fails → acceptable
+                          // for job numbers (documented); legal invoice numbers use the gapless variant:
+allocateLegalInvoiceNumber: inside the SAME transaction as invoice issuance (lock held until commit) → gapless.
+Changing "next job number" in settings: only increase; validated ≥ max(existing)+1.
+```
+
+### 10.10 Sweeps (per business, local 00:05)
+
+```
+for business in businessesDueAt(localTime 00:05):     // computed with tz db; idempotent per (business, localDate)
+  expire quotes: state in (sent, viewed) and expiresOn < today → expired (batch, events per quote)
+  overdue invoices: state in (open, viewed, partially_paid) and dueOn < today and overdueSince is null → flag + event
+  stale field states: en_route > 6 h → revert to not_started + office alert; in_progress > 18 h → office alert
+  scheduled jobs whose end < today-1 and not started → flag "past due — not completed" (no auto-change)
+  auto-send invoices: completed jobs with draft invoice older than autoSend.afterHours → issue + send
+```
+
+### 10.11 Send with undo window
+
+Quote/invoice send writes the version and emits the event immediately, but tells 08 `deliverAfter = now + 10 s`.
+"Undo" within the window calls `quotes.unsend` → 08 cancels the queued messages; version is marked `withdrawn_before_delivery`
+and the previous state restored. After 10 s, Undo disappears (to correct, revise/resend). `[D]`
+
+### 10.12 Photo capture & upload pipeline (reliability first)
+
+```
+capture(photo):
+  write original JPEG/HEIC to app-private storage (fsync) → compute sha256 → create local JobPhoto (state captured)
+  generate upload rendition: longest edge 2560 px, quality 0.8, keep EXIF time + GPS in metadata record,
+     strip EXIF GPS from customer-facing renditions server-side
+  enqueue metadata command field.photos.init (small, goes first so the office sees "photo pending")
+uploader (background task; survives app restarts; OS background transfer APIs where available):
+  for each queued photo (FIFO per job, before-photos first, max 2 concurrent, 1 on cellular-weak):
+    init → server returns alreadyHave (dedupe by sha256 within job) or resumable upload URL + chunkSize (256 KB–4 MB adaptive)
+    upload chunks with offset; on network error → exponential backoff (2 s … 5 min, jitter), resume at server offset
+    complete → server verifies sha256; mismatch → restart once, then failed_permanent (keep local file)
+    on verified: mark local uploaded; keep local original until server reports processed + 24 h, or storage pressure
+  never delete an unverified photo; storage-full → warn worker before capture fails; allow export to device gallery
+server processing: virus/format check, thumbnails (sm/md/lg), orientation fix, perceptual hash (duplicate warning),
+  emit job.photo.uploaded; customer-facing variants only for sharedWithCustomer photos
+```
+
+---
+
+## 11. Edge cases & failure modes
+
+**Identity & numbering**
+1. Two offices create jobs at the same millisecond → row-locked sequence; no duplicate numbers.
+2. Owner sets next number lower than max → rejected with explanation.
+3. Offline estimator creates 3 quotes → provisional refs; numbers assigned in sync order; any printed/handwritten
+   provisional ref resolves via search (`localRef` indexed).
+4. Search "1042" when both job #1042 and a phone number containing 1042 exist → number match ranked first.
+5. Strict legal invoice numbering enabled mid-year → only invoices issued after enablement get legal numbers;
+   earlier ones unchanged.
+
+**Quotes**
+6. Customer accepts v1 while office is editing an unsent v2 draft → acceptance of v1 valid; office's draft gets a
+   conflict banner; sending v2 requires choosing "re-request acceptance".
+7. Customer accepts after office sent v2 (old tab open) → `QUOTE_SUPERSEDED`, page reloads to v2.
+8. Accept at 23:59:59 local on expiry day vs. sweep at 00:05 → valid; acceptance at 00:01 → expired (sweep not
+   needed for the guard; guard compares dates).
+9. Customer double-clicks Accept / network retry → idempotent on versionId.
+10. Customer accepts, starts booking, slot taken by someone else → hold fails, job remains `approved`, fresh slots.
+11. Customer accepts & pays deposit, booking commit fails → saga compensation voids/refunds; customer sees error
+    with "We've saved your acceptance — pick another time".
+12. Quote sent to an email that bounces → 08 `comms.message.failed` → job card banner "Quote not delivered".
+13. Quote with book-online but no qualified worker exists for its services in the zone → booking step shows
+    "Call us to schedule" + office alert, acceptance still recorded.
+14. Preferred worker deactivated after quote sent → booking falls back to any qualified worker unless restricted;
+    restricted → contact-us fallback + office alert.
+15. Catalog price rises after quote sent → quote price honoured; job flagged `priceChangedSinceQuote` (info only).
+16. Customer declines then calls to accept → office revises/resends or marks accepted (verbal) — both audited.
+17. Quote for a customer later merged into another → token still works; job re-pointed; document shows original name.
+
+**Scheduling interplay**
+18. Office reschedules while worker is en route → WA push "Job moved"; en-route reverted; customer tracking link
+    shows "Your appointment was rescheduled".
+19. Office reassigns while worker has started (offline) → worker's start/complete preserved and applied as
+    "performed by unassigned worker" with alert (03 rule: reassigning started jobs needs admin).
+20. Recurring "commit to future" while some occurrences are in progress → only not-started occurrences updated.
+21. Route reoptimized mid-day → WA order changes; current job unaffected.
+22. Job scheduled in the past (backfill) → no customer notifications; requirement gate skipped only when
+    "mark completed" chosen.
+23. DST: job 01:30 on fall-back day → stored as instant; WA shows "1:30 AM (second occurrence)" disambiguation.
+
+**Field work**
+24. Worker taps On my way on the wrong job → "Cancel en-route" stops tracking and invalidates the link; if the ETA
+    message was already delivered, 08 sends a short correction (template owned by 08); if still queued (undo
+    window), the message is cancelled and the customer never sees it. Audit kept.
+25. Worker has no GPS permission → manual ETA only; tracking link not offered.
+26. Location permission revoked mid-route → tracking page shows "Live location unavailable", ETA from last estimate.
+27. Worker starts job without tapping on-my-way → allowed; customer gets no ETA.
+28. Two crew members start simultaneously → first start sets job startedAt; second creates its own visit.
+29. Worker completes with photos still uploading → completion accepted; `evidencePendingUpload`; 08 waits ≤ 10 min
+    before sending completion summary with photos, then sends without missing ones (link updates).
+30. Photo storage full on device → capture blocked with clear message and "free space / upload now" actions;
+    never silent loss.
+31. App killed/phone dies mid-upload → resumes from server offset on next launch.
+32. Same photo uploaded twice (retry after timeout) → sha256 dedupe.
+33. Worker picks gallery photo from last week → flagged `fromGallery`, EXIF capturedAt shown; optional block setting.
+34. Checklist template changed by office while job in progress → snapshot unchanged; office can push refresh only
+    if no answers yet.
+35. Upsell added while offline, office meanwhile marked job completed & invoice paid → line arrives as
+    "suggested line" requiring office approval (creates revision/supplemental if approved).
+36. Upsell pushes total above pre-authorized amount → Agent 05 handles re-auth/incremental auth; 04 shows
+    "Payment authorization needs update".
+37. Worker attempts to complete before scheduled start by days → confirm dialog; audit.
+38. Job left `in_progress` overnight → sweep alert; actual duration excludes nothing automatically (office edits).
+39. No-show tapped while customer actually present (mistake) → revert within 24 h with permission; fee reversal.
+40. Customer refuses to sign → signature optional unless required; required → "Customer declined to sign" reason.
+41. Worker device clock wrong by hours → skew correction; times clamped; audit shows raw device time.
+42. Worker logs out with unsynced commands → logout blocked until synced, or export bundle + explicit confirmation.
+43. Worker deactivated with pending offline data → device sync allowed for 72 h for pending commands only
+    (read access revoked), then wiped.
+
+**Invoices & payments**
+44. Payment succeeds but 04 handler fails → event redelivered; idempotent by paymentId; reconciliation job compares
+    05 ledger with invoice amountPaid nightly.
+45. Two payments race to final balance (customer online + worker cash) → both applied; overpayment → creditDue,
+    05 refund flow.
+46. Invoice voided while customer is on the pay page → pay attempt fails with "invoice no longer payable" (05 checks
+    `getPayableState` at confirm).
+47. Line edit after invoice export-locked → supplemental invoice, never silent change.
+48. Refund of a deposit on a cancelled job → master stays `cancelled`; payment pill `refunded`.
+49. $0 invoice (subscription-covered) → auto paid; no email unless opted in.
+50. Tax rate changes between quote and completion → quote price honoured if tax-inclusive? Rule: tax is
+    recomputed at issuance using rate in force at **service date** (05 authority); quote shows "tax estimated".
+51. Currency rounding: 3 × $3.335 line → 1000ths qty math → integer cents with deterministic rounding;
+    totals identical in WA (offline) and server (shared library + server re-check; mismatch → server wins and
+    WA shows updated total before payment).
+52. Customer pays invoice v1 link after v2 issued → payment applies to the invoice (not the version); balance computed
+    on current version.
+
+**Documents & branding**
+53. Business uploads font without embedding rights or corrupt file → fallback font, warning in settings.
+54. Logo missing/too large → placeholder text logo; size controls clamp to placement bounds.
+55. Copy override makes label empty → fallback to default label (empty labels not allowed on documents).
+56. PDF render service down → send proceeds with HTML link only, PDF attached later or regenerated on demand;
+    never block sending on PDF.
+57. Customer forwards link to someone else → link grants only the scoped actions; payment by third party allowed;
+    accept requires terms checkbox and name (recorded).
+58. Token brute force → 128-bit tokens, rate-limited, uniform 404s.
+
+**Permissions & multi-surface**
+59. Worker without `settings.catalog.view_cost` must never receive cost fields — enforced server-side in view-models,
+    and not synced to devices.
+60. AI/MCP action attempts void/write-off → same permission checks as the connected user; destructive actions require
+    explicit confirmation token (two-step) `[D]`.
+61. Native desktop app and web CRM editing same job → same optimistic concurrency (§10.8).
+62. Phone-call booking: staff building a job while the customer is on the line and the slot is taken by an online
+    booking → 03 hold expires/conflict; editor keeps lines and suggests next slots without losing data.
+
+---
+
+## 12. Better than Fieldd
+
+Concrete improvements (all `[D]`; Fieldd baseline from research where cited):
+
+1. **One editor, four modes** — Appointment/Quote/Invoice/Recurring share one editor, so converting a quote to an
+   appointment or invoice is a mode switch, not re-entry (extends the single-ID idea `[S: t04]` to the UI).
+2. **Lifecycle stepper** on the job card shows quote → booked → en route → in progress → completed → invoiced → paid with
+   timestamps/actors — instant "where is this job" answer.
+3. **Separate master status and payment status** with a documented derivation function → no contradictory states
+   ("Completed" yet "Paid" confusion); jobs list filters are exact.
+4. **Quote optional line items** (good/better/best, optional add-ons) that the customer ticks at acceptance — upsell
+   before the visit, priced and taxed correctly.
+5. **Version history with diffs** for quotes and invoices; customers always land on the latest version; acceptance
+   bound to a version and terms hash (dispute-proof).
+6. **"Changes since quote"** shown on the invoice → fewer billing disputes after on-site upsells.
+7. **Offline-first worker app** with explicit conflict rules, a visible sync center and zero silent data loss;
+   completion never blocked by bad signal.
+8. **Resumable, deduplicated photo uploads** with hash verification and "never delete until verified".
+9. **Stale on-my-way protection**: no ETA texts sent from a queue 40 minutes late; ETA never in the past; no duplicate
+   texts for crews.
+10. **Completion gate modes** (Block / Warn+reason / Off) and per-requirement override audit, so owners can enforce
+    before/after photos `[S: t06]` without stranding workers.
+11. **Send undo window** (10 s) for quotes/invoices.
+12. **Shared totals library** (CRM, worker app offline, portal, PDFs) → totals identical to the cent everywhere.
+13. **Strict sequential legal invoice numbers** option for tax compliance while keeping the single job number.
+14. **Supplemental invoices** after accounting lock instead of silently editing exported invoices.
+15. **Fast public documents**: server-rendered, < 60 KB, readable without JS, branded via Agent 11 tokens with
+    light/dark for pages and print-safe light PDFs.
+16. **Dispute evidence pack** (photos, checklist, GPS start/complete, signatures, acceptance record) one click for
+    Agent 05.
+17. **Keyboard-first phone-booking flow** for the native desktop app: caller-ID lookup (Agent 07), `N` new job,
+    type-ahead services, `Ctrl+Enter` book; target < 60 s from ring to confirmed booking.
+18. **On-site package change** on iPhone/worker app: swap/add services or subscription package mid-job with live
+    total, customer approval signature and automatic invoice revision.
+19. **Accessibility**: WA primary actions are large swipe/tap targets usable with gloves; full screen-reader labels;
+    colour never the only status signal (status text + icon).
+20. **Past-job backfill** made explicit ("mark completed?") with notification suppression `[S: llms]`.
+
+**Budget tier notes** (affordable starter vs. gated):
+
+| Starter (cheapest plan) — must have | Can be gated to higher plans |
+|---|---|
+| Single job ID, quotes, invoices, book-online button `[S: t04]`, auto invoice on booking | Optional line items / good-better-best |
+| Worker app job flow: on my way + ETA SMS, start, checklist, before/after photos, complete, POS hand-off | Live map tracking page with streaming location (ETA text only on starter) |
+| Partial payments, due terms, basic reminders | Advanced reminder cadences, late fees, scheduled sends |
+| Offline mode & reliable photo upload (reliability is not a premium feature) | Photo sharing galleries to customers, perceptual-duplicate detection |
+| Brand logo/colors on documents (Agent 11 basics) | Custom fonts, per-placement logo sizing, full copy overrides |
+| Strict legal invoice numbering (compliance) | Supplemental invoice/export locks (accounting integrations) |
+| Customer signature on quote acceptance | Signature on completion & upsell approvals, dispute evidence pack |
+| — | Native desktop app phone-booking console, multi-crew split visits |
+
+Starter targets: solo operator can go from "New → Quote" to sent in < 90 s; worker app usable on a mid-range Android
+over 3G; a job's offline data ≤ 200 KB excluding photos.
+
+---
+
+## 13. Open questions
+
+1. **Recurring occurrence numbering**: does Fieldd give each recurring occurrence its own job number, or one series
+   number with suffixes? (We chose own number + series link.)
+2. **When exactly is the invoice auto-generated** for CRM-booked appointments (t04 only states it for accepted+booked
+   quotes)? Is it visible/sendable before completion?
+3. **Is the invoice number literally identical to the job/quote number** in Fieldd's UI (e.g. "Invoice #1042"), or
+   does it show the job ID elsewhere? Any prefixes?
+4. Does Fieldd let a customer **accept without booking** when book-online is on? What status does the job show then?
+5. **Quote expiry**: does Fieldd have expiry dates / declines / revisions at all? None are mentioned in research.
+6. **Photo count aggregation** when multiple services each require N before/after photos: max or sum?
+7. Are completion requirements **hard-blocking** in Fieldd's worker app, or warnings?
+8. Is there an **"arrived"** state or geofence in Fieldd, or only on-my-way → start → complete?
+9. What does the **live tracking** page show customers (map, worker photo, vehicle)? Does it expire?
+10. Does POS "send an invoice" `[S: t16]` mark the job "complete & invoiced" immediately and email the customer?
+11. Gift card appears under "Options" with discount/tax `[S: t16]`: does Fieldd treat it as a discount (reducing
+    taxable base) or as a payment? (We treat as tender — confirm with Agent 05/06.)
+12. **Multi-visit jobs** (one job over several days): supported by Fieldd? We model one appointment per job in v1
+    with per-worker visits; multi-day may need `visits[]`.
+13. **Legal invoice requirements** for the owner's markets (gapless numbering, credit notes vs. negative invoices,
+    tax ID display) — which countries will the platform launch in?
+14. **Data retention vs. erasure**: how long to keep photos and documents; how to honour customer erasure while
+    keeping tax records?
+15. Should workers see **prices** by default (Fieldd hint: worker POS shows amounts `[S: t16]`)?
+16. **Quote email/SMS reminder defaults** in Fieldd's Settings → Communication → Email `[S: t04]` — which reminder
+    types exist?
+17. Does Fieldd support **deposits on quotes** (require deposit at acceptance) or only through booking payment settings
+    `[S: t04]`?
+18. **Estimator role**: is it a distinct permission set in Fieldd, or just a worker with quote permissions?
+19. Should **cancellation of a paid job** default to refund or credit? (Agent 05/01 policy.)
+20. Native apps (owner 2026-11-13): will the iPhone staff app be the same binary as the worker app with role-based
+    surfaces, or separate? Affects offline scope for office users.
+21. Is there a **customer approval step for on-site upsells** in Fieldd, or does the worker just add them?
+22. Event naming: team must confirm aliases — `job.job.en_route` vs 03's `job.job.on_my_way` / 01's
+    `job.worker.on_my_way`; `invoice.invoice.issued` vs 05's `job.invoice.finalized`; `job.job.cancelled` vs 05's
+    `job.job.canceled`; `job.job.lines_changed` vs 03's `job.lines.changed` (Agent 10 to rule).
+
+---
+
+## 14. Verify against video
+
+Concrete checks for the owner's walkthrough (and any Fieldd CRM screen recording):
+
+**Job identity**
+- [ ] Where is the job number shown on the job card, quote, invoice, email subject and PDF? Same number on all three?
+- [ ] Any prefixes (Q-, INV-, #)? Is numbering sequential per business? Starting value?
+- [ ] Do recurring occurrences each have their own number?
+- [ ] Does search find a job by quote/invoice number?
+
+**New menu & editor**
+- [ ] Exact items in the New menu and their order (Appointment, Quote, Invoice, Recurring job, …).
+- [ ] Quote editor: business info block contents; left/right column split; field names "Quote terms", "Book online".
+- [ ] Right panel order: job address, preferred worker, customer assets, notify contacts — labels and controls.
+- [ ] Is there a quote expiry/valid-until field? A message-to-customer field?
+- [ ] Line item columns (qty? cost? duration?) and how add-ons attach to services; company add-on badge.
+- [ ] "Options and payment" section layout: discount, tax, gift card; payment timing options wording.
+- [ ] Preview screen: side-by-side email and document? PDF download?
+- [ ] Send dialog: channels (email/SMS), recipients, editable message.
+
+**Customer-facing documents**
+- [ ] Quote page/email: buttons (Accept, Decline, Book online), terms display, signature?
+- [ ] What happens after Accept: booking flow steps, deposit step, confirmation page text.
+- [ ] Invoice page: pay button, partial payment, tip prompt, receipts, status badges.
+- [ ] Branding on documents: logo placement, colors, fonts; dark mode on pages?
+
+**Statuses**
+- [ ] Full list of job statuses in the jobs-tab status filter and their colors.
+- [ ] Payment status column values in the jobs list `[S: t08]`.
+- [ ] Quote statuses in the quotes list; invoice statuses in the invoices list `[S: t08]`.
+- [ ] Is there a "needs scheduling"/accepted state, "no-show", "on the way", "in progress" visible to office?
+
+**Worker app**
+- [ ] Day list layout: card contents, sorting, route card with "Start route" swipe `[S: t02]`.
+- [ ] Job detail: order of sections; call/text/message buttons; navigate button.
+- [ ] On my way: ETA shown/editable? Customer text content? Live tracking page look.
+- [ ] Start job interaction (swipe vs button); timer display.
+- [ ] Checklist UI: item types, required markers, global vs service grouping `[S: t06]`.
+- [ ] Photo capture: before/after counters "x of N", gallery allowed?, upload indicator.
+- [ ] Can the worker complete with missing photos/checklist? Error/warning text.
+- [ ] POS after completion: tenders listed (new card, card on file, cash, check, send invoice) `[S: t16]`; tip screen.
+- [ ] Upsell: how add-ons are added in POS before completion `[S: t07]`; price editable?
+- [ ] Estimator quote creation in the app `[S: t04]`: same fields as CRM? Present-on-device acceptance?
+- [ ] Offline behaviour: any offline banner, queued actions, photo retry UI.
+- [ ] Route progress % and auto-close after last job `[S: t02]`.
+
+**Settings**
+- [ ] Settings → Communication → Email: quote/invoice styling options and reminder settings `[S: t04]` — list every toggle.
+- [ ] Settings → Payments (right below): deposits, prepayments, pre-authorization `[S: t04]`.
+- [ ] Any job/workflow settings (photo enforcement, signature, numbering).
+
+**Customer side (swash.co walkthrough)**
+- [ ] Does the customer portal list past quotes/invoices/jobs under the account? Same job number visible?
+- [ ] On-my-way/arrival notifications as received by the customer (SMS text, link, map).
+- [ ] Completion message with photos? Review request timing?
