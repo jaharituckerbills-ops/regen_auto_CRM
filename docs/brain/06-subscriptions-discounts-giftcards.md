@@ -2204,3 +2204,291 @@ function upsellCandidates(cart, customer, zone, channel):
      p.netToday = member + firstCharge - regular   // what it costs the customer today vs not joining
   return top 1 (booking widget) or top 3 (CRM) by score desc, tie → lower price
 ```
+
+---
+
+## 11. Edge cases & failure modes
+
+All `[I]` unless cited.
+
+### 11.1 Billing & time
+1. **Anchor on the 29th–31st** → clamp per month, return to original day (§10.2); receipts show
+   the actual charge date.
+2. **Feb 29 yearly anchor** → Feb 28 in non-leap years.
+3. **DST gap/overlap** at billing local time → shift forward / take earlier instant; billing time
+   default 06:00 avoids 02:00–03:00 gaps entirely.
+4. **Business changes timezone** → existing anchors keep their original tz until next renewal,
+   then migrate (preview shows the one-time shift); never double-bill or skip a day.
+5. **Scheduler down for hours** → catch-up runs bill each due subscription once (unique
+   `(subId, seq)`); customers are charged late, not twice; if more than one period is overdue
+   (multi-day outage on weekly plans), bill missed periods sequentially only if
+   `catchUpMissedPeriods` (default: bill 1, skip-and-log the rest for owner review).
+6. **Charge timeout / unknown result** → period stays `charging`; reconcile with 05 by
+   idempotency key; no retry until resolved.
+7. **Webhook out of order** (success arrives after we processed a failure) → success wins if
+   chargeId differs and is newer; period → paid; dunning cancelled; customer receives
+   "payment received" not a second failure notice.
+8. **Duplicate webhook** → dedupe on chargeId / eventId.
+9. **Card expired between renewals** → pre-dunning: 7 days before renewal send "update card"
+   (08 `payment.card.expiring`); processor account updater (05) may refresh automatically.
+10. **SCA / 3DS required off-session** (EU/UK/IN etc. — 37 countries `[S: llms]`) → treat as a
+    soft failure with an authentication link; counts as dunning attempt.
+11. **Zero-price plans and 100% discounts** → no charge, period `paid`, still generate a $0
+    receipt only if owner opts in.
+12. **Price change scheduled but notice failed to deliver** (bounced email, no phone) → do not
+    apply increase until a notice is delivered or 2 channels attempted; owner alerted.
+13. **Currency change on business** → blocked while active subscriptions/gift cards exist.
+14. **Prepaid commitment refunded mid-term** → periods after refund date marked `refunded`, grants
+    expire, jobs per cancel policy.
+15. **Trial abuse** (same card/phone/address repeatedly taking trials) → fingerprint check
+    (card fingerprint from 05 + 07 customer fingerprint); one trial per fingerprint per package.
+
+### 11.2 Benefits & jobs
+16. **Job booked for next month when this month's credit is unused** → consumes next month's
+    window (service-date rule); this month's credit still expires — UI warns "You still have 1
+    wash this month; book before Nov 30".
+17. **Job dated in a future unpaid period** → provisional reservation; if that period fails
+    payment, job follows `pastDueJobPolicy`.
+18. **Two simultaneous bookings competing for the last credit** (customer online + staff on
+    phone) → per-subscription lock in `syncJobCoverage`; loser gets non-member price with clear
+    warning before confirm (evaluate dry-run again at commit; price mismatch → `PRICE_CHANGED`).
+19. **Rescheduled across a window where credit already used** → repriced; staff warning; customer
+    notification shows new amount.
+20. **Job completed after subscription cancelled** but dated inside paid period → still covered.
+21. **Job in pending_cancel subscription dated after effectiveAt** → uncovered; cancelled or
+    converted at cancellation time (never discovered at job time).
+22. **Worker adds an add-on on site** `[S: 07]` (add-ons can be added in worker app POS before
+    completion) → `job.lines.changed` → coverage re-sync; free add-on applied if available.
+23. **Job edited after completion / refund** → consumption reversed into the original window;
+    closed window → immediately expired unless staff credits current window.
+24. **Customer with two subscriptions** (two vehicles) → coverage chosen by asset match first;
+    without asset, soonest-expiring window rule.
+25. **Variant mismatch** (plan covers sedan, customer brings an SUV) → coverage = base variant
+    price; difference charged; worker app shows "SUV upcharge $20".
+26. **Unlimited plan abuse** → fair-use caps; owner report "top utilizers".
+27. **Auto-scheduled occurrence cannot be placed** (no worker available, 03 `dispatch.failed`) →
+    remains unscheduled; reservation still held; owner alert; customer not charged extra.
+28. **Holiday / weather cancellation by business** → release credit (business-initiated cancels
+    never consume); optional "credit next period" toggle.
+29. **Customer moves out of service area** → subscription flagged; auto-scheduling paused;
+    owner decides.
+30. **Package archived with active subscribers** → subscribers continue; renewals unaffected.
+31. **Catalog item in an entitlement deleted** (02 hard delete forbidden after use; archive only)
+    → entitlement keeps working for existing subscribers against the archived item; owner prompted
+    to map to a replacement.
+
+### 11.3 Discounts
+32. **Code entered with spaces/lowercase/Unicode look-alikes** → NFKC + uppercase + trim; no
+    fuzzy matching.
+33. **Race on last use of a limited code** → conditional update; second booking gets
+    `PRICE_CHANGED` with the new total before charging.
+34. **Booking abandoned after reserve** → reservation TTL (30 min, matches 05 hold TTL) then release.
+35. **Discount edited while carts are open** → carts re-evaluate on next step; evalHash mismatch
+    at commit → customer sees the updated price before paying.
+36. **Promo expiring during checkout** → if `validityBasis=booked_at`, the time the customer
+    started payment (session start, max 30 min grace) counts — no "expired at 23:59:30" surprise.
+37. **Fixed $ discount larger than order** → capped at eligible subtotal; no negative totals;
+    remainder not stored as credit.
+38. **Percentage > 100 or 0** → validation rejects; 100% allowed (free).
+39. **Discount scoped to travel fee only** → allowed; travel fee is a line (02).
+40. **Recurring series with promo "first occurrence only" where first occurrence is cancelled**
+    → promo moves to next occurrence once (setting, default yes).
+41. **Refund of a discounted job** → refund amounts based on net paid; per-customer use restored
+    per `refundRestoresUse`.
+42. **New-customer discount abuse** (new email, same phone/address/card) → fingerprint match →
+    `CUSTOMER_NOT_ELIGIBLE`; staff can override with permission.
+43. **Staff manual discount above cap** → server rejects (`CAP_EXCEEDED`) even if UI bug lets it through.
+44. **Bulk code export leaked** → per-code single use; owner can disable a batch.
+45. **Automatic discount + code both exclusive** → best-for-customer rule; receipt shows which
+    applied and why the other didn't ("Better offer applied").
+
+### 11.4 Gift cards
+46. **Brute-force code guessing** → 80-bit codes + check char + rate limits + uniform errors;
+    lockout per IP/device; alert on spikes.
+47. **Concurrent redemption from two devices** → row lock + ledger seq unique; second gets
+    remaining balance only.
+48. **Hold never captured** (browser closed after payment) → sweeper releases at TTL, but first
+    reconciles with 05 — if the payment intent actually succeeded, capture instead.
+49. **Gift card purchase charged back** → freeze card; if partially redeemed, owner decides
+    (balance written off as fraud loss).
+50. **Scheduled delivery to wrong email** → purchaser can change recipient until delivered;
+    after delivery, staff reissue (old code invalidated).
+51. **Recipient never opens email** → card still active; purchaser can resend; reminder at 30 days.
+52. **Gift card used for subscription renewals** → only if customer opted in; insufficient
+    balance → split with card on file.
+53. **Refund to a voided/expired gift card** → refund to a new store-credit card instead.
+54. **Jurisdiction forbids expiry** → expiry settings ignored for that locale with UI explanation.
+55. **Business closes account** → export outstanding gift card liability and escheat report;
+    warning that cards remain legal obligations of the business.
+56. **Very large balances / reloads** → max balance cap; KYC/AML review threshold.
+57. **Multi-currency** → cross-currency redemption rejected (05 agrees).
+58. **Partial capture after job amount drops** (discount added after hold) → capture smaller
+    amount; release rest.
+
+### 11.5 Live adjustment (native apps)
+59. **Two staff adjusting the same subscription at once** (office on phone + worker on site) →
+    optimistic `expectedVersion` + `previewHash`; second gets `PREVIEW_STALE` with fresh preview.
+60. **Customer declines consent screen** → no change applied; draft discarded.
+61. **App crashes after Apply** → idempotency key retried on relaunch; server returns original result.
+62. **Phone verbal consent disputed later** → ConsentRecord + written confirmation + audit;
+    recommend call recording integration later (open question).
+
+### 11.6 Permissions & security
+63. Workers cannot see full gift card codes, MRR, or other customers' subscriptions.
+64. Customer endpoints check ownership on every id (no IDOR on `subscription.get`).
+65. Bookings MCP can only act as the authenticated customer; cannot issue gift cards without
+    payment or create discounts.
+66. All money-moving actions audited with actor, device, IP, reason.
+
+---
+
+## 12. Better than Fieldd
+
+All are proposals `[I]`.
+
+### 12.1 Concrete improvements
+1. **Appointment packages (prepaid bundles) as a first-class type** — the owner's priority;
+   Fieldd tutorials only show recurring subscriptions `[S: 01]`. Same ledger, one-time charge,
+   "3 of 5 visits left" in the customer account.
+2. **Benefit meters everywhere** — staff, worker app, customer account show "1 of 1 used,
+   resets Nov 30"; reduces "do I get a free add-on?" calls.
+3. **Savings-to-date** on the customer's membership page and receipts ("You've saved $412 as a
+   member") — retention lever.
+4. **Live preview for every change** (proration, next charge, jobs affected) before applying,
+   in < 300 ms; no surprise charges.
+5. **Native-app live adjustment** with consent capture on the staff device or SMS (§8.7) —
+   on-site upgrades become a one-tap upsell.
+6. **Single code field** accepting discount, gift card, or referral code.
+7. **Explainable discount failures** ("Valid Mon–Thu only" instead of "invalid code"), plus an
+   owner-side "Test this discount" simulator.
+8. **Best-price guarantee** when offers conflict, shown transparently on the receipt.
+9. **Smart dunning**: local-time retries, decline-code aware, card-update link with immediate
+   retry, pre-expiry reminders → typically recovers a large share of failed renewals.
+10. **Pause instead of cancel** retention flow with one retention offer, still compliant with
+    easy-cancel laws.
+11. **Compliance built-in**: consent records, auto-renewal disclosures, price-change notices,
+    gift-card no-expiry defaults, cash-out thresholds, escheat export.
+12. **Versioned packages** with grandfathering control and bulk "apply at renewal with notice".
+13. **Gift cards not tied to our own processor** (Fieldd lists gift cards only when using its
+    payment product `[S: 09]`); works with any processor Agent 05 supports.
+14. **Wallet**: customers save gift cards to their account; balances auto-offered at checkout.
+15. **Scheduled gift delivery in recipient's timezone** with resend and recipient change.
+16. **Fraud controls** on gift card sales (velocity, review threshold) — Fieldd behaviour unknown.
+17. **Unified evaluator** used by booking site, CRM, worker POS and MCP → identical prices everywhere.
+18. **Exports and API/MCP parity** for every list (Fieldd's download-icon pattern `[S: 09]`).
+19. **Metrics that matter**: MRR, churn, dunning recovery, utilization, member value ratio,
+    discount cost, gift card liability.
+20. **Accessibility**: benefit meters with text equivalents, focus-trapped dialogs, keyboard-only
+    wizard, WCAG AA contrast with tenant palettes (BRIEF 2026-11-13 branding: our package cards,
+    gift card designs and upsell card must use tenant theme tokens for light/dark).
+
+### 12.2 Budget tier notes (owner wants an affordable starter plan)
+
+| Capability | Starter (entry) | Growth | Pro |
+|---|---|---|---|
+| Discount codes (time windows, scopes, limits) | ✓ (Fieldd also includes basic promos) | ✓ + automatic discounts, bulk codes | ✓ + budgets, A/B offers |
+| Recurring-job discount `[S: 14]` | ✓ | ✓ | ✓ |
+| Gift cards (manual + online sale + balance ledger) | ✓ (Fieldd Start includes gift cards `[S: llms]`) | ✓ + scheduled delivery, wallet | ✓ + AI design `[S: llms]`, bulk/corporate gift cards |
+| Subscription packages | ✓ up to 3 packages, monthly/yearly, included services & member discount | ✓ unlimited, commitments, trials, upsell | ✓ + multi-location, custom price overlays |
+| Prepaid visit bundles | ✓ (cheap to offer, high value for new businesses) | ✓ | ✓ |
+| Auto-scheduling from subscriptions | ✓ | ✓ | ✓ |
+| Dunning | fixed default schedule | configurable schedule, final action | + smart retries, pre-dunning |
+| Live adjustment in native apps | view + pause/skip | full ops | full ops + custom price |
+| Reports | MRR, active subs, gift card liability | + churn, utilization, discount cost | + cohort, forecasting |
+
+Rationale: recurring revenue features help a new business most; gating them would undercut the
+"affordable alternative" goal. Gate scale/complexity, not the core capability.
+
+---
+
+## 13. Open questions
+
+1. **Appointment packages**: does the owner mean prepaid visit bundles (our §1.1 third column),
+   recurring subscriptions, or both? Expiry of bundles — do state gift-card laws apply to
+   prepaid service packs in the owner's states?
+2. **Fieldd commitment mechanics**: is a commitment always prepaid (video says "pay for several
+   months in advance" `[S: 01]`) or can it be monthly-billed with a minimum term? What happens at
+   term end in Fieldd?
+3. **Benefit reset**: does Fieldd reset "1 free add-on each month" per calendar month or per
+   billing cycle, and do unused benefits roll over?
+4. **Billing start options**: what exact choices are in "choose when billing should begin"
+   `[S: 01]` (today / date / first visit)? Can billing frequency differ from the package cycle?
+5. **Auto-scheduling**: does Fieldd ask the customer for preferred day/time at purchase? Does it
+   create jobs indefinitely or within a horizon? What happens to them on failed payment?
+6. **Dunning**: does Fieldd retry, pause, or cancel on failed renewals? Any customer card-update link?
+7. **Stacking**: does Fieldd stack recurring discount with subscription discount and promo codes?
+   (Agent 05 assumed compounding; 06 proposes best-of — Agent 10 to decide.)
+8. **Discount nav location and fields**: where is "Discounts" in the nav, and which booking
+   conditions / customer types does Fieldd actually offer `[S: 09]`?
+9. **Gift cards**: are amounts preset or custom? Does Fieldd support expiry, reloads, partial
+   redemption display, physical cards, and refunds to gift card?
+10. **Tax on subscriptions** in the owner's jurisdiction (services taxable? package price
+    allocation across mixed taxable/non-taxable items?).
+11. **Customer self-service**: can Fieldd customers pause/cancel online? (We force online cancel
+    for online purchases for legal reasons — owner OK?)
+12. **Multiple subscriptions per customer** (per vehicle/property) — required at launch?
+13. **Store credit vs gift card** — should account credit (refund credit, referral rewards,
+    deposit forfeits from 01) be a separate customer-bound balance in UI, or shown as a gift card?
+14. **Phone sales consent**: is verbal consent + written confirmation acceptable for the owner's
+    markets, or do we need SMS/e-sign approval for every phone-initiated change?
+15. **Event naming normalisation** (`cancelled`/`canceled`, `jobs.`/`job.` prefixes) — Agent 10.
+16. **Gift card AI design**: generated imagery rights and moderation policy for business-uploaded prompts.
+
+---
+
+## 14. Verify against video
+
+Checklist for the owner's walkthrough (and any Fieldd CRM recording). Note: the owner's current
+video (https://youtu.be/vyELvdWCdnc) focuses on the customer side of a Fieldd-powered site — items
+marked (C) are customer-side; the rest need a CRM-side recording.
+
+**Packages (CRM)**
+- [ ] New menu contains "Subscription Package" and "Subscription" entries; exact labels/order.
+- [ ] Package editor: single page or stepper? Field names for name, description, billing cycle
+      options (weekly/monthly/yearly — any others?), price, image.
+- [ ] Commitment options UI: how terms and discounts are entered; prepay vs monthly; labels.
+- [ ] "Available for self-purchase" and "Upsell during booking" toggle labels and placement.
+- [ ] Automatic scheduling toggle and booking-frequency options list.
+- [ ] Included services picker: quantities? per-period? add-ons included? how "1 free add-on per
+      month" is configured.
+- [ ] Discount / "included price reduction" fields: % vs $; scope selection.
+- [ ] Review screen contents and Save button wording; validation messages.
+
+**Assign subscription (CRM)**
+- [ ] Customer search + "+" create; package select + create new.
+- [ ] "When billing should begin" options; "how often" choices.
+- [ ] Payment step: card entry UI, card-on-file selection, failure message.
+- [ ] Post-activation landing screen (subscription details layout).
+
+**Lists & detail**
+- [ ] Transactions → Subscriptions list columns, filters, status chips, export icon.
+- [ ] Dropdown → Packages list columns and actions.
+- [ ] Subscription detail: actions available (pause, cancel, change plan, update card?),
+      billing history, benefits usage display.
+- [ ] Past-due / failed payment indicators anywhere in CRM or dashboard.
+
+**Booking site (C)**
+- [ ] Where packages/memberships appear (separate page/tab, service page, cart).
+- [ ] Upsell during booking: position in flow, copy, savings display, accept/decline behaviour,
+      layout shift.
+- [ ] Self-purchase checkout steps, terms/auto-renew disclosure text, card form.
+- [ ] Customer account: membership view, benefits remaining, cancel/pause options.
+- [ ] Recurring frequency choice and discount display per service (video 06 recurring options).
+- [ ] Promo code field: location, label ("Have a code?"), error messages.
+- [ ] Gift card purchase page: amounts, designs, recipient/message fields, delivery date.
+- [ ] Gift card redemption at checkout; balance display; combined with card.
+- [ ] Gift card email/SMS the recipient receives (design, code format, link).
+
+**Discounts & gift cards (CRM)**
+- [ ] Discounts screen location in nav; list columns; editor fields (scope to services, add-ons,
+      customer types, booking conditions `[S: 09]`); start/end dates; usage limits; code format.
+- [ ] Booking form "Options" section: attach/create discount, apply tax, add gift card `[S: 16]` —
+      exact controls and order; how price breakdown shows discount vs gift card.
+- [ ] Recurring job form: recurring discount field ($ / %) placement `[S: 14]`; does it show
+      alongside a subscription?
+- [ ] Gift cards list columns; issue dialog fields; ledger/history view; void/refund options;
+      AI design entry point `[S: llms]`.
+- [ ] Whether gift cards appear only when using Fieldd's processor `[S: 09]`.
+
+**Worker app**
+- [ ] Any member/subscription indicator on jobs; POS discount and gift card controls.

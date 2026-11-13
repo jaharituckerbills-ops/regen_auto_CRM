@@ -1875,3 +1875,379 @@ lastActivityAt < now() - abandonAfter` (batched, `FOR UPDATE SKIP LOCKED`) → r
 release discount reservations (06) → cancel unconfirmed payment intents (05; never touch `succeeded`
 — those go to reconciliation §10.6) → identified → `abandoned` + `booking.session.abandoned`;
 browsing → `expired_anonymous` (counters only).
+
+---
+
+## 11. Edge cases & failure modes
+
+### 11.1 Domains, DNS, TLS
+1. Business enters `https://book.example.com/` or `Book.Example.com.` → normalize (strip scheme,
+   path, trailing dot; lowercase) before validation.
+2. IDN hostnames (`reservá.example`) → store punycode, display Unicode; reject mixed-script
+   homographs.
+3. Business enters the apex while the apex hosts their website → warn: "This will replace your
+   website" and require explicit apex mode.
+4. Business enters `www.example.com` (their main site) → same warning.
+5. CNAME added at the wrong level (`book.example.com.example.com` because the DNS UI auto-appends the
+   zone) → diagnostics detect the doubled name and say so.
+6. Both CNAME and A records on the same name (invalid; some panels allow) → mismatch with hint.
+7. Old TTL (e.g. 24 h) still caching the previous target → show "DNS changes can take up to N hours
+   (your old record's TTL)" with the actual TTL observed.
+8. Cloudflare proxy on → loop/525 → detection and grey-cloud instructions (§4.1.6).
+9. CAA restricts CAs → `error_caa` with exact record.
+10. CA outage / rate limit → secondary CA; per-hostname backoff; platform host keeps working.
+11. Let's-Encrypt-style duplicate/failed-validation limits hit by an owner hammering "Check now" →
+    "Check now" only re-runs DNS checks; issuance attempts are throttled server-side.
+12. Two tenants claim the same host → first verified wins; transfer requires TXT proof from the
+    new claimant + support confirmation; KV swap atomic.
+13. Tenant churns/deletes account while CNAME still points to us → host shows neutral C5 page; we never
+    serve another tenant on it; cert deleted after 30 days.
+14. Subdomain-takeover risk inverse case: business deletes our tenant but leaves the CNAME, an attacker
+    signs up and claims the same hostname → blocked unless they pass TXT ownership with a **new**
+    token (CNAME alone is not enough for a hostname previously owned by another tenant).
+15. Active domain DNS removed during business website migration → `detached` after 3 checks; links
+    in new notifications switch to platform host; already-sent links (old emails) break until DNS is
+    restored — mitigated by alert to owner within 2 h.
+16. Cert expires because renewal kept failing → HTTPS fails on custom host; HSTS was not
+    `includeSubDomains` so the business's other subdomains are unaffected.
+17. Clock skew on edge nodes → cert `notBefore` issues; NTP monitored.
+18. Customer bookmarks platform host, then custom domain activated → 301 to custom host; session
+    handoff token keeps them signed in.
+19. Business wants two booking hosts (two brands) → second host must be a separate PortalSite
+    (tier-gated) — not two canonical hosts for one site.
+20. Request with Host header not matching SNI (fronting) → 421.
+21. Requests on raw edge IP or unknown host → C5 page, no tenant leakage, `noindex`.
+
+### 11.2 Embed / popup / links
+22. Business's site has strict CSP (`frame-src`) → embed blocked; loader detects iframe load timeout
+    and swaps in a "Book now" link; settings page shows the CSP line to add.
+23. Business's site is HTTP (not HTTPS) → iframe still HTTPS; wallet buttons may be unavailable in
+    mixed contexts → fallback link to full page for payment step.
+24. Safari third-party cookie blocking inside embed → booking still works (no cookie dependency);
+    "Sign in" opens top-level window.
+25. Ad-blockers blocking loader script → `href` fallback on the button.
+26. Embed placed twice on one page → loader is idempotent (`__pb` guard), each container mounts once.
+27. `frame-ancestors`: tenant restricted `allowedEmbedOrigins` → other sites get a "Open booking in
+    new tab" page instead of a blank frame.
+28. 3-D Secure challenge inside iframe on small phones → challenge rendered in-frame by processor; if
+    the frame is too small, popup mode forces full-screen modal on < 600 px width.
+29. Deep link references an unpublished/archived service → ignore preselection, land on category
+    with a gentle notice; 02 `catalog.shortlink.dead_hit` emitted.
+30. Deep link with a date in the past or beyond horizon → clamp to first bookable date.
+31. Promo param invalid/expired → shown as invalid only when the customer reaches A11 (not an error
+    page).
+32. QR printed with platform host before custom domain existed → still works forever (platform host
+    is permanent; `/q/{id}` resolves on both hosts).
+33. Short link code collisions with reserved paths (`/account`, `/api`, `/t`) → reserved words list.
+34. UTM parameters with PII (e.g. `utm_content=email@x.com`) → strip values matching email/phone
+    patterns before storing.
+
+### 11.3 Booking flow
+35. Two customers pick the same last slot simultaneously → 03 hold is exclusive; loser gets 409 +
+    alternatives within the same interaction.
+36. Customer opens two tabs with two sessions and books both → allowed (separate bookings) unless
+    identical service/time/address within 10 min → "Looks like you already booked this — view it?"
+    duplicate guard (soft).
+37. Same session double-clicks "Book" → idempotency key returns same result; button disabled.
+38. Hold expires during 3DS → re-hold same slot at commit; if gone, void payment, alternatives.
+39. Prices change between quote and commit (owner edits price) → `QUOTE_CHANGED` diff screen.
+40. Service unpublished mid-session → at commit: "This service is no longer available online";
+    session kept, lead remains.
+41. Add-on goes out of stock mid-session → removed with notice and re-quote.
+42. Address within zone at A5 but zone geometry edited before commit → recheck; if out of area,
+    convert to request/lead rather than fail silently.
+43. Address geocodes to wrong point (new subdivision) → customer can drag pin; area check uses pin;
+    pin drag > 500 m from geocode flagged for staff.
+44. Address with unit numbers / PO boxes (unservicable) → PO box pattern rejected for mobile services.
+45. Customer in a different timezone than the business (booking for a parent's house) → times shown in
+    service location tz with explicit label; confirmation includes tz.
+46. DST spring-forward gap (02:00–03:00 doesn't exist) → 03 never returns slots in the gap; route days
+    unaffected. DST fall-back duplicate hour → slot labels include offset ("1:30 AM CDT"/"CST") if both
+    occur.
+47. Booking at 23:59 for "tomorrow" while min notice is 12 h → availability already excludes.
+48. Route service ("Anytime Thursday") chosen and route capacity filled by another booking → 409 on
+    hold with next route days.
+49. Multi-service cart with services requiring different worker skills → 03 handles crew/split; if not
+    feasible, 03 returns no slots → UI suggests booking separately.
+50. Mixed mobile + shop services → prevented by cart rule (§5.7).
+51. Questions changed after customer answered (new required question published) → at commit, missing
+    required answer → bounce to questions step with highlight (not an error page).
+52. File upload fails or virus detected → answer invalid, re-upload prompt; booking not blocked if the
+    question is optional.
+53. Phone number formats (national without country code, extensions) → libphonenumber-style parsing
+    with business country default; reject premium/short codes.
+54. Email typos (`gmial.com`) → "Did you mean gmail.com?" suggestion, never auto-change.
+55. Customer enters someone else's phone (booking for spouse) → contact vs service-recipient
+    distinction: optional "Someone else will be there" fields (name/phone) stored as job site contact
+    (07 supports multiple people per contact [S: llms]).
+56. Returning customer doesn't verify OTP but books anyway as guest with same phone → 07 dedupe merges
+    with care (no exposure of existing data to the guest).
+57. Gift card covers full amount → no card needed unless tenant requires card on file for no-shows.
+58. Gift card + discount + referral stacking → 06 rules decide; portal shows each line and the reason
+    for any rejected combination.
+59. Zero-priced booking (100 % discount, free estimate) → payment step skipped unless card required.
+60. Currency/locale: tenant currency differs from browser locale → format with tenant currency, browser
+    locale grouping.
+61. Very long service names/translations → truncation with full text in title/tooltip; no layout break
+    at 320 px.
+62. Back/forward browser buttons within steps → each step is a URL (`/book/{sessionId}/datetime`) so
+    history works; step guard redirects to first incomplete prerequisite.
+63. Customer leaves at payment then returns via resume link after the hold expired → resume restores
+    everything except slot → lands on datetime.
+64. Session secret lost (cleared storage) → session can be resumed only via resume link or sign-in;
+    otherwise new session (old one becomes abandoned → lead keeps data).
+65. Bots filling forms → velocity limits + invisible challenge at commit; honeypot field; leads from
+    bot-scored sessions flagged, not deleted.
+66. Card testing via booking form → 05 risk rules + per-session attempt limit (5) + per-IP limits.
+67. Customer books while business is on "maintenance/closure" → banner + availability empty; request
+    path still available.
+68. Approval mode (`confirmationMode='request'`) → hold converted to tentative block (03), payment as
+    pre-auth or card-on-file only, customer messaging says "requested" until approved.
+
+### 11.4 Account, reschedule, cancel
+69. Customer tries to cancel after worker marked "on my way" → online cancel disabled ("Please call/
+    text us"), since fee/ops implications are staff decisions.
+70. Customer reschedules into the fee window from outside it (e.g. moves to tomorrow) → fee preview
+    shown before confirm; fee based on **original** appointment time vs now (configurable).
+71. Reschedule races staff drag-and-drop in CRM → `expectedVersion` mismatch → reload and show the
+    staff's new time.
+72. Recurring occurrence cancelled online → only that occurrence unless "all future" chosen; series
+    owner rules (06/03) applied; commitment penalties displayed by 06.
+73. Cancel request retried after network timeout → idempotent; fee charged once.
+74. Fee charge fails (card expired) → booking still cancelled; balance due recorded (05) and shown.
+75. Policy changed after booking → snapshot rules apply (customer sees the policy they agreed to).
+76. Customer merged in 07 → portal identities re-pointed; open sessions keep working.
+77. Customer requests account deletion → 07 erasure flow; portal identity, sessions, tracking links
+    revoked; bookings remain on business side per legal basis.
+78. OTP SMS not delivered (carrier filtering) → after 30 s offer email code; after 2 failures show
+    business phone.
+79. Shared family email across multiple customer records → OTP sign-in shows "choose profile" only
+    after verification.
+80. Magic link opened on a different device than requested → allowed (single-use, 15 min) but session
+    is created on the opening device only.
+
+### 11.5 Tracking page
+81. Worker's phone has no GPS / app backgrounded → show last known time "Updated 4 min ago"; ETA from
+    03's schedule rather than live position.
+82. Job reassigned while on the way → link revoked, new link sent by 08.
+83. Worker does multiple jobs, link shared publicly → only current job's leg shown; after arrival map
+    stops; token expiry 2 h after completion.
+84. Customer opens tracking link for a cancelled job → "This appointment was cancelled" page.
+
+### 11.6 Settings & publishing
+85. Owner sets brand colors with poor contrast → warning + auto-fix (via 11); publish allowed but
+    flagged.
+86. Text override introduces unknown placeholder → validation error, cannot publish.
+87. Terms URL returns 404 → daily link check warns owner; acceptance still records the URL + fetched
+    content hash (if fetchable) at publish time.
+88. Two admins edit draft concurrently → draft versioning with last-writer warning ("Alex edited this
+    2 min ago — reload?").
+89. Rollback to a config referencing deleted questions/policies → those references dropped with
+    warnings.
+90. Analytics ID malformed → validation per kind (e.g. GA4 `G-XXXXXXX`); GTM containers allowed only
+    on Scale+ (arbitrary script risk) [D].
+
+### 11.7 Performance & platform reliability
+91. Origin outage → edge serves stale HTML/catalog (stale-if-error), commit unavailable → "request"
+    mode via queue (writes accepted into a durable queue at the edge, processed when origin returns;
+    customer told "we'll confirm by text") [D].
+92. Region outage → stateless edge + multi-AZ origin; booking commit depends on primary DB; RPO 0
+    for committed bookings (synchronous replication) — stack decision, flagged for Stage 2.
+93. Traffic spike (promo email to 20k customers) → edge-cached catalog absorbs; availability API
+    autoscaled + per-tenant rate limits; holds prevent oversell.
+94. Slow third-party (maps, analytics, payment) → each lazy-loaded with timeout; map failure never
+    blocks address entry; analytics failure never blocks anything.
+95. Huge uploaded logos/fonts via 11 → rejected or transcoded by 11 (limits in §9.9); portal never
+    preloads more than 2 font files.
+96. Long-lived tabs after a deploy → client detects new build hash on API responses; finishes current
+    session on old bundle (API is versioned/backward compatible for ≥ 7 days).
+
+---
+
+## 12. Better than Fieldd
+
+Concrete improvements (each is a buildable requirement, not marketing):
+
+1. **Custom domain on every plan, with a guided DNS wizard** that detects the DNS provider, shows
+   exact click-paths, diagnoses mistakes (doubled zone names, proxied records, CAA, TTL), and
+   verifies automatically. Fieldd's tutorial covers this in one sentence ("following the steps
+   below") [S: T05].
+2. **Self-healing links**: if the custom domain breaks, every new email/SMS/tracking link switches to
+   the platform host automatically and the owner is alerted — no stranded customers.
+3. **Pre-issued TLS** (issued at verification, not first visit) → first visitor never waits; dual-CA
+   fallback.
+4. **Same flow engine for web, embed, popup, native app and AI agents** (server-computed `StepPlan`) —
+   consistent behaviour and one place to fix bugs; Fieldd ships a separate Bookings MCP [S: llms].
+5. **Never-lose-a-booking guarantees**: server-side drafts, idempotent confirm, outbox, payment
+   reconciliation, degraded "request" mode instead of error pages.
+6. **No surprise totals**: travel fee and tax shown as soon as the address is known; quote hash
+   guarantees the charged amount equals the shown amount.
+7. **Faster**: SSR + edge-cached catalog, ≤ 60 KB initial JS, ≤ 5 KB loader, LCP ≤ 1.8 s p75 on
+   mid-range phones; published budgets enforced in CI.
+8. **Accessible by default**: WCAG 2.2 AA, automatic brand-color contrast fixing (with 11), keyboard
+   date picker, screen-reader announcements for holds/slot changes.
+9. **Fewer clicks**: deep links preselect anything (service, add-ons, area, date, promo, package);
+   returning customers skip address/assets/intake; "Book again" in one tap; first available slot
+   pre-highlighted.
+10. **Hold countdown + alternatives** when a slot is taken, instead of a failed checkout.
+11. **Passwordless accounts** (OTP / magic link) — no forgotten passwords for once-a-quarter customers.
+12. **Transparent cancellation**: fee/refund preview computed from the policy snapshot before confirm;
+    reschedule offered first (Fieldd supports the prompt [S: T05]; we add the fee preview and
+    "cancel only this visit vs all future").
+13. **Attribution that survives iframes, QR and short links**, with first- and last-touch and a funnel
+    report per source (Fieldd shows booking sources on the dashboard [S: T05]); `pb:booked` event lets
+    businesses fire their own ad conversions.
+14. **Editable QR destinations** (QR → short link) so printed material never goes stale.
+15. **Privacy-correct abandoned capture**: explicit consent for marketing follow-up, disclosure next to
+    the contact form, no keystroke capture.
+16. **Live preview of the booking site in light and dark, phone/tablet/desktop** while editing style
+    (with Agent 11).
+17. **Versioned settings with rollback** and draft/publish separation (Fieldd: changes "reflected
+    immediately" [S: T05] — great for speed, risky for mistakes; we keep instant publish but add undo).
+18. **Status page for the business's booking site** in settings: domain health, cert expiry, last 24 h
+    bookings, error rate — so owners know their storefront is up.
+
+### 12.1 Budget tier notes [D] (owner wants an affordable starter option)
+
+| Capability | Starter (budget) | Growth | Pro |
+|---|---|---|---|
+| Platform host booking site, full booking flow, customer accounts, rebook/cancel/reschedule | ✓ | ✓ | ✓ |
+| **1 custom booking subdomain with auto TLS** (owner's must-have; marginal cost ≈ 0) | ✓ | ✓ | ✓ |
+| Link button, inline embed, popup, QR, per-service short links | ✓ | ✓ | ✓ |
+| Booking questions, intake form, assets, terms, cancellation policy | ✓ | ✓ | ✓ |
+| Built-in visits & booking-source report | ✓ | ✓ | ✓ |
+| Basic theming (light/dark palettes, logo, font from curated list) via 11 | ✓ | ✓ | ✓ |
+| Custom uploaded fonts/icons, shadows/density controls (11) | — | ✓ | ✓ |
+| Third-party analytics by ID (GA4, Meta Pixel) | ✓ | ✓ | ✓ |
+| GTM container (arbitrary scripts) | — | ✓ | ✓ |
+| Gift card online sales, subscriptions self-purchase, referral codes | ✓ (needs payments connected) | ✓ | ✓ |
+| Live tracking page | ✓ | ✓ | ✓ (Fieldd includes on-my-way tracking at Start [S: llms]) |
+| Custom short links/QR campaigns beyond 10 | — | ✓ | ✓ |
+| Additional custom hosts (multi-brand/multi-location), account host `my.` | — | 1 extra | unlimited |
+| Remove "Powered by" badge | — | — | ✓ (Fieldd: "no fieldd branding" only on Pro [S: llms]) |
+| Native branded customer app | — | — | ✓ later phase (Fieldd: Scale [S: llms]) |
+| Funnel/A-B testing of step order, advanced attribution export | — | — | ✓ |
+
+Starter guidance: a new business needs a working link in minutes (platform host), then the custom
+subdomain once they have a website. AI setup that imports services/branding from an existing
+website (Fieldd has this [S: llms]) is a nice onboarding accelerator but not required for MVP.
+
+---
+
+## 13. Open questions
+
+1. **swash.co mechanics**: exact hostname (e.g. `book.swash.co`?), whether it's a CNAME to a Fieldd
+   host, whether the apex/`www` site links or embeds, and which CA issued the cert — owner video +
+   the 2-minute DNS check in §14.
+2. **Fieldd step order**: where are address, contact/account, assets and subscription upsell in the
+   flow? Is the account mandatory or is guest checkout possible? (Determines our default
+   `contactPosition` and `guestCheckout`.)
+3. **Pricing by asset**: do Fieldd/swash prices vary by vehicle size/type, and is that picked before
+   or after service? (Affects variant/asset step order.)
+4. **Event naming**: Agent 10 to pick canonical names (§9.0) — `booking.session.*` vs
+   `booking.attempt.*` vs `portal.session.*`; `booking.domain.verified` vs `portal.domain.activated`.
+5. **Approval mode**: does Fieldd support "request — business approves" online bookings, or always
+   instant? (08 has a template placeholder.)
+6. **Reserve with Google** / Google Business Profile native booking: required? (Partner program,
+   separate integration.)
+7. **Cancellation policy specifics** in Fieldd: fee types, window, deposit refund behaviour,
+   whether reschedule has its own limits — the tutorial only names the features [S: T05].
+8. **What is in "Additional settings"** [S: T05] — list needed from the video/live account.
+9. **Account host**: should the logged-in area live on the same subdomain (`book.`) or a separate one
+   (`my.`)? (One host = simpler cookies; two = cleaner branding.)
+10. **Abandoned-booking SMS consent**: legal review of whether follow-up texts to people who typed a
+    number but didn't check a box are permitted in the owner's markets (US/CA/AU/UK).
+11. **Hosted terms vs link only**: Fieldd shows a link field [S: T05]; do we also host terms text for
+    tenants without a website?
+12. **Data residency**: do EU/AU tenants need their booking data stored in-region? (Infra decision.)
+13. **Tip at booking**: should customers be able to pre-tip online, or only after service (Fieldd's
+    tipping appears POS-side [S: llms])?
+14. **Multi-language booking site**: needed for launch? (Text override model supports it.)
+15. **Embed vs subdomain default**: we recommend link-to-subdomain; does swash.co embed anything on
+    its main site, or only link out?
+
+---
+
+## 14. Verify against video
+
+Owner's walkthrough: https://youtu.be/vyELvdWCdnc (customer side of a Fieldd-powered business site;
+not yet readable from this environment). Check each item and note the timestamp.
+
+### 14.1 Subdomain / hosting (do these 2-minute checks too)
+- [ ] Exact booking URL in the address bar (e.g. `book.swash.co` / `booking.` / path on `www`?).
+- [ ] Does the URL stay on the business's domain through every step, including payment and
+      confirmation, or does it jump to a Fieldd host at any point?
+- [ ] Any Fieldd branding ("Powered by") in header/footer?
+- [ ] From any computer: `dig +short CNAME <booking-host>` (or `nslookup -type=CNAME <host>`) → note
+      the target (reveals the platform's CNAME pattern).
+- [ ] `openssl s_client -connect <host>:443 -servername <host> </dev/null | openssl x509 -noout -issuer -subject -dates`
+      (or click the padlock → certificate) → note issuer (Let's Encrypt / Google Trust Services /
+      Cloudflare / Amazon) and validity length → tells us how Fieldd issues TLS.
+- [ ] Does `http://` redirect to `https://`? Does the bare platform URL (if visible anywhere) redirect
+      to the custom host?
+- [ ] How the main website's "Book now" buttons work: link out (new tab/same tab), iframe embed, or
+      popup modal? Number of distinct entry points (header button, hero, service pages).
+- [ ] Any per-service links from the main site that land directly on a service (short links [S: T06])?
+- [ ] Any QR codes or Google Business Profile booking link shown?
+- [ ] URL parameters visible on arrival (`utm_*`, `src`, `ref`, service ids) → attribution scheme.
+
+### 14.2 Booking flow (record exact order, labels, fields)
+- [ ] First screen after clicking Book: categories, services, or address? Mobile vs shop choice?
+- [ ] Category pages: icons/images, names, any "from" prices or durations shown?
+- [ ] Service card fields: image, description, price format, duration, badges.
+- [ ] Variants (vehicle size/type, rooms) — where and how chosen; does price change live?
+- [ ] Add-ons screen: layout (list/grid), images, quantity steppers, categories, skip button, running
+      total placement.
+- [ ] Recurring frequency or subscription upsell — where it appears, wording, discount display,
+      commitment options [S: T01].
+- [ ] Address entry: autocomplete provider look, map shown?, unit field, gate/parking notes, what
+      happens for an out-of-area address (message text, alternatives).
+- [ ] Travel fee and tax shown? When?
+- [ ] Date/time: calendar style, how many days shown, slot granularity, arrival windows vs exact
+      times, "Anytime <weekday>" route wording [S: T02], timezone label, first-available highlight.
+- [ ] Any hold/countdown or "slot no longer available" message?
+- [ ] Booking questions: types used, required markers, per-service questions [S: T06].
+- [ ] Account creation: password vs code vs magic link; guest checkout possible?; fields required
+      (name, phone, email); marketing/SMS consent checkbox text.
+- [ ] Vehicle/asset entry: fields, lookup by plate/VIN/YMM [S: llms], color/photo, multiple vehicles.
+- [ ] Intake form questions shown on first booking? [S: T05]
+- [ ] Terms checkbox placement and wording; link target [S: T05]; cancellation policy text shown?
+- [ ] Promo / gift card / referral code input location and behaviour.
+- [ ] Payment step: card form look, Apple Pay/Google Pay, deposit vs card-on-file wording, amount due
+      today vs later, 3DS prompts.
+- [ ] Confirmation page content: job number, add-to-calendar, manage link, assigned worker, upsell.
+- [ ] Confirmation email/SMS received: timing, sender name, links (which host?).
+- [ ] Abandon test: enter phone/email, leave — does a follow-up text/email arrive? After how long?
+      What does it link to (resume with cart?) [S: T12][S: T10].
+- [ ] Step count/progress indicator style; back button behaviour; page reload mid-flow keeps data?
+
+### 14.3 Customer account / portal
+- [ ] Login method and screens; what's on the account home.
+- [ ] Saved vehicles/assets screen; edit/add.
+- [ ] Past appointments + "Rebook" behaviour (which steps are skipped?) [S: T05].
+- [ ] Reschedule flow: allowed window, fee display, calendar used.
+- [ ] Cancel flow: policy text, fee, **feedback reasons list**, "reschedule instead?" prompt [S: T05].
+- [ ] Gift card purchase & send screens: designs, amounts, recipient fields, scheduling [S: T05].
+- [ ] Subscription self-purchase screen and management [S: T01].
+- [ ] Referral code display/share [S: llms].
+- [ ] Invoices/receipts and payment methods management [S: T17].
+- [ ] Intake form editing after login [S: T05].
+- [ ] Live "on my way" tracking page (if the walkthrough includes a real appointment): map, ETA,
+      worker photo/name, vehicle, link expiry.
+- [ ] Light/dark mode availability for customers (needed per BRIEF 2026-11-13).
+
+### 14.4 Visual / responsive / performance
+- [ ] Brand application: which colors are customizable (buttons, headers, backgrounds), fonts, logo
+      placements and sizes, icons for categories/areas [S: T06][S: T11] — feed to Agent 11.
+- [ ] Behaviour at phone vs desktop width (sticky summary? bottom sheet? side cart?).
+- [ ] Perceived load time of first page and each step on the video's device; any spinners/blank
+      screens; any layout jumps (images/fonts popping in).
+- [ ] Text overrides visible (custom wording vs defaults) — compare against §3.D1 key list.
+
+### 14.5 Admin side (if the owner's video or a later one shows Fieldd settings)
+- [ ] Settings path name today: "Online Scheduling" vs "Customer hub" [S: T05][S: T02].
+- [ ] Installation screen: how the own-domain steps are presented (records shown, verification
+      button, status labels).
+- [ ] Style screen controls (colors, fonts, map, text) [S: T05].
+- [ ] Booking sources section and dashboard tile [S: T05].
+- [ ] Additional settings list [S: T05].
