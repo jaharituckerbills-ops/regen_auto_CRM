@@ -1615,3 +1615,186 @@ Permissions: `subs.subscription.edit` (base), `subs.subscription.custom_price`,
 `subs.subscription.comp` (grant_once, cap per role e.g. 1 per window for workers),
 `discounts.apply_manual` with caps; workers default to `grant_once` + `change_package` to
 **published** packages only; office staff all ops; owner can restrict `cancel` to office roles.
+
+---
+
+## 9. Interfaces with other modules
+
+### 9.0 Event naming alignment (read first)
+
+Peer specs already subscribe to singular domains: Agent 03 and Agent 08 use
+`subscription.subscription.activated`, Agent 08 uses `giftcard.giftcard.*`. **Canonical
+names are therefore the singular domains `subscription.*`, `discount.*`, `giftcard.*`** listed
+below. Where §4 writes `subscriptions.<entity>.<verb>`, `discounts.…` or `giftcards.…`, read the
+singular form (same event). Spelling: we emit **`cancelled`** (matches Agent 03); Agent 08's
+catalog says `subscription.subscription.canceled` → **conflict for Agent 10** to normalise
+(recommend `cancelled` platform-wide, or 06 emits both during transition).
+
+Every event envelope `[I]`: `{eventId (ULID), type, businessId, occurredAt, actor: {kind, id},
+correlationId, causationId, aggregateId, aggregateVersion, payload}`; delivered at-least-once
+via an outbox table written in the same transaction as the state change; consumers dedupe by
+`eventId`.
+
+### 9.1 PRODUCES
+
+| Event | Payload (key fields) | Consumers |
+|---|---|---|
+| `subscription.package.created` / `.updated` / `.published` / `.archived` | packageId, versionId, selfPurchase, upsell, autoSchedule, zoneIds | 01 (packages page, upsell index cache), 02 (Agent 02 already listens to `subscription.package.updated` to warn on catalog edits affecting included items), 08 (reports) |
+| `subscription.subscription.created` | subscriptionId, customerId, packageVersionId, channel, status | 07 (profile badge), 08 |
+| `subscription.subscription.activated` | + firstPeriod, commitment, autoSchedule{frequency, visitItems, preferredWindow, preferredWorkerId, firstVisit, addressId, assetIds} | **03** (create series), 07, **08** (N-S01 welcome), 05 (card-on-file usage flag: card cannot be removed while active) |
+| `subscription.subscription.trial_started` / `.trial_ending` (3 days before) | trialEndsAt | 08 |
+| `subscription.renewal.upcoming` | subscriptionId, chargeAt, amountCents, isCommitmentOrAnnual | 08 (N-S02) — 06 decides timing (default 3 days; ≥ 15 days for annual/commitment where law requires, §5.11) |
+| `subscription.renewal.charged` (alias of `subscription.subscription.renewed`) | periodId, seq, amount breakdown, chargeId | 08 (N-S03 receipt), 05 (already ledgered by its charge) |
+| `subscription.payment.failed` | periodId, attempt n, nextRetryAt, declineCategory, updateCardUrl | 08 (N-S04), 07 (status past_due) |
+| `subscription.subscription.past_due` | subscriptionId, since, pastDueJobPolicy | **03** (series policy: keep/pause per our setting — 03 table expects this), 04 (worker-app banner on jobs), 07 |
+| `subscription.subscription.recovered` | periodId | 03 (resume held occurrences), 04, 07, 08 |
+| `subscription.dunning.exhausted` | finalAction | 08 (A-12 owner alert) |
+| `subscription.subscription.paused` / `.resumed` | window, regenerateFrom | **03** (pause/resume series), 08 (N-S06), 07 |
+| `subscription.subscription.cancel_scheduled` / `.cancel_reverted` | effectiveAt, futureJobsPolicy | 03 (end series at effectiveAt), 08 |
+| `subscription.subscription.cancelled` | reasonCode, mode, futureJobs: 'cancel'\|'convert_to_paid', effectiveAt | **03** (end or convert series — convert = series.source becomes 'crm' with funding removed), 05 (refund already requested by us), 07, 08 (N-S05) |
+| `subscription.subscription.expired` | reason ('commitment_end'\|'bundle_validity') | 03, 07, 08 |
+| `subscription.subscription.plan_changed` (03 listens as `.package_changed`, alias) | old/new versionId, timing, frequencyChanged, newRule? | 03 (update this-and-future), 08 |
+| `subscription.subscription.adjusted` | ops[], channel (native_ios/native_desktop/crm_web), consentRecordId | 08 (confirmation), 03 (if schedule ops), audit |
+| `subscription.commitment.ending` (default 14 days before) / `.ended` / `.renewed` | commitmentEndsAt, afterTerm | 08 (N-S07) |
+| `subscription.price_change.scheduled` | effectiveAt, old/new price | 08 (legal notice template) |
+| `subscription.entitlement.granted` / `.reserved` / `.consumed` / `.released` / `.expired` | windowId, defId, qty, jobId? | 08 (utilization reports, "you have 1 free add-on left — book now" drip trigger), 04 (job line coverage badge) |
+| `subscription.coverage.changed` | jobId, lineIds, newCoverage | **04/05** (reprice job; re-snapshot `PriceBreakdown`) |
+| `discount.discount.created` / `.updated` / `.activated` / `.expired` / `.exhausted` / `.archived` | discountId, versionId, code?, bannerText? | 01 (promo banner, `?promo=` prefill), 08 (campaign offer picker), 02 (Agent 02 lists `discount.code.updated` — alias of `.updated`) |
+| `discount.redemption.reserved` / `.committed` / `.released` / `.reversed` | redemptionId, discountId, target, amountCents | 08 (discount cost report, campaign attribution), 05 (ledger contra-revenue uses the job's breakdown, not this event) |
+| `giftcard.giftcard.purchased` | giftCardId, purchaser, amount, salePaymentId | 08 (N-G02 receipt), 05 |
+| `giftcard.giftcard.issued` | giftCardId, kind, source, recipient, deliveryAt | 08 |
+| `giftcard.giftcard.delivery_due` | giftCardId, recipient contact, designId, message, view link token | 08 (N-G01 delivery; at chosen date 09:00 recipient-local per 08) |
+| `giftcard.giftcard.delivered` / `.delivery_failed` | channel | 08 / staff alert |
+| `giftcard.giftcard.redeemed` | amountCents, balanceAfter, jobId | 08 (N-G03 balance update) |
+| `giftcard.giftcard.refunded_to` / `.adjusted` / `.voided` / `.replaced` / `.expired` / `.frozen` | delta, reason | 08, 05 (liability ledger lines for adjust/void/expire) |
+| `giftcard.giftcard.expiring` (60/30/7 days, promotional only) | expiresAt, balance | 08 |
+
+### 9.2 CONSUMES
+
+| From | Event / data | What we do |
+|---|---|---|
+| **01** Booking portal | `portal.subscription.purchased` (or direct `StartSubscription` call within the booking saga) | create/activate subscription with consent; idempotent by checkout session |
+| 01 | `portal.giftcard.purchased` | issue gift card after payment confirmed (if 01 emits rather than calls `IssueGiftCard`) |
+| 01 | `portal.cancellation.completed` | release reservations/redemptions for the cancelled booking (backup to 04's event) |
+| **02** Catalog | `catalog.service.archived` / `.deleted` / `.replaced`, `catalog.addon.archived` | flag packages/discounts referencing them; on `.replaced` remap entitlement targets (02 provides old→new id); alert owner; never silently drop a paid benefit |
+| 02 | `catalog.service.price_changed` | no effect on coverage (counts not $) but member-value reports recalc; % discounts automatically follow new price |
+| 02 | `coverage.zone.archived` / `.disabled` | warn subscriptions whose service address leaves coverage (owner decides: keep or cancel) |
+| 02 | recurring booking options per service (suggested frequencies & discount) `[S: 06]` | read model used to compute `recurring` modifier for online recurring bookings |
+| **03** Scheduling | `scheduling.series.created` (source=subscription) | store `scheduleSeriesId` on subscription |
+| 03 | `scheduling.occurrence.materialized` (jobId, seriesId, serviceAt) | reserve entitlements for that job (§10.4) |
+| 03 | `scheduling.job.rescheduled` / `scheduling.occurrence.moved` | move reservation across windows atomically; reprice if no capacity |
+| 03 | `scheduling.occurrence.skipped` | release reservation (§4.9) |
+| 03 | `scheduling.series.ended` / `.paused` (initiated by staff in 03 UI) | if series is subscription-funded: ask staff via UI whether subscription should also pause/cancel (03 must not change billing) |
+| **04** Jobs | `jobs.job.created` (with `funding.subscriptionId?`, lines) | reserve entitlements / record member discount application |
+| 04 | `jobs.job.completed` (also seen as `job.job.completed` in 02/03/07 — Agent 10 to normalise) | convert reservations → consumed; commit discount redemptions if policy = on completion |
+| 04 | `jobs.job.cancelled` (+ `noShow`, cancellation fee charged?) | release, or consume if no-show/late-cancel policy |
+| 04 | `jobs.job.reopened` / `jobs.lineitem.added` / `job.lines.changed` | re-evaluate coverage; reserve/release |
+| **05** Payments | result of `payments.chargeOffSession` (sync) + `payments.payment.succeeded` / `payments.payment.requires_action` / `payments.authorization.failed` (async) | mark period paid/unpaid; SCA `requires_action` → send customer authentication link (counts as a dunning attempt) |
+| 05 | `payments.refund.succeeded` (subscription charge) | period refunded; optional expire of unconsumed grants |
+| 05 | `payments.refund.succeeded` (job with gift card tender) | 05 calls `giftcard.refund` for the gift-card portion (05 rule: "original gift-card tender → always back to the same gift card") |
+| 05 | `payments.dispute.opened` / `.updated` | flag subscription disputed; auto-pause (setting); gift card purchase dispute → freeze card |
+| 05 | `payments.card.saved` / card expiring (`payment.card.expiring` per 08) | trigger immediate retry if past due; pre-dunning reminder for expiring cards on active subscriptions |
+| **07** Customers | `customer.customer.merged` | re-point subscriptions, redemptions, gift card ownership/wallets to surviving id; recompute per-customer usage counts; if two active subs to same package → flag for staff |
+| 07 | `customer.customer.erased` | cancel subscriptions immediately, anonymize purchaser/recipient on gift cards (balance retained — it's a liability), keep financial ledgers |
+| 07 | customer type / tags (read model, `customerTypeId` `[S: 09]` via 07) | discount eligibility |
+| 07 | default discount on customer profile (07 field "Default discount") | auto-attached as a `manual` modifier in CRM bookings for that customer |
+| **08** Marketing | referral reward rule fires | `discount.issueForCustomer` or `giftcard.issueOrReload` (credit) |
+| 08 | campaign/drip "attach offer" | reads `discount.list`; redemptions attributed via `campaignId` passed in `?promo=` context |
+| **09** Team | permission checks `can(user, action, resource)` + caps | enforce manual discount caps, gift card issue caps, subscription actions |
+| 09 | `team.member.deactivated` | `preferredWorkerId` on subscriptions → cleared, 03 reassigns |
+
+### 9.3 Contracts (who owns what, what each side guarantees)
+
+**06 ↔ 01 (Booking portal: self-purchase, upsell, codes, gift card shop)**
+- 01 renders; 06 decides. 01 never computes prices: calls `subscription.upsellCandidates`,
+  `subscription.quote`, `pricing.modifiers.evaluate` (via 05's `quoteTotals`), `discount.validateCode`.
+- Single code field: 01 sends whatever the customer typed; `discount.validateCode` classifies
+  it as discount / gift card / referral code.
+- Upsell placement after service + add-on selection, before payment step; reserved-height
+  container (no layout shift); max one upsell card; 06 guarantees `upsellCandidates` p95 < 150 ms.
+- Self-purchase checkout must collect: account, service address in zone, card with recurring
+  consent, explicit auto-renewal checkbox; 06 returns the exact disclosure text to show
+  (`QuoteSnapshot.disclosure`) and stores its hash in `ConsentRecord`.
+- Customer account pages (B10 `/account/subscriptions`) consume `subscription.get`,
+  `entitlement.balances`, and call pause/skip/cancel commands; 06 enforces policies server-side
+  (01 hides disallowed buttons but 06 is the guard). Online cancel always available for
+  online-purchased subscriptions.
+- Gift card shop: `giftcard.quote` → 05 payment (`purpose:'gift_card_purchase'`) → `giftcard.issue`
+  with `salePaymentId`; if issue fails after payment, 06 retries via outbox; never leaves a paid
+  order without a card (reconciliation job alerts after 5 min).
+
+**06 ↔ 02 (Catalog: included services/add-ons)**
+- Entitlements and discount scopes reference catalog item ids **and** category ids; 02
+  guarantees stable ids across edits and emits `catalog.service.replaced` with a mapping when
+  an item is recreated.
+- 02 exposes variant/size pricing so coverage can be "base variant only" (larger vehicle pays
+  difference); 02 exposes add-on → service pairing so "1 free add-on" only offers add-ons that
+  pair with the booked service `[S: 07]`.
+- 02 owns per-service recurring options (suggested frequencies + discount) `[S: 06]`; 06 evaluates them.
+- Company add-ons (internal-only `[S: 07]`) can be covered but never shown in public package text.
+
+**06 ↔ 03 (Scheduling: auto-scheduling)**
+- On `subscription.subscription.activated` with autoSchedule, 03 calls `series.create(source=
+  'subscription', subscriptionId, rule, lineTemplate, preferredWindow, preferredWorkerId,
+  firstVisit)`; 03 owns dates, materialization horizon, worker assignment, holidays.
+- Every materialized occurrence carries `funding: {kind:'subscription', subscriptionId}`;
+  03 **must not** apply the series' own recurring discount to such occurrences (§5.6).
+- 06 → 03 commands on lifecycle: pause/resume (window), end at `effectiveAt`, convert to paid
+  (remove funding, keep series), update frequency on plan change (this-and-future).
+- 03 → 06 events for every materialize/move/skip/cancel so reservations stay exact.
+- Frequency vocabulary: 06 stores 03's `RecurrenceRule` verbatim (no parallel enum).
+- Past due: 03's table pauses the series on `subscription.subscription.past_due` when
+  `policy=pause`; 06 sends the policy in the payload so 03 doesn't need 06 settings.
+
+**06 ↔ 04 (Jobs: price lines and worker app)**
+- Job price lines store `PriceModifierApplied[]` snapshots (05 calls it `DiscountApplication`
+  with `source: 'subscription'|'recurring'|'code'|'manual'`). 06's `PriceModifierApplied`
+  maps 1:1: stage coverage/member → source `subscription`; recurring → `recurring`; promo →
+  `code`; manual → `manual`.
+- Worker app shows MEMBER badge and covered lines from `subscription.coverageForJob`.
+- 04 emits created/completed/cancelled/reopened/lines-changed events (§9.2).
+
+**06 ↔ 05 (Payments: charges, tender, ledger)**
+- Off-session subscription charges via `payments.chargeOffSession({purpose:'subscription',
+  subscriptionId, cycleId: periodId, customerId, amount, idempotencyKey:
+  'sub:{subscriptionId}:{periodId}:{attempt}'})` — **05's key format wins**; 06's §7 period
+  `idempotencyKey` is the base and the attempt number is appended per dunning attempt.
+- 05's canonical order of operations (05 §5.3, steps 2a–2d) and 06 §5.1 agree: coverage →
+  member % → recurring → codes → order-level/manual → travel fee → tax → tip → tenders. 05 owns
+  the arithmetic container and tax; 06 supplies modifier decisions (`pricing.modifiers.evaluate`).
+  **Difference to resolve (Agent 10):** 05 compounds member % and recurring %; 06 default is
+  "not stacked, take larger" (§5.6). Recommend 06's rule as default with a setting.
+- Gift card tender: hold → capture → release, TTL 30 min for booking sessions (05's value;
+  06's default 7-day TTL applies only to POS pre-auth flows).
+- Ledger: 05 books gift card liability (`2400`) on sale/redemption and contra-revenue for
+  discounts from the job breakdown; 06 sends `giftcard.giftcard.adjusted|voided|expired` so 05
+  can book non-payment liability movements.
+- Card removal: 05 blocks deleting a payment method used by an active subscription (05 already
+  states this) — 06 exposes `subscription.listByPaymentMethod`.
+- Refunds: 05 executes; 06 decides subscription refund amounts (§5.4) and gift-card portion.
+
+**06 ↔ 07 (Customers)**
+- 07 owns identity, addresses, assets, tags, customer type, merge/erase; 06 stores ids only.
+- 07 shows subscription status (active/past due/none) and gift-card balances on profile via
+  06 queries; profile hosts 06's Subscriptions card (§3.5).
+- Customer fingerprint (normalized phone/email/address hash) provided by 07 for "new
+  customer" discount abuse checks.
+- Multi-vehicle: subscriptions may be per asset (`assetIds`); 07 guarantees asset ids survive merges.
+
+**06 ↔ 08 (Notifications, dunning comms, renewal notices, reports)**
+- 06 emits; 08 owns templates, channels, quiet hours, consent. Notification ids already in
+  08's catalog: N-S01…N-S07, N-G01…N-G03, A-12. Additional triggers 06 requests 08 to add:
+  `subscription.price_change.scheduled` (legal notice, LOCK), `subscription.subscription.trial_ending`,
+  `subscription.subscription.adjusted` (confirmation incl. verbal-consent written confirmation, LOCK),
+  `giftcard.giftcard.expiring` (promotional cards), `subscription.entitlement` "benefit left"
+  nudge (marketing, opt-in).
+- Legal notices (auto-renew acknowledgement, price change, annual renewal) are transactional
+  and must not be suppressible by marketing opt-out.
+- 08 reports read 06 report queries (§8.5); 08 must not recompute MRR itself.
+- Referral rewards: 08 decides when; 06 issues the instrument.
+
+**06 ↔ 09 (Permissions)**: keys in §2 registered in 09's matrix; caps are numeric attributes of
+roles; worker default caps listed in §8.7.
+
+**06 ↔ 10**: conflicts flagged for normalisation: `cancelled` vs `canceled`; `jobs.job.*` vs
+`job.job.*`; stacking default (compound vs best-of); gift card hold TTL by context.

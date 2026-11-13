@@ -988,3 +988,380 @@ Rules:
 - `balanceDue = max(total − amountPaid, 0)`; `creditDue = max(amountPaid − total, 0)`.
 - No negative line except kind `discount`/`adjustment`; adjustments require `job.price.adjust`.
 
+
+### 5.11 Document branding rules (owner requirement 2026-11-13; Agent 11 owns the brand system)
+
+- Quotes, invoices, receipts and their emails/SMS link pages are **tenant-branded surfaces**. 04 never
+  hard-codes colors, fonts, radii or logos; the renderer takes a resolved `BrandTokens` object from Agent 11
+  (`brand.tokens.resolve{businessId, surface:'document'|'document_email'|'document_page', mode}`) `[D]`.
+- Placements used by 04: `logo.invoice` (PDF/print header), `logo.email` (email header), `logo.header` /
+  `logo.mobileHeader` (public quote/invoice page), each with the business's size controls; light and dark
+  variants — **PDF/print always renders the light palette and light logo** (paper is white; dark PDFs waste
+  toner and fail accessibility in print); public pages follow the viewer's light/dark preference `[D]`.
+- Custom uploaded fonts are embedded (subset to used glyphs) in PDFs; if a font file is missing/corrupt or
+  lacks a glyph (e.g. customer name in another script), fall back per glyph to the system font stack and log a
+  brand warning — a document must **never** fail to render because of branding.
+- Copy overrides (Agent 11 text overrides) apply to every customer-facing label on documents: "Quote" →
+  "Estimate", "Invoice" → "Bill", "Book online" → "Choose your time", "Balance due", "Terms" etc. Overrides
+  are captured in the **document version snapshot** (style version id) so a re-download of an old version
+  looks exactly as sent.
+- Contrast guard: if a business palette yields text/background contrast < 4.5:1 on documents, the renderer
+  substitutes the nearest compliant shade for text (not for brand blocks) and flags it in Settings preview.
+- Every `QuoteVersion`/`InvoiceVersion` stores `brandVersionId`; brand changes never mutate past renderings
+  (a "Re-render with current branding" action creates a new rendering, not a new version).
+
+---
+
+## 6. State machines
+
+Design principle `[D]`: the job has **orthogonal sub-states** (quote, schedule, field work, invoice,
+payment); the **master status** shown everywhere (jobs list filter `[S: t08]`, job card pill, worker app) is
+**derived** from them by a precedence function (§10.1) and stored denormalised for indexing. Commands
+validate against the relevant sub-machine, never against the master status alone. The **payment status**
+pill (jobs list column `[S: t08]`) is a projection of Agent 05's `payments.job.balance_changed`.
+
+### 6.1 Master job status (derived)
+
+| Master status | Meaning (label shown) | Derived when (first matching row wins) |
+|---|---|---|
+| `cancelled` | Cancelled | job.cancelledAt set |
+| `no_show` | No-show | workState = `no_show` |
+| `paid` | Paid | (fieldWork = none OR workState = completed) AND invoice ∈ {paid} (or total 0) |
+| `partially_paid` | Partially paid | (fieldWork none OR completed) AND invoice = partially_paid |
+| `invoiced` | Invoiced / Awaiting payment | (fieldWork none OR completed) AND invoice ∈ {open, viewed} (overdue = badge) |
+| `completed` | Completed — not invoiced | workState = completed AND invoice = draft |
+| `paused` | Paused | workState = paused |
+| `in_progress` | In progress | workState = in_progress |
+| `arrived` | Arrived | workState = arrived |
+| `en_route` | On the way | workState = en_route |
+| `scheduled` | Scheduled (badge "Unassigned" if no worker) | scheduleState = scheduled |
+| `approved` | Accepted — needs scheduling | quote = accepted AND scheduleState = unscheduled |
+| `unscheduled` | Needs scheduling | fieldWork = required AND scheduleState = unscheduled AND no open quote |
+| `quoted` | Quote sent | quote ∈ {sent, viewed} |
+| `declined` | Quote declined | quote = declined (and nothing later) |
+| `expired` | Quote expired | quote = expired |
+| `written_off` | Written off | invoice = written_off |
+| `draft` | Draft | otherwise |
+
+Flags orthogonal to status (badges/filters): `overdue`, `unassigned`, `requirementsIncomplete`,
+`evidencePendingUpload`, `unsyncedFieldData`, `backfilled`, `disputed` (Agent 05), `creditDue`, `archived`.
+
+### 6.2 Quote sub-machine (per job; versions inside)
+
+| State | Event / command | Guard | Next | Side effects |
+|---|---|---|---|---|
+| `none` | CreateJob(mode quote) / AddQuote | job not cancelled | `draft` | — |
+| `draft` | SendQuote | §5.8 guards | `sent` | freeze vN, render, public link, `quote.quote.sent` |
+| `sent` | first public view | version = latest | `viewed` | `quote.quote.viewed` |
+| `sent`/`viewed` | ReviseQuote (edit) | — | same (draft revision exists) | revision draft vN+1 (invisible to customer) |
+| `sent`/`viewed` | SendQuote(vN+1) | guards | `sent` | vN `superseded`, `quote.quote.revised` + `.sent` |
+| `sent`/`viewed` | AcceptQuote | latest version, not expired, terms accepted | `accepted` | acceptance record, optional lines resolved, `quote.quote.accepted` |
+| `sent`/`viewed` | DeclineQuote | latest version | `declined` | `quote.quote.declined`, reminders cancelled |
+| `sent`/`viewed` | ExpirySweep | today > expiresOn | `expired` | `quote.quote.expired` |
+| `sent`/`viewed`/`expired` | ExtendExpiry | new date ≥ today | `sent` (or keep viewed) | audit; `quote.quote.expiry_changed` |
+| `sent`/`viewed`/`draft` | WithdrawQuote | perm `quote.withdraw` | `withdrawn` | link shows withdrawn, `quote.quote.withdrawn` |
+| `declined`/`expired`/`withdrawn` | ReviseQuote + Send | — | `sent` | new version |
+| `accepted` | `scheduling.job.scheduled` | — | `booked` | invoice auto-created `[S: t04]` |
+| `accepted` | ReviseQuote | perm `quote.revise_accepted` | `sent` (re-acceptance) | old acceptance kept as history |
+| `accepted`/`booked` | CancelJob | — | unchanged (job cancelled) | — |
+
+Version sub-states: `draft → sent → superseded` or `sent → accepted|declined|expired|withdrawn`.
+
+### 6.3 Field-work sub-machine (per job aggregate; per-worker `FieldVisit` uses the same table)
+
+| State | Event / command | Guard | Next | Side effects |
+|---|---|---|---|---|
+| `not_applicable` | AddSchedule (standalone invoice gets work) | — | `not_started` | fieldWork = required |
+| `not_started` | MarkEnRoute | assigned/crew; scheduled; not cancelled | `en_route` | ETA, tracking session, `job.job.en_route` (08: N-D01) |
+| `en_route` | MarkArrived / geofence | — | `arrived` | stop tracking stream, `job.visit.arrived` |
+| `en_route` | CancelEnRoute / en-route on other job / reschedule | — | `not_started` | invalidate tracking link, `job.visit.en_route_cancelled` |
+| `not_started`/`en_route`/`arrived` | StartJob | within early-start window or confirmed; not cancelled | `in_progress` | startedAt, `job.job.started` |
+| `in_progress` | PauseJob | — | `paused` | pause interval opened, `job.visit.paused` |
+| `paused` | ResumeJob | — | `in_progress` | pause closed, `job.visit.resumed` |
+| `in_progress`/`paused` | CompleteJob | completion gate passes or override w/ reason+perm | `completed` | completedAt, inventory, `job.job.completed` |
+| `arrived` (+wait time) | MarkNoShow | evidence per setting | `no_show` | `job.job.no_show`, fee via 05 |
+| `completed` | ReopenJob | perm `job.reopen`; invoice not written off | `in_progress` | `job.job.reopened` |
+| `not_started` | RecordPastJob / backfill complete | scheduled end < now; perm | `completed` | backfilled flag |
+| any non-terminal | CancelJob | perm | `cancelled` | schedule released (03), invoice void/fee |
+| `no_show` | RevertNoShow | perm, within 24 h | `not_started` | fee reversal request to 05 |
+
+### 6.4 Invoice sub-machine
+
+| State | Event / command | Guard | Next | Side effects |
+|---|---|---|---|---|
+| `none` | job becomes scheduled / standalone create | — | `draft` | `invoice.invoice.created` |
+| `draft` | SendInvoice / IssueInvoice / first payment / auto-send | lines ≥ 1 or $0 allowed | `open` | freeze v1, dueOn, `invoice.invoice.issued` (+ `.sent` if sent) |
+| `open` | first public view | — | `viewed` | `invoice.invoice.viewed` |
+| `open`/`viewed`/`partially_paid` | payment allocation | balance after > 0 | `partially_paid` | `invoice.invoice.payment_applied` |
+| `open`/`viewed`/`partially_paid` | payment allocation | balance after = 0 | `paid` | `invoice.invoice.paid` (08 receipt, cancel reminders) |
+| `paid`/`partially_paid` | refund allocation | net paid > 0 | `partially_refunded` (if paid before) / recompute | `invoice.invoice.refund_applied` |
+| `paid`/`partially_paid` | refund allocation | net paid = 0 | `refunded` | — |
+| `paid` | line edit increases total | perm `job.edit_paid`, not export-locked | `partially_paid` | revision vN+1, `invoice.invoice.revised` |
+| any issued | line edit | export-locked | unchanged | supplemental invoice `#N-2` created in `draft` |
+| `draft`/`open`/`viewed` | VoidInvoice | netPaid = 0 | `void` | `invoice.invoice.voided`, reminders cancelled |
+| `open`/`viewed`/`partially_paid` | MarkUncollectible | perm | `written_off` | `invoice.invoice.written_off` |
+| `written_off` | payment allocation | — | `partially_paid`/`paid` | recovery recorded |
+| (derived) | overdue sweep | today > dueOn, balance > 0 | flag `overdue` | `invoice.invoice.overdue` once per dueOn |
+
+`refunded`, `void` are terminal for that invoice; a cancelled-then-rebooked job uses **"Rebook"** which creates a
+new job (new number, `relatedJobId`) — we never resurrect a void invoice.
+
+### 6.5 Schedule sub-state (projection of Agent 03's JobSchedule)
+
+| 03 event | 04 effect |
+|---|---|
+| `scheduling.job.scheduled` | scheduleState `scheduled`; snapshot start/end/localDate/tz/workers; create invoice draft if none; quote accepted→booked |
+| `scheduling.job.rescheduled` | update snapshot; if workState `en_route` → back to `not_started` (tracking link invalidated) |
+| `scheduling.job.unscheduled` | scheduleState `unscheduled`; if `en_route` → `not_started` |
+| `scheduling.assignment.created/removed/changed` | update `assignedWorkerIds`/line assignment snapshot; WA job lists refresh; a worker removed mid-job keeps their recorded visit data (§11) |
+| `routing.route.started` / `routing.route.optimized` | `routeSequence` snapshot for WA ordering |
+
+### 6.6 Photo upload state (per photo; §10.12)
+
+`captured → queued → uploading → uploaded → verified → processed` with `failed_retryable` (→ queued after backoff)
+and `failed_permanent` (corrupt/unsupported; user notified, local file retained for manual export). `deleted`
+is a soft state requiring permission once `verified`.
+
+### 6.7 Offline command state (device outbox)
+
+`pending → sending → acked` | `rejected_conflict` (server returned conflict outcome; data preserved, user
+informed) | `rejected_invalid` (bug/validation; preserved for support export) | `superseded` (a later command
+made it moot, e.g. MarkEnRoute after job already started — dropped silently but logged).
+
+---
+
+## 7. Data model
+
+Stack-agnostic TypeScript-style interfaces. `Id` = opaque string (ULID/UUIDv7). `Cents` = integer (int64).
+`LocalDate` = `YYYY-MM-DD`. `Instant` = UTC ISO-8601. Every entity has `businessId` (tenant key) and
+`createdAt/updatedAt`; all queries are tenant-scoped.
+
+```ts
+// ---------- Aggregate root ----------
+interface Job {
+  id: Id;
+  businessId: Id;
+  number: number | null;              // null only while offline/provisional
+  localRef?: string;                  // provisional ref from a device ("Draft · A7F2")
+  version: number;                    // optimistic concurrency, +1 per committed change
+  origin: 'crm_appointment' | 'crm_quote' | 'crm_invoice' | 'crm_recurring' | 'online_booking'
+        | 'quote_booking' | 'lead_conversion' | 'recurring' | 'subscription' | 'worker_app'
+        | 'phone_booking' | 'api' | 'mcp' | 'ai_assistant' | 'import' | 'rebook' | 'callback';
+  bookingSource?: string;             // Agent 01 source tracking [S: t05]
+  fieldWork: 'required' | 'none';     // 'none' for standalone invoices
+  masterStatus: MasterStatus;         // derived, stored for indexing (§10.1)
+  flags: JobFlag[];                   // overdue, unassigned, requirementsIncomplete, ...
+  customerId: Id;                     // Agent 07
+  billToContactId?: Id;               // Agent 07 contact/person
+  notifyContacts: NotifyContact[];    // [S: t04]
+  address: JobAddressSnapshot | null; // null for standalone invoices / shop jobs use shopId
+  shopId?: Id;                        // Agent 02 shop [S: t11]
+  zoneId?: Id;                        // Agent 02 zone resolved at save
+  timezone: string;                   // IANA
+  assetIds: Id[];                     // Agent 07 assets [S: t04, t19]
+  assetSnapshots: AssetSnapshot[];    // what was printed on documents
+  preferredWorkerId?: Id;             // [S: t04]
+  schedule: JobScheduleSnapshot | null;  // projection of Agent 03 JobSchedule
+  scheduleState: 'unscheduled' | 'scheduled';
+  workState: WorkState;
+  quoteState: QuoteState;
+  invoiceState: InvoiceState;
+  paymentStatus: PaymentStatusProjection; // from Agent 05
+  lines: JobLineItem[];
+  discounts: JobDiscountRef[];        // Agent 06 refs + manual discounts
+  taxMode: 'apply' | 'exempt';        // "apply tax" toggle [S: t16, t19]
+  priceBreakdownVersion?: number;     // Agent 05 PriceBreakdown version (authoritative totals)
+  totals: JobTotals;                  // cached copy of current breakdown
+  paymentTiming: 'after_job' | 'at_booking';   // [S: t16]
+  cardOnFileId?: Id;                  // Agent 05 stored method ref
+  customerNote?: string;              // visible on documents
+  internalNote?: string;              // never customer-visible
+  tagIds: Id[];                       // [S: t08, t19]
+  bookingAnswers: BookingAnswer[];    // [S: t05, t06] snapshot
+  termsAcceptance?: TermsAcceptance;  // online booking T&C [S: t05]
+  requirements: RequirementsSnapshot | null;  // §10.5
+  seriesId?: Id; occurrenceIndex?: number; detachedFromSeries?: boolean; // Agent 03 [S: t14]
+  subscriptionId?: Id;                // Agent 06 [S: t01]
+  routeId?: Id; routeSequence?: number; // Agent 03 [S: t02]
+  leadId?: Id;                        // Agent 07 [S: t20]
+  relatedJobId?: Id; relationType?: 'rebook' | 'callback' | 'split_from';
+  conversationId?: Id;                // Agent 08 thread [S: t02]
+  cancelledAt?: Instant; cancelReason?: string; cancelledBy?: ActorRef;
+  completedAt?: Instant; startedAt?: Instant; actualDurationMin?: number;
+  backfilled: boolean;                // [S: llms] past jobs
+  discardedAt?: Instant;              // draft discarded (number retained)
+  archivedAt?: Instant;
+  createdBy: ActorRef;
+}
+
+type MasterStatus = 'draft' | 'quoted' | 'approved' | 'declined' | 'expired' | 'unscheduled' | 'scheduled'
+  | 'en_route' | 'arrived' | 'in_progress' | 'paused' | 'completed' | 'invoiced' | 'partially_paid'
+  | 'paid' | 'written_off' | 'cancelled' | 'no_show';
+type WorkState = 'not_applicable' | 'not_started' | 'en_route' | 'arrived' | 'in_progress' | 'paused'
+  | 'completed' | 'no_show' | 'cancelled';
+type QuoteState = 'none' | 'draft' | 'sent' | 'viewed' | 'accepted' | 'booked' | 'declined' | 'expired' | 'withdrawn';
+type InvoiceState = 'none' | 'draft' | 'open' | 'viewed' | 'partially_paid' | 'paid' | 'partially_refunded'
+  | 'refunded' | 'void' | 'written_off';
+type JobFlag = 'overdue' | 'unassigned' | 'requirementsIncomplete' | 'evidencePendingUpload'
+  | 'unsyncedFieldData' | 'backfilled' | 'disputed' | 'creditDue' | 'outOfArea' | 'priceChangedSinceQuote';
+
+interface ActorRef { kind: 'user' | 'worker' | 'customer' | 'system' | 'api_key' | 'mcp' | 'ai';
+  id?: Id; deviceId?: Id; surface: 'crm_web' | 'crm_desktop' | 'crm_ios' | 'worker_app' | 'portal' | 'system' | 'api'; }
+
+interface NotifyContact { contactId: Id; email: boolean; sms: boolean; push: boolean; role?: 'primary' | 'billing' | 'site' | 'other'; }
+
+interface JobAddressSnapshot { addressId?: Id; line1: string; line2?: string; city: string; region?: string;
+  postalCode?: string; country: string; lat: number; lng: number; accessNotes?: string; geocodeQuality: 'rooftop' | 'interpolated' | 'approximate'; }
+
+interface AssetSnapshot { assetId: Id; kind: 'vehicle' | 'property' | 'equipment' | 'other'; label: string;
+  details: Record<string, string>; photoUrl?: string; }   // e.g. make/model/year/color/plate [S: llms]
+
+interface JobScheduleSnapshot {        // copy of Agent 03 data; never edited by 04
+  start?: Instant; end?: Instant; localDate?: LocalDate; window?: 'exact' | 'arrival_window' | 'day_only';
+  assignedWorkerIds: Id[]; leadWorkerId?: Id; lineAssignments: { lineId: Id; workerIds: Id[] }[];
+  scheduleVersion: number; }
+
+// ---------- Lines ----------
+interface JobLineItem {
+  id: Id;                             // stable; shared with Agent 05 breakdown line_id
+  kind: 'service' | 'customer_addon' | 'company_addon' | 'custom_item' | 'fee' | 'discount' | 'adjustment';
+  catalogItemId?: Id; catalogVersion?: number;   // Agent 02
+  parentLineId?: Id;                  // add-on attached to service
+  name: string; description?: string;
+  qtyMilli: number;                   // 1000 = qty 1
+  unitPriceCents: Cents; unitCostCents?: Cents;  // cost [S: t06, t07, t19]
+  durationMin?: number;               // [S: t06, t07]
+  taxable: boolean; taxCategory?: string;
+  sku?: string; inventoryTracked?: boolean;     // product add-ons [S: t07]
+  optional: boolean; optionalState?: 'offered' | 'selected' | 'declined';  // quote optional lines [D]
+  coveredBySubscriptionId?: Id;
+  source: 'quote' | 'booking' | 'crm' | 'pos_upsell' | 'series' | 'subscription' | 'zone_fee' | 'api';
+  addedBy: ActorRef; addedAt: Instant;
+  assignedWorkerIds?: Id[];           // split services [S: llms]
+  sortOrder: number;
+  removedAt?: Instant;                // soft remove (history); excluded from totals
+}
+
+interface JobDiscountRef { id: Id; kind: 'code' | 'promo' | 'manual' | 'recurring' | 'subscription';
+  discountId?: Id; code?: string; type: 'percent' | 'fixed'; bps?: number; fixedCents?: Cents;
+  scope: 'order' | 'lines'; lineIds?: Id[]; appliedBy: ActorRef; }
+
+interface JobTotals { subtotal: Cents; discountTotal: Cents; feeTotal: Cents; taxTotal: Cents; total: Cents;
+  depositRequired: Cents; amountPaid: Cents; balanceDue: Cents; creditDue: Cents; tipTotal: Cents;
+  costTotal?: Cents; profit?: Cents; marginBps?: number; estimatedDurationMin: number; currency: string; }
+
+interface PaymentStatusProjection { status: 'unpaid' | 'card_on_file' | 'authorized' | 'deposit_paid'
+  | 'partially_paid' | 'paid' | 'invoice_sent' | 'refunded' | 'partially_refunded' | 'disputed' | 'failed';
+  balanceDue: Cents; asOfLedgerSeq: number; }        // from payments.job.balance_changed
+
+// ---------- Quote ----------
+interface Quote {                     // 1:1 with Job (absent if never quoted)
+  jobId: Id; state: QuoteState; currentVersionId?: Id; latestSentVersionId?: Id;
+  expiresOn?: LocalDate; bookOnline: boolean;
+  bookOnlineOptions?: { restrictToPreferredWorker: boolean; earliestDate?: LocalDate; requireDeposit: boolean };
+  termsTemplateId?: Id; termsText: string; messageToCustomer?: string; requireSignature: boolean;
+  viewCount: number; firstViewedAt?: Instant; lastViewedAt?: Instant;
+  acceptance?: QuoteAcceptance; decline?: { reason: string; text?: string; at: Instant; versionId: Id };
+}
+interface QuoteVersion { id: Id; jobId: Id; versionNo: number; state: 'draft' | 'sent' | 'superseded'
+  | 'accepted' | 'declined' | 'expired' | 'withdrawn';
+  linesSnapshot: JobLineItem[]; totalsSnapshot: JobTotals; termsText: string; termsHash: string;
+  customerSnapshot: object; addressSnapshot?: JobAddressSnapshot; assetSnapshots: AssetSnapshot[];
+  expiresOn: LocalDate; brandVersionId: Id; renderingIds: Id[]; sentAt?: Instant; sentBy?: ActorRef;
+  recipients: Recipient[]; }
+interface QuoteAcceptance { versionId: Id; at: Instant; method: 'online' | 'in_person' | 'verbal' | 'api';
+  acceptorName: string; signatureFileId?: Id; ip?: string; userAgent?: string; deviceId?: Id;
+  termsHash: string; selectedOptionalLineIds: Id[]; recordedBy: ActorRef; }
+
+// ---------- Invoice ----------
+interface Invoice { id: Id; jobId: Id; kind: 'primary' | 'supplemental'; suffix?: number;  // #1042-2
+  legalNumber?: string;               // strict sequential numbering option
+  state: InvoiceState; currentVersionId?: Id; issuedAt?: Instant; issuedReason?: 'sent' | 'payment' | 'manual' | 'completion_auto';
+  dueTerms: 'on_receipt' | 'net_7' | 'net_15' | 'net_30' | 'custom'; dueOn?: LocalDate;
+  allowOnlinePayment: boolean; allowPartialOnline: boolean; footerText?: string;
+  amountPaid: Cents; balanceDue: Cents; overdueSince?: LocalDate; exportLockedAt?: Instant;
+  viewCount: number; voidedAt?: Instant; voidReason?: string; writtenOffAt?: Instant; }
+interface InvoiceVersion { id: Id; invoiceId: Id; versionNo: number; linesSnapshot: JobLineItem[];
+  totalsSnapshot: JobTotals; priceBreakdownVersion: number; brandVersionId: Id; renderingIds: Id[];
+  createdAt: Instant; createdBy: ActorRef; reason: 'issue' | 'revision' | 'cancellation_fee'; }
+
+// ---------- Documents ----------
+interface DocumentRendering { id: Id; jobId: Id; docType: 'quote' | 'invoice' | 'receipt' | 'work_summary';
+  versionId: Id; format: 'html' | 'pdf'; storageKey: string; sha256: string; bytes: number;
+  locale: string; brandVersionId: Id; renderedAt: Instant; }
+interface PublicLink { token: string /* ≥128-bit random, url-safe */; jobId: Id; docType: 'quote' | 'invoice' | 'tracking';
+  versionPolicy: 'latest'; createdAt: Instant; expiresAt?: Instant; revokedAt?: Instant; lastUsedAt?: Instant;
+  scopes: ('view' | 'accept' | 'decline' | 'pay' | 'book' | 'message')[]; }
+interface Recipient { contactId?: Id; email?: string; phone?: string; channels: ('email' | 'sms')[]; messageIds: Id[]; }
+
+// ---------- Field execution ----------
+interface FieldVisit { id: Id; jobId: Id; workerId: Id; state: WorkState;
+  enRouteAt?: Instant; etaAt?: Instant; etaSource?: 'gps_route' | 'manual'; trackingSessionId?: Id;
+  arrivedAt?: Instant; arrivalMethod?: 'manual' | 'geofence';
+  startedAt?: Instant; completedAt?: Instant; pauses: { from: Instant; to?: Instant; reason: string }[];
+  startLocation?: GeoPoint; completeLocation?: GeoPoint; deviceId?: Id; closedBy?: ActorRef; }
+interface GeoPoint { lat: number; lng: number; accuracyM: number; at: Instant; }
+
+interface RequirementsSnapshot { resolvedAt: Instant; catalogVersions: Record<Id, number>;
+  photoRules: { stage: 'before' | 'after'; minCount: number; sourceLineIds: Id[]; ruleIds: Id[] }[];
+  items: RequirementItem[]; signatureRequired: boolean; }
+interface RequirementItem { id: Id; templateItemId: Id; source: 'global' | 'service'; lineId?: Id;
+  type: 'checkbox' | 'yes_no' | 'text' | 'number' | 'single_select' | 'multi_select' | 'date' | 'photo';
+  label: string; options?: string[]; required: boolean; allowNA: boolean; minPhotos?: number;
+  assignedWorkerIds?: Id[]; order: number; }   // item types defined by Agent 02
+interface ChecklistResponse { id: Id /* client-generated */; jobId: Id; itemId: Id; value: unknown;
+  na?: boolean; photoIds?: Id[]; answeredBy: ActorRef; deviceTime: Instant; serverTime: Instant; supersedes?: Id; }
+
+interface JobPhoto { id: Id /* client-generated */; jobId: Id; stage: 'before' | 'after' | 'other' | 'no_show_evidence' | 'quote';
+  lineItemId?: Id; checklistItemId?: Id; takenBy: ActorRef; capturedAt: Instant; capturedGeo?: GeoPoint;
+  fromGallery: boolean; sha256: string; bytes: number; width: number; height: number; mime: string;
+  uploadState: 'pending_upload' | 'uploaded' | 'verified' | 'processed' | 'failed_permanent';
+  storageKey?: string; thumbKeys?: Record<'sm' | 'md' | 'lg', string>;
+  sharedWithCustomer: boolean; caption?: string; deletedAt?: Instant; }
+
+interface JobNote { id: Id; jobId: Id; visibility: 'internal' | 'worker' | 'customer'; body: string;
+  author: ActorRef; createdAt: Instant; editedAt?: Instant; }   // append-mostly
+interface JobFile { id: Id; jobId: Id; name: string; mime: string; bytes: number; sha256: string;
+  storageKey: string; visibleToCustomer: boolean; visibleToWorkers: boolean; uploadedBy: ActorRef; }
+interface CustomerSignature { id: Id; jobId: Id; purpose: 'quote_acceptance' | 'completion' | 'upsell_approval';
+  signerName: string; fileId: Id; at: Instant; deviceId?: Id; }
+
+// ---------- Audit & sync ----------
+interface JobAuditEntry { seq: number /* per job, gapless */; jobId: Id; at: Instant; actor: ActorRef;
+  command: string; commandId?: Id; changes: { path: string; before: unknown; after: unknown }[];
+  reason?: string; eventIds: Id[]; }
+interface DeviceCommand { commandId: Id; deviceId: Id; workerId: Id; jobId?: Id; type: string;
+  baseVersion?: number; payload: unknown; deviceTime: Instant; deviceSeq: number;
+  receivedAt?: Instant; outcome?: 'applied' | 'duplicate' | 'conflict_preserved' | 'superseded' | 'invalid';
+  outcomeDetail?: string; }
+interface NumberSequence { businessId: Id; kind: 'job' | 'legal_invoice'; next: number; }  // row-locked increment
+
+// ---------- Settings ----------
+interface JobSettings { businessId: Id; numbering: { nextJobNumber: number; prefixes: { job: string; quote: string; invoice: string };
+    strictLegalInvoiceNumbers: boolean; legalFormat?: string };
+  quotes: { defaultExpiryDays: number; defaultTermsTemplateId?: Id; bookOnlineDefault: boolean; requireSignature: boolean; allowOptionalLines: boolean; allowZeroTotal: boolean };
+  invoices: { defaultDueTerms: Invoice['dueTerms']; autoSendOnCompletion: 'off' | 'immediate' | { afterHours: number }; allowPartialOnline: boolean; minPartialCents: Cents };
+  field: { photoEnforcement: 'block' | 'warn' | 'off'; checklistEnforcement: 'block' | 'warn' | 'off';
+    requireCompletionSignature: boolean; geofenceRadiusM: number; earlyStartWindowMin: number;
+    workerPrices: { view: boolean; edit: boolean }; allowConcurrentJobs: boolean; galleryPhotosAllowed: boolean;
+    trackingLinkTtlMin: number; onMyWayLeadWorkerOnly: boolean; noShowWaitMin: number; noShowEvidenceRequired: boolean;
+    promptClockIn: boolean };
+}
+interface DocumentStyleSettings { businessId: Id; showTaxId: boolean; showWorkerName: boolean; showServiceDate: boolean;
+  showLineDescriptions: boolean; showQtyPrice: boolean; showTaxBreakdown: boolean; showPhotosOnInvoice: boolean;
+  showAssets: boolean; footerText?: string; paymentInstructions?: string; brandVersionId: Id /* Agent 11 */; }
+```
+
+Relations & keys:
+- `Job (businessId, number)` unique where number not null. `Job.id` is the only FK other modules use.
+- `Quote.jobId` PK=FK (1:1). `QuoteVersion (jobId, versionNo)` unique.
+- `Invoice (jobId, kind='primary')` unique; supplemental `(jobId, suffix)` unique.
+- `JobPhoto.id`, `ChecklistResponse.id`, `DeviceCommand.commandId` are **client-generated** (idempotency).
+- `JobAuditEntry (jobId, seq)` PK; append-only; never updated.
+- Indexes: `(businessId, masterStatus, schedule.start)`, `(businessId, customerId, createdAt)`,
+  `(businessId, invoiceState, dueOn)`, `(businessId, quoteState, expiresOn)`, `(businessId, seriesId)`,
+  assigned worker + date (via Agent 03's schedule table), full-text on number/customer/address.
+- Retention: documents and audit kept ≥ 7 years by default (tax records) `[I]`; photos per plan setting;
+  customer erasure (Agent 07 `customer.customer.erased`) pseudonymises job customer snapshots but keeps
+  financial documents where law requires (§13 Q).
+

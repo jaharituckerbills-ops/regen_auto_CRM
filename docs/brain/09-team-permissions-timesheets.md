@@ -1313,3 +1313,570 @@ State is **derived** from `effectiveDate` vs today — not stored — to avoid c
 re-auth; watch channels renewed before expiry (Google channels expire) `[I]`.
 
 ---
+### 6.9 Session (web, native desktop app, iPhone/Android apps) — added for owner requirements 2026-11-13
+
+| State | Event | Guard | Next | Side effects |
+|---|---|---|---|---|
+| — | sign-in completes (OTP/password/passkey/SSO, + 2FA if required) | user `active` | `active` | Session + Device rows; E `auth.session.created`; new-device email |
+| `active` | access token expires, refresh presented | refresh token current, family not revoked, device not wiped | `active` (rotated) | old refresh marked used |
+| `active` | old (already-used) refresh token presented | — | `revoked` (whole family) | E `auth.session.reuse_detected`; security email `[I]` |
+| `active` | idle > surface idle limit (6.9.1) | — | `expired` | client shows sign-in / biometric unlock |
+| `active` | sensitive action (refund, compensation edit, export, role grant, ownership transfer, phone card entry) | last strong auth > 15 min | `step_up_required` | client prompts OTP/passkey/Face ID |
+| `step_up_required` | strong re-auth OK | — | `active` (`strongAuthAt=now`) | — |
+| `active` | user signs out / "sign out everywhere" / admin revokes device | — | `revoked` | push token deleted; native app purges encrypted cache |
+| `active` | membership deactivated | user has other active memberships | `active` (business context removed) | 403 `membership_inactive` for that business; app purges that business's cache |
+| `active` | membership deactivated | no other memberships | `revoked` | as above |
+| `active` | password changed / 2FA reset | — | `revoked` (all other sessions) | — |
+| `active` | absolute lifetime reached | — | `expired` | — |
+
+#### 6.9.1 Session lifetimes by surface `[I]`
+
+| Surface | Credential storage | Access token | Refresh / session | Idle lock | Notes |
+|---|---|---|---|---|---|
+| CRM web | httpOnly Secure SameSite=Lax cookie | session cookie (server session) | 30 d absolute ("remember this device"), else 12 h | 12 h | CSRF token on mutations |
+| CRM **native desktop app** (macOS/Windows, later) | OS keychain (macOS Keychain / Windows Credential Manager via DPAPI) | 15 min JWT/opaque | rotating refresh 30 d | 8 h app idle → local unlock (OS biometrics / password) | Sign-in via system browser + OAuth 2.1 auth-code + PKCE (loopback redirect); no embedded webview login |
+| CRM **iPhone/iPad app** (later) | iOS Keychain, `ThisDeviceOnly` accessibility | 15 min | rotating refresh 60 d | 30 min idle → Face ID/passcode unlock | `ASWebAuthenticationSession` or native passkey sheet; jailbreak heuristics → warn only |
+| Team app (iOS/Android) | Keychain / Android Keystore | 15 min | rotating refresh 90 d (field workers rarely re-login) | none for clock card; Face ID optional to open customer data | Must allow clock-out even when token expired offline (queued, 4.19) |
+| API key / MCP connection | hashed at rest, shown once | n/a (key) or OAuth for MCP | until revoked; optional expiry | n/a | Scoped to a membership; inherits its permissions ∩ key scopes |
+
+Native-app specifics `[I]` (owner wants staff to "adjust a client's package on site, or take a phone
+call and build a service/booking for the client live" — BRIEF 2026-11-13):
+- The native desktop and iPhone **CRM** apps are the **CRM surface** (same `surface.crm.access` toggle
+  as web), not the team app. Business setting (Team/Pro) can restrict CRM to specific device kinds:
+  `crmSurfaces: ('web'|'desktop'|'ios'|'android')[]` (e.g., "no CRM on personal phones").
+- Offline cache in native CRM apps is encrypted at rest with a key held in the keychain; purged on
+  sign-out, deactivation, or remote device revoke (server sends `device.revoked` on next contact and via
+  silent push).
+- Phone-call booking with card entry is card-not-present/MOTO: requires `payments.collect.manual_card_entry`
+  (Agent 05) and a **step-up** (6.9) at most every 15 min; card fields are the processor's SDK
+  component, never our inputs (PCI scope — Agent 05).
+- On-site package change requires `subs.subscription.edit` (Agent 06) in scope; price below package
+  price requires `payments.price.override`.
+
+### 6.10 Branding & theme permissions — added for owner requirements 2026-11-13
+
+The BRIEF (2026-11-13) requires deep tenant branding (palettes for light and dark mode, shadows,
+radius, density, custom fonts, custom icons, logos per placement, copy overrides) for the booking
+site, customer portal/app, emails, SMS links, quotes/invoices **and the business's own CRM workspace**;
+staff and customers can switch light/dark. The branding engine/brand kit is owned by Agent 01 (portal)
+with shared use by 04/08 (documents, emails) — Agent 10 to confirm single owner. This module defines the
+**permission keys** and the **per-user theme preference** `[I]`:
+
+| Permission key | Owner | Operator | Admin | Manager | Foreman | Estimator | Worker | Bookkeeper |
+|---|---|---|---|---|---|---|---|---|
+| `branding.view` (see brand kit, preview) | A | A | A | R | — | — | — | — |
+| `branding.edit_draft` (palettes light/dark, shadows, radius, density) | A | A | A | — | — | — | — | — |
+| `branding.publish` (push draft live to booking site / portal / emails / docs) | A | A | opt | — | — | — | — | — |
+| `branding.assets.upload` (logos per placement, light/dark variants, favicon/app icon) | A | A | A | — | — | — | — | — |
+| `branding.fonts.upload` (custom font files; licence attestation required) | A | A | opt | — | — | — | — | — |
+| `branding.icons.manage` (icon set choice / SVG upload for categories, services, nav) | A | A | A | — | — | — | — | — |
+| `branding.copy.edit` (customer-facing label/text overrides) | A | A | A | — | — | — | — | — |
+| `branding.workspace_theme.edit` (business default theme of the CRM + team app) | A | A | A | — | — | — | — | — |
+| `branding.domain.manage` (custom/subdomain hosting — Agent 01) | A | A | opt | — | — | — | — | — |
+| `user.preferences.theme` (own light/dark/system + density) | O | O | O | O | O | O | O | O |
+
+Rules `[I]`:
+- Personal theme (light/dark/system, density, text size) is a **user** preference (follows the person
+  across businesses and devices) with optional per-device override; the **palette** used is the
+  current business's workspace theme (each business's brand in its own workspace).
+- Uploaded SVG icons/logos are sanitized server-side (strip scripts, external refs) — any member with
+  upload permission can otherwise inject content into customer-facing pages.
+- Font upload requires the uploader to tick a licence attestation; audited.
+- Publishing branding is audited with a before/after snapshot and one-click revert (Agent 01).
+- Branding changes never require timesheet/team permissions; they live under Settings → Branding.
+
+---
+
+## 7. Data model
+
+Stack-agnostic TypeScript-style interfaces. Conventions `[I]`: every tenant-scoped row has
+`businessId`; `version: number` for optimistic concurrency; soft delete via `deletedAt`; audit fields
+`createdAt/createdBy/updatedAt/updatedBy`. **`Membership.id` is the `workerId` used by every other
+module** (02 `WorkerZoneAssignment.workerId`, 03 `WorkerScheduleProfile.workerId`, 05 `performed_by`).
+
+```ts
+type ID = string;            // UUIDv7 (time-ordered)
+type Instant = string;       // RFC3339 UTC
+type LocalDate = string;     // "2026-10-20" (no timezone)
+type LocalTime = string;     // "08:00"
+type IanaTz = string;        // "America/Chicago"
+type Cents = number;         // integer minor units
+type Bp = number;            // integer basis points (15000 = 1.5x, 2500 = 25%)
+type Hex = string;           // "#1A73E8"
+
+// ───────────── Identity (global, not tenant-scoped) ─────────────
+interface User {
+  id: ID;
+  status: 'pending' | 'active' | 'locked' | 'disabled' | 'deleted';
+  primaryEmail?: string;          // lowercased, verified flag below
+  primaryEmailVerifiedAt?: Instant;
+  primaryPhone?: string;          // E.164
+  primaryPhoneVerifiedAt?: Instant;
+  firstName: string; lastName?: string;
+  avatarAssetId?: ID;
+  locale: string;                 // "en-US"
+  preferences: { theme: 'light'|'dark'|'system'; density: 'comfortable'|'compact'; textScale: number };
+  lastLoginAt?: Instant;
+  lockedUntil?: Instant;
+  createdAt: Instant; version: number;
+}
+
+interface AuthIdentity {          // one per login method
+  id: ID; userId: ID;
+  kind: 'email_otp' | 'sms_otp' | 'password' | 'passkey' | 'totp' | 'oidc_google' | 'oidc_microsoft' | 'saml';
+  identifier: string;             // email / phone / credentialId / subject
+  secretHash?: string;            // Argon2id for password; never plain
+  publicKey?: string;             // passkey
+  verifiedAt?: Instant; lastUsedAt?: Instant; disabledAt?: Instant;
+}
+
+interface OtpChallenge {
+  id: ID; identifier: string; channel: 'email'|'sms';
+  codeHash: string; expiresAt: Instant; attempts: number; maxAttempts: 5;
+  purpose: 'sign_in' | 'invite_accept' | 'step_up' | 'change_email' | 'change_phone';
+  ipHash: string; createdAt: Instant; consumedAt?: Instant;
+}
+
+interface Device {
+  id: ID; userId: ID;
+  kind: 'web' | 'desktop_mac' | 'desktop_win' | 'ios' | 'ipados' | 'android';
+  app: 'crm' | 'team_app';
+  model?: string; osVersion?: string; appVersion?: string;
+  pushToken?: string;             // encrypted at rest
+  firstSeenAt: Instant; lastSeenAt: Instant;
+  revokedAt?: Instant; revokedBy?: ID;
+}
+
+interface Session {
+  id: ID; userId: ID; deviceId: ID;
+  surface: 'crm_web' | 'crm_desktop' | 'crm_ios' | 'crm_android' | 'team_app';
+  status: 'active' | 'expired' | 'revoked';
+  refreshFamilyId?: ID; currentRefreshHash?: string;
+  strongAuthAt: Instant;          // last OTP/passkey/biometric, for step-up
+  createdAt: Instant; lastActiveAt: Instant; absoluteExpiresAt: Instant;
+  ipHash: string; userAgent?: string;
+  revokedReason?: 'sign_out' | 'admin' | 'reuse_detected' | 'password_change' | 'deactivated' | 'expired';
+}
+
+// ───────────── Tenancy ─────────────
+interface Business {
+  id: ID;
+  name: string; legalName?: string;
+  status: 'trial' | 'active' | 'suspended' | 'closed';
+  ownerMembershipId: ID;          // exactly one
+  timezone: IanaTz; country: string; currency: string; locale: string;
+  plan: PlanCode; planSeatsIncluded: number; overageAllowed: boolean;
+  hubId?: ID;
+  weekStartsOn: 0|1|2|3|4|5|6;
+  createdAt: Instant; version: number;
+}
+type PlanCode = 'solo' | 'starter' | 'team' | 'pro';
+
+interface BusinessHub {           // multi-business hub (Pro) [S: llms]
+  id: ID; name: string; ownerUserId: ID;
+  businessIds: ID[];
+  createdAt: Instant;
+}
+interface HubMembership { hubId: ID; userId: ID; role: 'hub_owner'|'hub_admin'|'hub_viewer'; }
+
+interface PlanEntitlement {       // static config per plan, versioned
+  plan: PlanCode; featureKey: string;   // e.g. 'timesheets.overtime.all', 'team.custom_roles'
+  enabled: boolean; limit?: number;     // e.g. auditRetentionDays
+}
+
+// ───────────── Team ─────────────
+interface Membership {            // a.k.a. TeamMember / Worker profile; id == workerId elsewhere
+  id: ID; businessId: ID; userId: ID;
+  status: 'draft' | 'invited' | 'active' | 'deactivated' | 'removed' | 'anonymized';
+  roleId: ID;                     // preset or custom role
+  firstName: string; lastName?: string; displayName: string;
+  email?: string; phone?: string; workPhone?: string;   // business-specific contact copy
+  address?: Address;              // start/end location for travel (03)
+  startLocation?: { lat: number; lng: number };
+  photoAssetId?: ID;
+  employeeId?: string;
+  timezone: IanaTz; locale: string;
+  calendarColor: Hex;             // [S: T13]
+  surfaces: { crm: boolean; teamApp: boolean };        // [S: T13] mobile app + CRM
+  isDispatchable: boolean;        // "receives jobs"
+  onlineBookable: boolean;        // customer can pick this worker on booking site (01) [I]
+  primaryZoneId?: ID;
+  allServices: boolean;           // true = all current+future services allowed [S: T13]
+  maxJobsPerDay?: number;
+  defaultVehicleId?: ID;          // [S: llms] vehicle on every job
+  otExempt: boolean;              // overtime exempt (salaried/contractor)
+  employmentType?: 'employee' | 'contractor';
+  notes?: string;                 // internal [S: T09]
+  invitedAt?: Instant; activatedAt?: Instant;
+  deactivatedAt?: Instant; deactivatedBy?: ID; deactivationReason?: string;
+  scheduledDeactivationAt?: Instant;
+  permsVersion: number;           // bump → caches invalidated
+  createdAt: Instant; createdBy: ID; version: number;
+}
+interface Address { line1: string; line2?: string; city: string; region?: string; postal?: string; country: string; lat?: number; lng?: number; }
+
+interface MemberServiceSkill {    // owned by 09 (02 confirms) [S: T13]
+  businessId: ID; membershipId: ID; serviceId: ID; createdAt: Instant; createdBy: ID;
+}
+// Zone/shop joins are owned by 02: WorkerZoneAssignment, WorkerShopAssignment (edited from 09 UI).
+
+interface Crew {                  // [I] foreman scope
+  id: ID; businessId: ID; name: string;
+  leadMembershipIds: ID[]; memberIds: ID[]; defaultVehicleId?: ID;
+  archivedAt?: Instant; version: number;
+}
+
+interface Role {
+  id: ID; businessId: ID | null;  // null = system preset
+  key: 'owner'|'operator'|'admin'|'manager'|'foreman'|'estimator'|'worker'|'bookkeeper'|'custom';
+  name: string; baseRoleKey: Exclude<Role['key'], 'custom'>;   // rank derives from base
+  rank: number;
+  grants: PermissionGrant[];
+  isLocked: boolean;              // presets locked
+  version: number;
+}
+interface PermissionGrant {
+  key: string;                    // e.g. 'jobs.assign'
+  scope?: 'own' | 'crew' | 'zone' | 'all';
+  limits?: Record<string, number>;   // e.g. { max_refund_minor: 20000, max_discount_bp: 1500 }
+}
+interface MemberPermissionOverride {
+  businessId: ID; membershipId: ID;
+  key: string; effect: 'grant' | 'revoke';
+  scope?: PermissionGrant['scope']; limits?: PermissionGrant['limits'];
+  setBy: ID; setAt: Instant;
+}
+
+interface Invite {
+  id: ID; businessId: ID; membershipId: ID;
+  channel: 'email' | 'sms' | 'link';
+  sentTo: string;
+  tokenHash: string;              // SHA-256 of 32-byte random token; token never stored
+  status: 'pending' | 'accepted' | 'expired' | 'revoked' | 'superseded';
+  deliveryStatus: 'queued' | 'delivered' | 'bounced' | 'complained' | 'unknown';
+  expiresAt: Instant; sentAt: Instant; sentBy: ID;
+  acceptedAt?: Instant; acceptedByUserId?: ID;
+  resendCount: number;
+}
+
+// ───────────── Availability ─────────────
+interface AvailabilityTemplate {  // versioned weekly hours (03 reads as AvailabilityRule[])
+  id: ID; businessId: ID; membershipId: ID;
+  effectiveFrom: LocalDate; effectiveTo?: LocalDate;
+  tz: IanaTz;
+  status: 'active' | 'pending_approval' | 'rejected' | 'superseded';
+  rules: { weekday: 0|1|2|3|4|5|6; start: LocalTime; end: LocalTime; /* end<start = overnight */
+           locationZoneIds?: ID[]; locationShopId?: ID }[];
+  submittedBy: ID; approvedBy?: ID;
+  version: number;
+}
+interface AvailabilityOverride {
+  id: ID; businessId: ID; membershipId: ID; date: LocalDate; tz: IanaTz;
+  intervals: { start: LocalTime; end: LocalTime }[];   // [] = unavailable all day
+  note?: string; createdBy: ID;
+}
+interface TimeOff {
+  id: ID; businessId: ID; membershipId: ID;
+  start: Instant; end: Instant; allDay: boolean;
+  startDate?: LocalDate; endDate?: LocalDate;        // for all-day, evaluated in member tz
+  type: 'vacation' | 'sick' | 'unpaid' | 'personal' | 'other';
+  status: 'requested' | 'approved' | 'denied' | 'cancelled';
+  hard: boolean;                  // approved = hard block for dispatch
+  note?: string; decisionReason?: string;
+  requestedBy: ID; decidedBy?: ID; decidedAt?: Instant;
+  paidHours?: number;             // future: PTO accrual (out of scope v1)
+  version: number;
+}
+interface FleetVehicle {          // company vehicle (NOT customer vehicle/asset — that's 07). Ownership TBD with 03.
+  id: ID; businessId: ID; name: string; plate?: string; color?: string; capacityNotes?: string;
+  shopId?: ID; active: boolean;
+}
+interface VehicleAssignment {     // default member→vehicle for a date range
+  id: ID; businessId: ID; vehicleId: ID; membershipId?: ID; crewId?: ID;
+  from: LocalDate; to?: LocalDate;
+}
+
+interface CalendarConnection {
+  id: ID; businessId: ID; membershipId: ID;
+  provider: 'google' | 'microsoft' | 'ics_out';
+  status: 'connecting' | 'active' | 'error' | 'revoked_by_user' | 'disconnected';
+  pushJobs: boolean; pushCalendarId?: string;
+  busyCalendarIds: string[];
+  tokenRef: string;               // pointer into secrets vault; never in app DB plaintext
+  watchChannelId?: string; watchExpiresAt?: Instant;
+  lastSyncAt?: Instant; lastError?: string;
+}
+interface ExternalBusyBlock { id: ID; businessId: ID; membershipId: ID; connectionId: ID;
+  start: Instant; end: Instant; externalId: string; updatedAt: Instant; }
+interface ExternalEventLink { connectionId: ID; jobId: ID; externalEventId: string; etag?: string; lastPushedVersion: number; }
+
+// ───────────── Timesheets ─────────────
+interface TimesheetSettings {
+  businessId: ID;
+  enabled: boolean; enabledAt?: Instant;                       // [S: T03]
+  payPeriod: 'weekly' | 'biweekly' | 'semimonthly' | 'monthly';
+  payPeriodAnchor: LocalDate;
+  workweekStart: { weekday: 0|1|2|3|4|5|6; time: LocalTime };
+  payrollTz: IanaTz;
+  workdayBoundary: LocalTime;                                   // "04:00"
+  roundingMinutes: 0 | 1 | 5 | 6 | 15;
+  overtime: OvertimePolicy;
+  paidBreaksCountAsWorked: boolean;
+  maxPaidBreakMinPerShift: number;
+  autoDeductMeal?: { afterHours: number; minutes: number };
+  forgottenClockOut: { remindAfterMin: number; secondRemindAfterMin: number; maxShiftHours: number };
+  clockInWindow?: { requireScheduled: boolean; minutesBeforeFirstJob: number };
+  geofence: { mode: 'off' | 'record' | 'warn' | 'block'; radiusM: number;
+              allowed: ('shops' | 'job_sites_today' | 'assigned_zones' | 'anywhere')[] };
+  requireClockInPhoto: boolean;
+  workersMayAddManualEntries: boolean;
+  autoApprove?: { toleranceMin: number };
+  trackJobTime: boolean;
+  allowConcurrentBusinessClock: boolean;
+  version: number;
+}
+interface OvertimePolicy {
+  preset: 'none' | 'flsa_weekly' | 'daily_weekly' | 'california' | 'custom';
+  dailyOtAfterMin?: number; dailyDtAfterMin?: number;
+  weeklyOtAfterMin?: number;
+  seventhDayRule: boolean;
+  otMultiplierBp: Bp; dtMultiplierBp: Bp;                      // 15000 / 20000
+}
+
+interface CompensationRate {      // [S: T03] rate + effective date, future-dated raises
+  id: ID; businessId: ID; membershipId: ID;
+  kind: 'hourly';                 // v2: 'salary' | 'per_job' | 'commission'
+  rateCents: Cents;               // per hour
+  effectiveDate: LocalDate;       // date-only in payrollTz (avoids the Oct-19/20 ambiguity)
+  note?: string;
+  createdBy: ID; createdAt: Instant; deletedAt?: Instant;
+}
+
+interface ClockEvent {            // raw, append-only, idempotent (offline-safe)
+  id: ID;                         // = clientEventId (UUIDv7 from device)
+  businessId: ID; membershipId: ID; deviceId: ID;
+  type: 'clock_in' | 'break_start' | 'break_end' | 'clock_out';
+  breakPaid?: boolean;
+  deviceTime: Instant; bootId: string; monotonicMs: number;
+  trustedTime: Instant;           // server-computed
+  serverReceivedAt: Instant;
+  location?: { lat: number; lng: number; accuracyM: number; capturedAt: Instant };
+  photoAssetId?: ID;
+  geofenceResult?: 'inside' | 'outside' | 'unknown';
+  offline: boolean;
+  entryId?: ID;                   // TimeEntry it was applied to
+  rejectedReason?: string;
+}
+
+interface TimeEntry {             // one shift ("time sheet" in Fieldd UI)
+  id: ID; businessId: ID; membershipId: ID;
+  status: 'in_progress' | 'stopped' | 'submitted' | 'approved' | 'rejected' | 'paid' | 'voided';
+  source: 'clock' | 'manual_admin' | 'manual_worker' | 'adjustment';
+  workday: LocalDate;             // attribution date (5.5)
+  rawStartAt: Instant; rawEndAt?: Instant;
+  startAt: Instant; endAt?: Instant;                            // rounded
+  segments: TimeSegment[];
+  totals?: EntryTotals;           // computed on stop/edit
+  rateOverrideCents?: Cents;      // [S: T03] "set the hourly rate for this punch"
+  effectiveRateCents?: Cents;     // snapshot at compute time
+  pay?: { regularCents: Cents; otCents: Cents; dtCents: Cents; totalCents: Cents };
+  flags: EntryFlag[];
+  note?: string;                  // worker note
+  rejectionReason?: string;
+  submittedAt?: Instant; submittedBy?: ID;
+  approvedAt?: Instant; approvedBy?: ID | 'system';
+  paidAt?: Instant; paidBy?: ID; payrollExportId?: ID;
+  adjustsEntryId?: ID;            // for source='adjustment'
+  jobLinks: JobTimeLink[];
+  version: number;
+}
+interface TimeSegment {
+  id: ID; kind: 'work' | 'break';
+  paid?: boolean;                 // breaks only [S: T03] paid vs unpaid
+  startAt: Instant; endAt?: Instant;
+  autoDeducted?: boolean;
+}
+interface EntryTotals {
+  workMs: number; paidBreakMs: number; unpaidBreakMs: number; payableMs: number;
+  regularMs: number; otMs: number; dtMs: number;                // after OT allocation
+}
+type EntryFlag = 'auto_closed' | 'auto_closed_deactivation' | 'auto_submitted' | 'edited' | 'manual'
+  | 'offline_synced' | 'clock_skew' | 'outside_geofence' | 'missing_rate' | 'missing_break'
+  | 'overlap' | 'long_shift' | 'void_requested' | 'blended_rate_required';
+interface JobTimeLink { jobId: ID; startAt: Instant; endAt?: Instant; source: 'job_workflow' | 'manual'; }
+
+interface TimeEntryRevision {     // full snapshot before each edit
+  id: ID; entryId: ID; revision: number; snapshot: Omit<TimeEntry, 'jobLinks'>;
+  editedBy: ID; editedAt: Instant; reason: string;
+}
+
+interface PayrollExport {
+  id: ID; businessId: ID;
+  periodStart: LocalDate; periodEnd: LocalDate;
+  format: 'csv_generic' | 'gusto' | 'quickbooks' | 'adp';
+  entryIds: ID[]; memberCount: number;
+  totals: { regularMs: number; otMs: number; dtMs: number; grossCents: Cents; tipsCents: Cents };
+  fileAssetId: ID; markedPaid: boolean;
+  createdBy: ID; createdAt: Instant;
+}
+
+// ───────────── Audit ─────────────
+interface AuditEvent {
+  id: ID; businessId: ID | null;
+  actor: { type: 'membership' | 'user' | 'system' | 'api_key' | 'mcp' | 'support'; id: ID; onBehalfOf?: ID };
+  action: string;                 // e.g. 'team.member.role_changed'
+  targetType: string; targetId: ID;
+  diff?: Record<string, { from: unknown; to: unknown }>;
+  severity: 'info' | 'notice' | 'high';
+  ipHash?: string; deviceId?: ID; at: Instant;
+}
+
+interface ApiCredential {         // API key or MCP connection (service principal)
+  id: ID; businessId: ID; ownerMembershipId: ID;
+  kind: 'api_key' | 'mcp_crm' | 'mcp_bookings';   // [S: llms] two MCP servers
+  name: string; keyHash?: string; prefix: string;  // "pk_live_ab12…"
+  scopes: string[];               // ⊆ owner's effective permissions at call time
+  lastUsedAt?: Instant; expiresAt?: Instant; revokedAt?: Instant;
+}
+```
+
+Keys & indexes `[I]`:
+- `Membership (businessId, userId)` unique where status ∉ {removed, anonymized}.
+- `Membership (businessId, lower(email))` unique where status ∈ {draft, invited, active}.
+- `TimeEntry (membershipId, status='in_progress')` partial unique → at most one open entry.
+- `TimeEntry` exclusion constraint on `(membershipId, tstzrange(startAt,endAt))` overlap where status ≠ voided.
+- `ClockEvent (id)` primary key = client UUID → idempotency.
+- `CompensationRate (membershipId, effectiveDate)` unique where deletedAt is null (one rate per date).
+- `Invite (tokenHash)` unique.
+
+Relations: User 1–N Membership N–1 Business; Business N–1 BusinessHub; Membership 1–N
+TimeEntry 1–N TimeSegment; Membership 1–N CompensationRate; Membership N–M Service (via
+MemberServiceSkill); Membership N–M Zone/Shop (02 joins); Membership N–M Crew; Membership 1–N
+AvailabilityTemplate/Override/TimeOff; Membership 1–0..1 CalendarConnection per provider.
+
+---
+
+## 8. API surface
+
+Transport-agnostic commands (`cmd`) and queries (`qry`). All mutating commands take `idempotencyKey`
+and, for existing records, `expectedVersion`; errors are typed: `VALIDATION_FAILED{fieldErrors}`,
+`VERSION_CONFLICT{current}`, `FORBIDDEN{missingKey}`, `NOT_FOUND`, `SEAT_LIMIT{used,included}`,
+`ESCALATION_DENIED{keys}`, `STATE_INVALID{from,event}`, `RATE_LIMITED{retryAfter}`,
+`STEP_UP_REQUIRED`. Auth column: `public`, `user` (signed-in, any business), `staff(key)` (membership in
+`X-Business-Id` with permission), `system`, `self` (own membership).
+
+### 8.1 Auth & account
+
+| Name | Kind | Input | Output | Auth |
+|---|---|---|---|---|
+| `auth.startOtp` | cmd | `{identifier, channel, purpose, captchaToken?}` | `{challengeId, resendAfterSec}` | public (rate-limited) |
+| `auth.verifyOtp` | cmd | `{challengeId, code, device}` | `{session|stepUpOk, memberships[]}` | public |
+| `auth.passwordSignIn` | cmd | `{email, password, device}` | `{session}` or `{mfaRequired, challengeId}` | public |
+| `auth.passkeyOptions` / `auth.passkeyVerify` | cmd | WebAuthn payloads | `{session}` | public |
+| `auth.oauthAuthorize` / `auth.oauthToken` | cmd | OAuth 2.1 + PKCE (native apps, MCP) | tokens | public |
+| `auth.refresh` | cmd | `{refreshToken, deviceId}` | `{accessToken, refreshToken}` | public (token) |
+| `auth.signOut` | cmd | `{all?: boolean}` | `{}` | user |
+| `auth.stepUp` | cmd | `{method, proof}` | `{strongAuthAt}` | user |
+| `account.get` / `account.update` | qry/cmd | profile, preferences (theme) | User | user |
+| `account.listSessions` / `account.revokeSession` | qry/cmd | `{sessionId}` | sessions | user |
+| `account.addLoginMethod` / `account.removeLoginMethod` | cmd | method data | identities | user + step-up |
+| `account.delete` | cmd | `{}` | `{scheduledAt}` | user + step-up; blocked if owner |
+| `account.memberships` | qry | — | `{businessId, name, role, status, logo}[]` | user |
+
+### 8.2 Tenant
+
+| Name | Kind | Input | Output | Auth |
+|---|---|---|---|---|
+| `tenant.createBusiness` | cmd | `{name, address, timezone?, currency?, industry?}` | Business + owner Membership | user |
+| `tenant.get` / `tenant.update` | qry/cmd | profile fields | Business | staff(`settings.business_profile`) |
+| `tenant.plan.get` | qry | — | plan, seats used/included, entitlements | staff(`team.view`) |
+| `tenant.plan.change` | cmd | `{plan}` | preview/apply | staff(`tenant.plan_billing.manage`) + step-up |
+| `tenant.transferOwnership` / `tenant.acceptOwnership` | cmd | `{toMembershipId}` / `{transferId}` | — | owner + step-up / target |
+| `tenant.hub.create` / `addBusiness` / `removeBusiness` / `summary` | cmd/qry | ids | hub | hub_owner |
+| `tenant.cloneProfile` (Pro) | cmd | `{fromBusinessId, toBusinessId?, parts: ('catalog'|'coverage'|'settings'|'roles'|'branding')[]}` | job id | hub_owner |
+
+### 8.3 Team members & invites
+
+| Name | Kind | Input | Output | Auth |
+|---|---|---|---|---|
+| `team.list` | qry | `{q?, roles?, statuses?, zoneIds?, shopIds?, crewIds?, serviceIds?, clockedIn?, cursor, limit≤200}` | page of MemberSummary (masked) | staff(`team.view`) |
+| `team.get` | qry | `{membershipId}` | MemberDetail (masked by perms) | staff(`team.view`) or self |
+| `team.createMember` | cmd | `{profile, roleId, overrides?, zoneIds, shopIds, primaryZoneId?, allServices, serviceIds?, calendarColor, availability?, rate?, sendInvite, inviteChannel}` | `{membership, invite?}` | staff(`team.create_invite`) |
+| `team.updateMember` | cmd | `{membershipId, patch, expectedVersion}` | membership | staff(`team.edit_profile`) or self (limited fields) |
+| `team.setServices` | cmd | `{membershipId, allServices, serviceIds}` | skills | staff(`team.assign_zones_services`) |
+| `team.setZones` | cmd | `{membershipId, zoneIds, shopIds, primaryZoneId}` → calls 02 `coverage.setWorkerZones` | assignments | staff(`team.assign_zones_services`) |
+| `team.setRole` | cmd | `{membershipId, roleId}` | membership | staff(`team.permissions.manage`) |
+| `team.setPermissionOverrides` | cmd | `{membershipId, overrides[]}` | effective permissions | staff(`team.permissions.manage`) |
+| `team.previewDeactivation` | qry | `{membershipId, effectiveAt}` | impact (jobs, routes, series, quotes, leads, clock, entries, cash on hand from 05) | staff(`team.deactivate`) |
+| `team.deactivate` | cmd | `{membershipId, effectiveAt, reason, reassignment: 'auto'|'unassigned'|{toMembershipId}, notifyCustomers, notifyMember}` | membership | staff(`team.deactivate`) |
+| `team.reactivate` | cmd | `{membershipId}` | membership | staff(`team.deactivate`) |
+| `team.anonymize` | cmd | `{membershipId}` | — | owner + step-up |
+| `team.invite.resend` / `revoke` / `copyLink` | cmd | `{membershipId}` | invite / `{url}` (once) | staff(`team.create_invite`) |
+| `team.invite.inspect` | qry | `{token}` | `{businessName, logo, inviterName, email (masked), expired}` | public |
+| `team.invite.accept` | cmd | `{token}` | membership | user (verified email/phone match) |
+| `team.export` | cmd | `{filters, format:'csv'}` | file | staff(`team.export`) |
+| `team.crews.*` | cmd/qry | CRUD | Crew | staff(`team.edit_profile`) |
+| `team.viewAs` | cmd | `{membershipId}` | read-only scoped token (15 min) | staff(`team.permissions.manage`), rank > target |
+
+### 8.4 Authorization (internal, used by every module)
+
+| Name | Kind | Input | Output | Auth |
+|---|---|---|---|---|
+| `authz.check` | qry | `{principal, key, resource?: {type, id, zoneId?, shopId?, assigneeIds?, ownerId?}}` | `{allow, scope, limits?, reason?}` | system |
+| `authz.effectivePermissions` | qry | `{membershipId}` | `{grants[], permsVersion, masks}` | system / self |
+| `authz.scopeFilter` | qry | `{principal, key, resourceType}` | predicate descriptor (zoneIds, crewMemberIds, ownId) for list queries | system |
+| `authz.registerKeys` | cmd (build-time manifest) | `{module, keys: {key, description, scopes, limits?, defaultByRole}}[]` | — | build/system |
+| `roles.list` / `roles.create` / `roles.update` / `roles.applyPreview` | qry/cmd | role defs | Role, diff | staff(`team.roles.manage_custom`) |
+
+### 8.5 Availability, time off, calendar, vehicles
+
+| Name | Kind | Input | Output | Auth |
+|---|---|---|---|---|
+| `team.availability.get` | qry | `{membershipId, from, to}` | template(s), overrides, time off, busy, **materialized intervals** | staff(`team.availability.view`) / self |
+| `team.availability.setTemplate` | cmd | `{membershipId, rules[], effectiveFrom}` | template (maybe pending) | staff(`team.availability.edit`) / self |
+| `team.availability.approveTemplate` | cmd | `{templateId, approve, reason?}` | template | staff(`team.timeoff.approve`) |
+| `team.availability.setOverride` / `deleteOverride` | cmd | `{membershipId, date, intervals}` | override | staff/self |
+| `team.timeoff.request` / `create` / `decide` / `cancel` | cmd | per 4.14 | TimeOff (+ conflicts list) | self / staff(`team.timeoff.approve`) |
+| `team.timeoff.list` | qry | `{membershipIds?, from, to, status?}` | TimeOff[] | staff/self |
+| `team.scheduleProfiles` | qry | `{membershipIds? , since?: version}` | `WorkerScheduleProfile[]` (03 shape) | system (03) |
+| `team.availabilityRules` | qry | `{membershipIds, from, to}` | `AvailabilityRule[]`, `AvailabilityOverride[]`, `TimeOff[]`, `ExternalBusy[]` (03 shapes) | system (03) |
+| `team.eligibleWorkers` | qry | `{serviceIds[], zoneId?, shopId?, date?}` | `{membershipId, reasonsExcluded?}[]` | system (02/03), staff(`jobs.assign`) |
+| `team.calendar.connect` / `disconnect` / `status` / `resync` | cmd/qry | OAuth code, options | CalendarConnection | self |
+| `team.calendar.webhook` | cmd | provider push | 204 | public (signed channel token) |
+| `team.vehicles.*` / `team.vehicles.assign` | cmd/qry | CRUD, `{vehicleId, membershipId|crewId, from, to?}` | assignments | staff(`team.vehicles.assign`) |
+| `team.activeNow` | qry | — | members clocked in / on job / on break (dashboard `[S: llms]`) | staff(`dashboard.team_activity.view`) |
+
+### 8.6 Timesheets, compensation, payroll
+
+| Name | Kind | Input | Output | Auth |
+|---|---|---|---|---|
+| `timesheet.settings.get` / `update` | qry/cmd | TimesheetSettings patch | settings | staff(`timesheets.settings.manage`) |
+| `timesheet.clock` | cmd | `ClockEvent[]` (batch, ordered; offline flush) | `{applied[], rejected[{id, reason}], currentState}` | self + `timesheets.clock` |
+| `timesheet.current` | qry | — | open entry + state + server time (for offset) | self |
+| `timesheet.submitEntry` | cmd | `{entryId, note?, segmentsEdit?}` | entry | self (edit needs `timesheets.edit_own`) |
+| `timesheet.createEntry` | cmd | `{membershipId, workday, start, end, breaks[], rateOverrideCents?, jobIds?, note?}` | entry (`submitted`) `[S: T03]` | staff(`timesheets.edit_others`) / self(`timesheets.edit_own` + setting) |
+| `timesheet.editEntry` | cmd | `{entryId, patch, reason, approveAfter?, expectedVersion}` | entry | staff(`timesheets.edit_others`) / self(`edit_own`, not approved/paid) |
+| `timesheet.approve` / `reject` / `unapprove` / `markPaid` / `unmarkPaid` / `void` | cmd | `{entryIds[], reason?}` | `{succeeded[], skipped[{id, reason}]}` | staff(respective key); no self-approval |
+| `timesheet.list` | qry | `{from, to, membershipIds?, statuses?, flags?, groupBy, cursor}` | entries + totals (pay masked) | staff(`timesheets.view_others`) / self |
+| `timesheet.periodSummary` | qry | `{periodStart}` | per-member totals, tips (from 05), approval completeness | staff(`timesheets.view_others`) |
+| `timesheet.laborCost` | qry | `{jobIds[]}` | `{jobId, minutes, costCents}[]` | system (04/05/08), staff(`reports.labor_cost.view`) |
+| `compensation.list` | qry | `{membershipId}` | rates with derived state (current/future/past) | staff(`compensation.view_others`) / self(`view_own`) |
+| `compensation.addRate` | cmd | `{membershipId, rateCents, effectiveDate, note?}` | rate | staff(`compensation.edit`), not self |
+| `compensation.deleteRate` | cmd | `{rateId}` | — | staff(`compensation.edit`) |
+| `payroll.export` | cmd | `{periodStart, periodEnd, format, includeStatuses, markPaid}` | PayrollExport + file | staff(`timesheets.payroll_export`) + step-up |
+| `payroll.exports.list` | qry | — | PayrollExport[] | staff(`timesheets.payroll_export`) |
+
+### 8.7 Audit & API credentials
+
+| Name | Kind | Input | Output | Auth |
+|---|---|---|---|---|
+| `audit.list` | qry | `{targetType?, targetId?, actorId?, actions?, from, to, cursor}` | AuditEvent[] | staff(`settings.audit_log.view`) |
+| `apiCredentials.create` / `list` / `revoke` | cmd/qry | `{kind, name, scopes, expiresAt?}` | key (shown once) | staff(`settings.api_mcp.manage`) + step-up |
+
+MCP exposure `[S: llms]` `[I]`: every command above is exposed to the CRM MCP as a tool **only if** the
+calling credential's owner holds the key; payroll export, ownership transfer, API credential creation,
+and permission grants are **never** exposed to MCP/AI (human-only, step-up). Bookings MCP gets no
+access to this module beyond `team.eligibleWorkers`-derived public worker list (first name + photo for
+"choose your pro", if business enables it).
+
+---

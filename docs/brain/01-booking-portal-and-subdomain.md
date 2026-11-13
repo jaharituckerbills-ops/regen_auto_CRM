@@ -1322,3 +1322,283 @@ N—M Service (02); CancellationPolicySnapshot 1—1 Job.
 **Retention [D]:** anonymous sessions 30 days; identified-but-unconverted sessions 90 days (lead
 persists in 07 under its own policy); converted sessions 13 months (attribution analytics) then
 reduced to PortalBooking; OTP challenges 24 h; terms acceptances for life of customer + 7 years.
+
+### 7A. Addendum (2026-11-13): theme & brand data comes from Agent 11
+
+The 2026-11-13 owner requirements (BRIEF) add deep tenant branding: editable **light and dark
+palettes**, shadows/elevation, radius, spacing density, **uploaded custom fonts**, custom icons
+(icon set or uploaded SVGs for categories/services/nav), **logos per placement with sizing
+controls and light/dark variants**, copy overrides everywhere, responsive desktop/tablet/phone,
+and later native apps. **Agent 11 (Branding, Theming & Responsive Design System) owns that model.**
+Consequences for this module (they refine, not replace, §3.D1 and `PortalStyle` in §7):
+
+- `PortalStyle.colors/fontFamily/radius/theme/logoAssetId/faviconAssetId` are a **portal-local
+  projection** of Agent 11's `BrandTheme`. The source of truth is 11's theme record; the portal stores
+  only `themeId` + `themeVersion` per published `PortalConfigVersion` plus portal-only settings
+  (map style/pin, hero image, "powered by" badge, `showOnAddressStep`).
+- The portal consumes 11's compiled **design tokens** (CSS custom properties for both modes, e.g.
+  `--color-primary`, `--color-surface`, `--shadow-2`, `--radius-md`, `--density`, `--font-heading`,
+  `--font-body`, font-size scale) and 11's **asset manifest** (logo per placement: `portal_header`,
+  `portal_header_mobile`, `favicon`, `app_icon`, `og_image`; each with light/dark variants, intrinsic
+  width/height and the sizing chosen by the business; icon map for categories/services/nav).
+- Customer-facing light/dark switch: default follows `prefers-color-scheme`; a toggle in the portal
+  header persists the choice per visitor (`localStorage`, wrapped in try/catch) and per signed-in
+  customer (profile preference via 07) [D, required by BRIEF 2026-11-13].
+- Text overrides (§3.D1, §5.9) remain owned by 01 **for portal strings**; if Agent 11 centralizes all
+  copy overrides into one "copy" registry, 01's `TextKey` list becomes a namespace (`portal.*`) in it.
+- Performance guardrails the portal imposes on 11's output (see §10.9, §11.7): tokens delivered inline
+  in the HTML `<head>` (≤ 4 KB), custom fonts self-hosted, subset, WOFF2, ≤ 2 families × 2 weights
+  preloaded, `font-display: swap` with metric-matched fallbacks; uploaded SVG icons sanitized by 11
+  and inlined as a sprite; every logo rendered with explicit width/height (no CLS).
+
+---
+
+## 8. API surface
+
+Conventions [D]: JSON over HTTPS; public routes are tenant-scoped **by Host only** (edge-injected
+`X-Tenant-Id`); all mutating calls accept `Idempotency-Key`; optimistic concurrency via
+`If-Match: <version>` on session PATCH; errors are `{code, message, details?, retryable}` with stable
+`code` strings. Auth kinds: `public` (anonymous, rate-limited), `session` (booking-session bearer = 
+session id + signed secret in memory/sessionStorage), `customer` (portal session cookie), `agent`
+(Bookings-MCP API key, customer-level), `staff:<permission>` (CRM, permission names per Agent 09:
+`settings.online_booking.manage` etc.), `system` (internal service identity). Names below are
+command/query names; REST paths are illustrative.
+
+### 8.1 Public: config, catalog, attribution
+
+| Name | Path (illustrative) | Input | Output | Auth |
+|---|---|---|---|---|
+| `portal.config.get` | `GET /api/portal/config` | — (Host) | published `PortalConfig` (public subset) + theme token URL/version (Agent 11) + feature flags + `canonicalHost` | public, edge-cached (tag `tenant:{id}:config`) |
+| `portal.catalog.get` | `GET /api/portal/catalog?mode=` | `mode?` | categories, services (public fields only), customer add-ons + pairings, variants, recurring options, self-purchasable packages (06), questions (booking) — all from 02/06 projections | public, edge-cached (tag `tenant:{id}:catalog`) |
+| `portal.visit.record` | `POST /api/portal/v` (beacon) | `{visitorId?, landingPath, referrer, utm, clickIds, src, embedParentOrigin?}` | `204` | public; batched; consent-aware |
+| `portal.link.resolve` | `GET /s/{slug}`, `/go/{code}`, `/q/{qrId}` | path | `302` to `/` with prefill params + `src` | public; increments counters |
+
+### 8.2 Public: booking session
+
+| Name | Path | Input | Output | Auth |
+|---|---|---|---|---|
+| `booking.session.start` | `POST /api/booking/sessions` | `{visitorId, prefill?: DeepLinkPrefill, attribution, channel}` | `{sessionId, sessionSecret, version, steps: StepPlan}` | public |
+| `booking.session.get` | `GET /api/booking/sessions/{id}` | — | full session (minus secrets) + `StepPlan` | session |
+| `booking.session.update` | `PATCH /api/booking/sessions/{id}` | partial `{cart?, location?, answers?, intake?, contact?, draftAssets?, codes?}` + `If-Match` | updated session, new `StepPlan`, `quote?` | session |
+| `booking.session.checkArea` | `POST …/{id}/location` | `{address \| shopId}` | `{inArea, zone?, travelFeeCents?, taxRatePpm?, eligibleServiceIds, alternatives?: shops[]}` (wraps 02 `coverage.resolveLocation` / `coverage.resolveShop`) | session |
+| `booking.session.availability` | `GET …/{id}/availability?from&to` | date range ≤ 62 days | 03's day/slot list (`slot.token` opaque) + `ttlSec` | session |
+| `booking.session.hold` | `POST …/{id}/hold` | `{slotToken}` | `{holdId, expiresAt, start, end}` / `409 SLOT_TAKEN {alternatives}` (wraps 03 `scheduling.hold.create`) | session |
+| `booking.session.extendHold` | `POST …/{id}/hold/extend` | — | `{expiresAt}` / `410 HOLD_EXPIRED` | session |
+| `booking.session.quote` | `POST …/{id}/quote` | — | `{quoteId, quoteHash, lines, totals, dueNowCents, dueLaterCents, expiresAt}` (02 `catalog.priceSelection` + 05 `payments.quoteTotals`) | session |
+| `booking.session.applyCode` | `POST …/{id}/codes` | `{code}` | `{kind, status, message, quote}` (06 validation; referral via 06/08) | session; 10 attempts/session |
+| `booking.session.acceptTerms` | `POST …/{id}/terms` | `{termsVersionId}` | `{acceptedAt}` | session |
+| `booking.session.preparePayment` | `POST …/{id}/payment` | `{quoteHash}` | `{paymentSessionId, clientSecret, mode, amountCents}` (05 `payments.prepareBookingPayment`) | session |
+| `booking.session.confirm` | `POST …/{id}/confirm` | `{quoteHash, paymentSessionId?}` + `Idempotency-Key` (= sessionId) | `200 {bookingId, jobId, jobNumber, start, end, publicToken, manageUrl}` / `409 QUOTE_CHANGED \| SLOT_TAKEN \| HOLD_EXPIRED` / `202 {status:'needs_attention'}` | session |
+| `booking.session.resume` | `GET /r/{resumeToken}` | — | redirect into restored session | public (token) |
+| `booking.session.uploadUrl` | `POST …/{id}/uploads` | `{questionId, contentType, size}` | pre-signed upload target (quarantine bucket) | session; ≤ 5 files × 10 MB |
+| `booking.request.submit` | `POST …/{id}/request` | `{note?}` | `{leadId}` — "ask us anyway"/request-a-time/degraded mode | session |
+
+`StepPlan` = ordered list of `{step: StepKey, required, complete, skippedReason?}` computed server-side
+(§10.3) so web, embed, native app and MCP agents run the same flow logic.
+
+### 8.3 Customer auth & account
+
+| Name | Input | Output | Auth |
+|---|---|---|---|
+| `portal.auth.requestCode` | `{identifier (phone/email), channel?}` | `{challengeId}` (always 200; no enumeration) | public, rate-limited |
+| `portal.auth.verifyCode` | `{challengeId, code, trustDevice}` | sets cookie; `{customer summary}` | public |
+| `portal.auth.magicLink` | `GET /auth/m/{token}` | sets cookie, redirect | public (token) |
+| `portal.auth.handoff` | `GET /auth/handoff?t=` | sets cookie on canonical host | public (one-time token, 60 s) |
+| `portal.auth.signOut` | — | clears session | customer |
+| `portal.me.get` / `.update` | profile fields, notification prefs, theme preference | profile | customer |
+| `portal.me.intake.get` / `.update` | answers | answers (stored by 07) | customer |
+| `portal.assets.list/create/update/archive` | asset fields (07 schema) | asset | customer (proxy to 07) |
+| `portal.vehicle.lookup` | `{vin} \| {plate, region} \| {year, make?, model?}` | candidates (07) | session or customer; rate-limited |
+| `portal.addresses.list/create/update/delete` | address | address | customer (proxy to 07) |
+| `portal.appointments.list` | `{status: upcoming\|past, cursor}` | appointments | customer |
+| `portal.appointments.get` | `{jobPublicId}` | detail incl. policy snapshot, actions allowed | customer or booking `publicToken` |
+| `portal.appointments.rescheduleOptions` | `{jobPublicId, from, to}` | slots + fee preview | customer/publicToken |
+| `portal.appointments.reschedule` | `{jobPublicId, slotToken, expectedVersion}` + Idempotency-Key | updated appointment, fee charged | customer/publicToken (+OTP step-up if configured) |
+| `portal.appointments.cancelPreview` | `{jobPublicId, scope: this\|future}` | `{feeCents, refundCents, creditCents, policyText, offerReschedule}` | customer/publicToken |
+| `portal.appointments.cancel` | `{jobPublicId, scope, reasonKey?, text?}` + Idempotency-Key | `{status:'cancelled', feeCents, refundCents}` | customer/publicToken |
+| `portal.appointments.rebook` | `{jobPublicId}` | new booking session prefilled (+ list of unavailable items) | customer |
+| `portal.paymentMethods.*` | list/add (SetupIntent via 05)/remove/setDefault | — | customer |
+| `portal.subscriptions.list/purchase/cancel/pause` | per 06 commands | — | customer |
+| `portal.giftcards.quote/purchase` | design, amount, recipient, message, deliverAt | `{giftCardPublicId, receiptUrl}` | public (purchase) / customer (history) |
+| `portal.giftcards.balance` | `{code}` | `{balanceCents, expiresAt?}` | public, rate-limited 10/min/IP |
+| `portal.referrals.get` | — | `{code, shareUrl, rewards[]}` (06/08) | customer |
+| `portal.invoices.get/pay` | `{token}` | invoice + 05 payment session | public (token) |
+| `portal.quotes.get/accept` | `{token}` | quote; accept → booking session prefilled & locked (4.10) | public (token) |
+
+### 8.4 Tracking
+
+| Name | Input | Output | Auth |
+|---|---|---|---|
+| `portal.tracking.get` | `GET /t/{token}` | `{status, eta, worker:{firstName, photoUrl}, vehicle?, serviceAddress(approx), timeline}` | public (token) |
+| `portal.tracking.stream` | SSE/WebSocket `/t/{token}/stream` | location/ETA/status events (≤ 1 per 5 s) | public (token) |
+
+### 8.5 Admin (CRM) — portal settings, domains, links
+
+| Name | Input | Output | Auth |
+|---|---|---|---|
+| `portal.settings.getDraft` / `.saveDraft` | `PortalConfig` partial | draft + validation warnings (contrast, missing terms…) | `staff:settings.online_booking.manage` |
+| `portal.settings.publish` | `{note?}` | `{version}` | same |
+| `portal.settings.versions` / `.rollback` | `{version}` | — | same |
+| `portal.preview.token` | — | short-lived URL rendering draft config + draft theme | same |
+| `portal.questions.list/create/update/reorder/archive` | `BookingQuestion` | — | same (service-scoped ones also `settings.catalog.manage`) |
+| `portal.terms.publish` | `{kind, url \| body}` | `TermsVersion` | same |
+| `portal.cancellationPolicy.update` | `CancellationPolicy` | new version | same |
+| `portal.analytics.update` | `AnalyticsIntegration[]` | validated list | same |
+| `portal.domains.add` | `{hostname, purpose, mode}` | `CustomDomain` + records to add + provider guide | `staff:settings.online_booking.manage` + owner/admin role |
+| `portal.domains.check` | `{domainId}` | `DnsDiagnostics`, status | same; 1 per 10 s |
+| `portal.domains.remove` | `{domainId}` | — | same |
+| `portal.domains.setCanonical` | `{domainId}` | — | same |
+| `portal.links.list/create/update/archive` | `ShortLink` | — | same |
+| `portal.qr.create/download` | `{shortLinkId \| target, label, format, size, fg, withLogo}` | file | same |
+| `portal.embed.snippet` | `{mode, start, options}` | HTML snippet | same |
+| `portal.sources.report` | `{from, to, groupBy}` | rows per source: visits, sessions, contacts, bookings, revenue, conversion | `staff:marketing.analytics.view` (09) |
+| `portal.funnel.report` | `{from, to, sourceKey?}` | step-by-step drop-off counts | same |
+| `portal.sessions.list` | `{status, from, to}` | live booking attempts (for lead board, 07 is primary) | same |
+
+### 8.6 System / internal
+
+| Name | Purpose | Caller |
+|---|---|---|
+| `portal.edge.resolveHost` | KV read; fallback RPC on KV miss | edge |
+| `portal.tls.ask` | `{hostname}` → `200` allow / `403` deny on-demand issuance | edge TLS terminator |
+| `portal.domains.verifierTick` | scheduled DNS checks | scheduler |
+| `booking.sessions.sweep` | inactivity → abandoned/expired; release holds | scheduler (every 1 min) |
+| `booking.reconcile.run` | orphan payment intents vs sessions (§10.6) | scheduler (every 5 min) |
+| `portal.bookingBaseUrl` | `{tenantId}` → canonical healthy base URL | 08, 04, 05, 06 when generating links |
+
+**Bookings-MCP parity [S: llms]:** each tool in the customer-level MCP maps 1:1 onto §8.2–§8.4
+(e.g. `list_services` → `portal.catalog.get`, `get_availability` → `booking.session.availability`,
+`book` → `booking.session.confirm`). Payment by an agent is always a **pay link** sent to the
+customer (05 hosted page), never raw card data through the agent [D].
+
+---
+
+## 9. Interfaces with other modules
+
+### 9.0 Event naming reconciliation (for Agent 10)
+
+Sections 4 and 6 use short working names `portal.session.*` / `portal.booking.*`. Other agents'
+specs already consume different names for the same facts. **Canonical names this module publishes
+are the left column**; the right column lists the names other specs used, which Agent 10 should map
+or rename in the master event catalog. One fact = one event; no double-publishing.
+
+| Canonical (01 publishes) | Same fact as named elsewhere | Consumers |
+|---|---|---|
+| `booking.session.started` | `portal.session.started` (§4/§6), `booking.attempt.started` (07) | 07, 08 (funnel) |
+| `booking.session.step_reached` | `portal.session.step_reached`, `booking.attempt.step_reached` (07) | 07 |
+| `booking.session.contact_captured` | `portal.session.contact_captured`, `booking.attempt.contact_captured` (07); 08 uses this name | 07, 08 |
+| `booking.session.abandoned` | `portal.session.abandoned`, `lead.attempt.abandoned` (07 derives its own) ; 03 & 08 use this name | 07, 08, 03 |
+| `booking.session.expired` | `booking.attempt.expired` (07) | 07 |
+| `booking.session.payment_started` | `portal.session.payment_started` | 07 (high-intent flag) |
+| `booking.appointment.created` (payload `source: online \| embed \| popup \| app \| agent`, `sessionId`, `jobId`) | `portal.booking.confirmed` (§4/§6), `booking.attempt.completed` (07); 07 & 08 consume `booking.appointment.created` | 07, 08 (N-B confirmation, A-01), 06, 10 |
+| `booking.appointment.requested` | request/approval mode (§7 `confirmationMode='request'`); 08 N-B02 | 08, 04 |
+| `booking.session.failed` | `portal.booking.failed` | 08 (ops alert when `needs_attention`) |
+| `booking.reschedule.completed` | `portal.reschedule.completed`; 08 consumes `booking.appointment.rescheduled` (emitted by 03 as `scheduling.job.rescheduled`) | 08 |
+| `booking.cancellation.completed` | `portal.cancellation.completed`; 08 `booking.appointment.canceled`; 04 `jobs.job.cancelled` | 08, 06 |
+| `booking.feedback.submitted` | `portal.feedback.submitted` | 08 (reports) |
+| `portal.domain.activated` | 05 consumes `booking.domain.verified` | 05 (wallet domain registration), 08 (link base) |
+| `portal.domain.detached` / `portal.domain.reattached` / `portal.domain.removed` | — | 05, 08 |
+| `portal.config.published` | — | 08 (email branding uses booking link), edge |
+| `portal.account.created` | 07 consumes `portal.account.registered`; 08 `customer.account.created` | 07, 08 |
+| `portal.account.signed_in` | 09 `auth.session.created` is staff-side; keep separate | 08 (security notice optional) |
+| `portal.auth.challenge_created` | 08 consumes `auth.challenge.created` (N-A02 login code) | 08 |
+| `portal.qr.scanned` | same name in 07 | 07, 08 |
+| `portal.shortlink.clicked` | 02 has `catalog.shortlink.dead_hit` for unknown/unpublished slugs | 08 (reports), 02 |
+| `portal.visit.recorded` (aggregated) | — | 08 (dashboard "portal visits" [S: T05]) |
+| `portal.giftcard.purchase_requested` | 06 emits `giftcards.card.issued`; 08 `giftcard.giftcard.purchased` | 06 |
+| `portal.subscription.purchase_requested` | 06 emits `subscriptions.subscription.activated` | 06 |
+| `portal.referral.applied` | 08 `referral.code.issued` / `referral.referral.rewarded` | 06, 08 |
+| `portal.tracking.viewed` | — | 08 (optional analytics) |
+| `portal.terms.accepted` | — | 07 (consent ledger), 05 (card-on-file consent proof) |
+
+### 9.1 Agent 02 — Catalog & Coverage
+
+| Direction | What | Contract |
+|---|---|---|
+| CONSUMES (query) | Public catalog projection | categories (name, icon/image → icon via 11, mobile/shop flag [S: T06]), services (public fields, variants, recurring options [S: T06], duration, image, **short-link slug** [S: T06]), customer add-ons + categories + pairings + stock state [S: T07]. Company add-ons and cost **never** in the public projection [S: T07]. |
+| CONSUMES (query) | `catalog.priceSelection` | line pricing & durations for display (no totals) — 01 never computes prices |
+| CONSUMES (query) | `coverage.resolveLocation`, `coverage.resolveShop` | `{covered, primaryZoneId, travelCharge, taxRate, eligibleServiceIds, nearestZone}`; shop distance filter [S: T11] |
+| CONSUMES (events) | `catalog.revision.published`, `catalog.service.published/archived/price_changed`, `catalog.addon.published/archived`, `catalog.addon_pairing.changed`, `coverage.zone.*`, `coverage.shop.*`, `inventory.stock.depleted/restored` | purge edge cache tag `tenant:{id}:catalog` ≤ 5 s; in-flight sessions re-quote at commit |
+| PRODUCES | `coverage.location.out_of_area_attempted` input (01 calls 02's event/command on out-of-area with address) ; `portal.shortlink.clicked`; unknown slug → 02's `catalog.shortlink.dead_hit` | 02 owns slug uniqueness; 01 owns the redirect route |
+| SLA | public projection read p99 < 50 ms from cache; `resolveLocation` p95 < 300 ms (geocode cached) |
+
+### 9.2 Agent 03 — Scheduling & Dispatch
+
+| Direction | What | Contract |
+|---|---|---|
+| CONSUMES (query) | `scheduling.availability.search` | input lines, location, range ≤ 62 d, channel `online`; output days/slots with opaque `token`, route-day entries with label "Anytime Thursday" [S: T02], `ttlSec` (default 60). **01 never caches slots longer than `ttlSec`.** |
+| CONSUMES (command) | `scheduling.hold.create/extend/release` | idempotency key = sessionId + slot token; TTL 10 min, max total 20 min (aligned with §5.4) |
+| CONSUMES (command) | `scheduling.booking.commit(holdId, jobDraft, idempotencyKey)` | atomic: confirm hold → create appointment (with 04 job id) → auto-dispatch [S: llms]; returns `{jobId, jobNumber, start, end, workerIds?}` or `409 SLOT_TAKEN` |
+| CONSUMES (command) | `scheduling.job.reschedule(jobId, slotToken, expectedVersion)` | for B4 |
+| CONSUMES (events) | `scheduling.hold.expired` (UI notice), `scheduling.job.rescheduled` / `scheduling.job.unscheduled` (refresh account views), `scheduling.dispatch.decided` (show assigned pro on confirmation/account), `schedule.eta.updated` (tracking ETA) | — |
+| PRODUCES | `booking.session.abandoned` (03 releases holds defensively), hold release on step-back | — |
+
+### 9.3 Agent 04 — Job lifecycle
+
+| Direction | What | Contract |
+|---|---|---|
+| CONSUMES | single job ID & job number for confirmation [S: T04]; job status for account/tracking; quote documents (`/q/{token}`) & invoices (`/i/{token}`) render data | job public id is unguessable; job number is display-only |
+| CONSUMES (events) | `jobs.job.status_changed`, `job.job.on_my_way` / `job.job.en_route`, `jobs.job.started`, `jobs.job.completed`, `jobs.job.cancelled`, `jobs.quote.sent/accepted`, `jobs.invoice.issued/paid` | drive tracking link lifecycle (§6.7), account views, quote→book (4.10) |
+| PRODUCES | job draft inside `scheduling.booking.commit` (lines, answers, assets, address, notes, terms acceptance id, cancellation policy snapshot id, source) ; `CancelJob(by:'customer', reasonKey)` command | 04 owns cancellation side-effects on the job; 01 owns policy evaluation & feedback |
+
+### 9.4 Agent 05 — Payments
+
+| Direction | What | Contract |
+|---|---|---|
+| CONSUMES (query) | `payments.quoteTotals` | authoritative totals, tax order, deposit/due-now; 01 shows exactly this |
+| CONSUMES (command) | `payments.prepareBookingPayment({draftBookingId=sessionId, customer, lines, zoneId, discountCodes, giftCards})` → `{paymentSessionId, clientSecret, mode}`; `payments.confirmBookingPayment(paymentSessionId)` server-side during saga | modes: after-job, card-on-file (now/after), deposit, prepayment, pre-auth [S: T04][S: T16] |
+| CONSUMES (UI component) | processor-hosted payment element (card, Apple Pay, Google Pay) embedded in A12 & B9 (SAQ-A) | 05 provides the component; 01 provides the container, theme tokens (11) and copy |
+| CONSUMES (command) | cancellation fee charge / deposit refund / credit; reschedule fee | input = 01's computed fee + policy snapshot id; 05 executes & is idempotent on `(jobId, 'cancel_fee')` |
+| CONSUMES (events) | `payments.payment.succeeded/requires_action/authorized`, `payments.payment.failed`, `payments.refund.succeeded` | session state transitions & account receipts |
+| PRODUCES | `portal.domain.activated/detached/removed` (05 registers/unregisters wallet domains — **05 listens for `booking.domain.verified`; Agent 10 to align**); `portal.terms.accepted` (card-on-file consent proof) | — |
+| Rule | Never charge an amount whose `quoteHash` the customer didn't see; void/cancel intents if saga fails before job creation | — |
+
+### 9.5 Agent 06 — Subscriptions, discounts, gift cards, referral rewards
+
+| Direction | What | Contract |
+|---|---|---|
+| CONSUMES (query) | packages flagged self-purchase / upsell-during-booking [S: T01], commitment options, included discounts | portal never shows CRM-only packages |
+| CONSUMES (command) | discount code validate → reserve at commit (`discounts.redemption.reserved` → `committed`); gift card balance/redeem; referral code validate; subscription purchase/cancel/pause; gift card purchase/issue | reservation tied to sessionId, released on abandon/expire |
+| CONSUMES (events) | `giftcards.card.issued` (confirmation page), `subscriptions.subscription.activated/cancel_scheduled`, `subscriptions.package.published/archived` (cache purge) | — |
+| PRODUCES | `portal.giftcard.purchase_requested`, `portal.subscription.purchase_requested`, `portal.referral.applied`, `booking.appointment.created` (for referral reward evaluation and first-booking promos) | — |
+
+### 9.6 Agent 07 — Customers, leads, assets, abandoned bookings
+
+| Direction | What | Contract |
+|---|---|---|
+| PRODUCES (events) | full session telemetry (§9.0): started, step_reached (per step, not keystroke), contact_captured (name/phone/email/address + consent flags), payment_started, abandoned, expired, appointment.created | 07 owns the lead / abandoned-booking record, magic-data enrichment [S: T10][S: T20], dedupe, lead board |
+| CONSUMES (command) | `MatchCustomer` (silent, server-only — result never revealed to an unauthenticated visitor), `UpsertCustomer` with addresses, assets, intake answers at commit; asset CRUD for B6; vehicle lookup (VIN/plate/YMM [S: llms]) | 07 owns schemas for assets & intake storage |
+| CONSUMES (events) | `customer.customer.merged` (re-point PortalIdentity), `customer.customer.erased` (delete PortalIdentity, sessions), `customer.consent.changed`, `customer.asset.updated`, `customer.intake.updated` | — |
+| PRODUCES | `portal.account.created` (07 expects name `portal.account.registered`), `portal.account.deleted`, `portal.qr.scanned` | linking rules (verified identifier only) per 07 §state machine |
+
+### 9.7 Agent 08 — Notifications, marketing, reporting
+
+| Direction | What | Contract |
+|---|---|---|
+| PRODUCES | every customer-facing trigger above; 01 sends **no** messages itself. Payloads include `links.*` computed by `portal.bookingBaseUrl` (manage link, resume link, tracking link, invoice/quote link) | 08 owns templates/consent; 08's `links.booking` variable = `portal.bookingBaseUrl(tenant)` |
+| Triggers fired by 01 (catalog in 08) | booking confirmation (online), request received (approval mode), reschedule confirmation, cancellation confirmation (+fee/refund), OTP / magic link (`auth.challenge.created`), resume-your-booking (abandoned; consent-gated), gift card delivery & receipt, subscription welcome, tracking link (on-my-way, triggered by 04's event but link minted by 01), domain activated/detached alerts to owner, cert renewal failing alert to owner | — |
+| CONSUMES (query) | 08's consent state for the contact step checkbox text (TCPA disclosure in 08 §consent table) | 01 renders 08's exact disclosure string per locale |
+| CONSUMES | review page & unsubscribe page are **hosted on the booking host** (08 specs say so) → 01 provides routing/theming shell; 08 provides content | — |
+| PRODUCES (reporting) | `portal.visit.recorded` aggregates, funnel counts, booking-source attribution per booking | 08 renders dashboard tiles ("booking sources" [S: T05]) |
+
+### 9.8 Agent 09 — Team, permissions
+
+| Direction | What | Contract |
+|---|---|---|
+| CONSUMES | permission `settings.online_booking.manage` (portal settings), owner/admin role for domains, `marketing.analytics.view` for reports; worker public profile (first name, photo, optional bio) for confirmation & tracking | worker phone/last name never exposed unless tenant opts in |
+| CONSUMES (events) | `team.member.deactivated` (remove from "choose your pro" list; revoke live tracking links), `team.location.pinged` (via 03/04 → tracking stream) | — |
+
+### 9.9 Agent 11 — Branding, theming & responsive design system (added 2026-11-13)
+
+| Direction | What | Contract |
+|---|---|---|
+| CONSUMES (query) | compiled theme tokens for light + dark (colors, shadows, radius, density, typography scale, font faces) and asset manifest (logos per placement incl. `portal_header`, `portal_header_mobile`, `favicon`, `app_icon`, `og_image`, light/dark variants with sizes; icon map for categories/services/nav) — versioned (`themeId`, `themeVersion`) | delivered as one ≤ 4 KB CSS block + manifest JSON; fonts as WOFF2 URLs on our CDN |
+| CONSUMES (events) | `branding.theme.published` (name to be fixed by 11/10) → purge `tenant:{id}:config` and re-render hero/OG images | ≤ 5 s propagation |
+| PRODUCES | portal constraints: contrast minima (AA), max font files/weights preloaded, required logo placements & aspect-ratio bounds, breakpoints used by the portal (phone < 600 px, tablet 600–1024, desktop > 1024), embed/popup sizing | 11 validates uploads against these |
+| Shared | Style screen §3.D1 becomes a portal-specific tab inside 11's brand editor (live preview of booking flow in light & dark, phone/tablet/desktop) | 01 supplies preview routes `portal.preview.token` |
+
+### 9.10 Agent 10 — integrator notes
+- Saga ownership: 01 orchestrates the online booking saga; 03's `scheduling.booking.commit` is the
+  single atomic reservation point; 05 verifies payment server-side inside it. Same saga is reused
+  by MCP agents and by the future native customer app.
+- `portal.bookingBaseUrl` is the only allowed way for any module to generate customer links.

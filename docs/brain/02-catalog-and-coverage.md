@@ -1366,3 +1366,572 @@ Event envelope `[I]` (Agent 10 finalises): `{eventId, type, businessId, occurred
 
 **Agent 10 — Integrator**
 - Owns final event envelope, signup event name, and conflict resolution of D1–D5.
+
+**Agent 11 — Branding, Theming & Responsive Design System** (added per BRIEF owner requirements 2026-11-13)
+- **Custom icons for categories, services, add-on categories, zones and shops are owned by Agent 11** (icon-set choice, SVG upload, sanitisation, light/dark variants, sizing). Agent 02 stores only an `IconRef` (`{kind: 'builtin'|'upload', key}`) pointing at Agent 11's icon registry; the icon pickers in §3.3, §3.11, §3.13 are Agent 11 components embedded in 02's screens. Validation rules quoted in §3 (≤ 256 KB, sanitised SVG) defer to 11's final rules.
+- Category/service/add-on **images** remain 02 content assets (`ImageAsset`), but rendering (radius, shadows, aspect crops, dark-mode treatment) follows 11's tokens.
+- Zone polygon fill colors on the booking-site map (`zonesForMap.color`) must be derived from the tenant palette with sufficient contrast in light and dark mode; 02 stores a palette **token name** (e.g. `zone.1`) by default, a raw hex only when the owner overrides `[I]`.
+- Customer-facing labels that originate in the catalog are owner content (service names, question prompts); generic labels around them ("Travel fee", "Sold out", "Anytime {day}", out-of-area message) are copy-override keys owned by 11/01 — 02 supplies defaults only (travel charge name is owner content per `[S: T11]`).
+- All 02 admin screens must meet 11's responsive breakpoints (desktop/tablet/phone); polygon editing on phones is view-only (§3.10) and that degradation must be documented in 11's surface matrix.
+
+---
+
+## 10. Algorithms / pseudo-code
+
+### 10.1 Geocoding with cache and precision gate `[I]`
+
+```ts
+async function geocode(address: string, biasPoint?: LatLng): Promise<GeocodeResult[]> {
+  const key = sha256(normalizeAddress(address));          // lowercase, collapse spaces, expand abbreviations ("St"→"street"); unit number kept
+  const hit = await cache.get(key);
+  if (hit && !expired(hit)) return [hit];
+  const results = await withTimeout(provider.geocode(address, { bias: biasPoint, country: business.country }), 3000)
+                   .catch(e => fallbackProvider ? fallbackProvider.geocode(address) : Promise.reject(PROVIDER_UNAVAILABLE));
+  const ranked = results.sort(byPrecisionThenRelevance);
+  if (ranked[0]) await cache.put(key, ranked[0], ttlDays = 90);
+  return ranked.slice(0, 5);
+}
+
+function acceptableForCoverage(r: GeocodeResult, mode: 'mobile'|'shop_filter'): boolean {
+  if (mode === 'mobile') return ['rooftop','interpolated','street'].includes(r.precision);
+  return true;                                             // postal/locality is fine for "shops near me"
+}
+// If precision too low for mobile: booking site asks customer to drop/confirm a pin (01 UI); CRM shows warning but allows.
+```
+
+### 10.2 Isochrone generation `[I]`
+
+```ts
+async function generateZoneGeometry(center: LatLng, minutes: number, opts): Promise<MultiPolygon> {
+  assert(minutes >= 5 && minutes <= 120);
+  const idem = hash(center.lat.toFixed(5), center.lng.toFixed(5), minutes, opts.traffic, opts.avoid.sort());
+  const cached = await isoCache.get(idem); if (cached) return cached;
+  let poly: MultiPolygon;
+  try {
+    poly = await retry(() => withTimeout(isoProvider.isochrone({
+              profile: 'driving', contourMinutes: minutes,
+              departAt: opts.traffic === 'typical' ? nextWeekday(10, 0, zoneTz) : undefined,
+              avoid: opts.avoid, denoise: 0.5, generalizeMeters: 50 }), 10_000),
+           { attempts: 3, backoff: jittered(500), retryOn: [TIMEOUT, HTTP_5XX] });
+  } catch {
+    // Fallback: circle whose radius approximates average speed × time
+    poly = circlePolygon(center, radiusKm = minutes * AVG_KMH(opts) / 60, segments = 64); // AVG_KMH ≈ 40 urban
+    poly.meta = { source: 'circle_fallback' };
+  }
+  poly = removeHolesSmallerThan(poly, 0.05 /* km² */);     // drop islands of unreachable blocks
+  poly = dropPartsSmallerThan(poly, 0.25 /* km² */, keepPartContaining = center);
+  poly = simplifyTopologyPreserving(poly, toleranceMeters = 50);   // Douglas–Peucker variant that never self-intersects
+  while (vertexCount(poly) > 2000) poly = simplifyTopologyPreserving(poly, tolerance *= 1.5);
+  const v = validate(poly); if (!v.valid) poly = makeValid(poly);  // buffer(0) style repair
+  await isoCache.put(idem, poly, ttlDays = 30);
+  return poly;
+}
+```
+
+### 10.3 Point → zone resolution with overlap rules `[I]`
+
+```ts
+function resolveZones(p: LatLng, ctx: { channel: 'online'|'crm', serviceIds?: ID[] }): { primary?: Zone; containing: Zone[] } {
+  const candidates = zoneIndex(businessId)                 // in-memory per-business R-tree, rebuilt on coverage.zone.* events
+      .query(p)                                            // bbox prefilter
+      .filter(z => z.status === 'active' || (ctx.channel === 'crm' && z.status === 'disabled')) // §5.14: disabled zones still usable in CRM
+      .filter(z => ctx.channel === 'crm' || z.acceptOnlineBookings)
+      .filter(z => pointInMultiPolygon(p, z.geometry));    // boundary-inclusive
+  const servingRequested = ctx.serviceIds
+      ? candidates.filter(z => z.serviceScope === 'all' || ctx.serviceIds!.every(id => z.serviceIds!.includes(id)))
+      : candidates;
+  const pool = servingRequested.length ? servingRequested : [];
+  pool.sort((a, b) => a.priority - b.priority              // 1. explicit priority (list order)
+                   || a.areaKm2 - b.areaKm2                // 2. smaller (more specific) zone wins
+                   || haversine(p, a.center) - haversine(p, b.center)   // 3. closer center
+                   || a.id.localeCompare(b.id));           // 4. deterministic tie-break
+  return { primary: pool[0], containing: candidates };
+}
+
+function pointInMultiPolygon(p, mp): boolean {
+  for (const polygon of mp.coordinates) {
+    const [outer, ...holes] = polygon;
+    if (onBoundary(p, outer) ) return true;                // inclusive (epsilon 1e-9 deg)
+    if (!rayCast(p, outer)) continue;
+    if (holes.some(h => rayCast(p, h) && !onBoundary(p, h))) continue;  // inside a hole = outside (hole edge counts as inside zone)
+    return true;
+  }
+  return false;
+}
+// Planar ray casting on lng/lat is acceptable at city scale (< 300 km); zones crossing the antimeridian are rejected at validation.
+```
+
+### 10.4 Full coverage resolution `[I]`
+
+```ts
+async function resolveLocation(input, caller): Promise<CoverageResolution> {
+  const pt = input.location.lat ? input.location : (await geocode(input.location))[0] ?? throwErr('ADDRESS_NOT_FOUND');
+  const { primary, containing } = resolveZones(pt, { channel: caller.channel, serviceIds: input.serviceIds });
+  const covered = !!primary;
+  const staff = unique(containing.flatMap(z => zoneStaff(z.id)));
+  const eligibleWorkerIds = staff.length ? staff
+        : (primary ? activeWorkers() /* zero-staff zone rule §5.14 */ : []);
+  const eligibleServiceIds = publishedServices()
+        .filter(s => s.fulfillment.includes('mobile') && !s.hidden)
+        .filter(s => containing.some(z => z.serviceScope === 'all' || z.serviceIds!.includes(s.id)))
+        .filter(s => s.zoneScope === 'all' || s.zoneIds!.some(id => containing.some(z => z.id === id)));
+  const tax = resolveTaxRate({ fulfillment: 'mobile', zone: primary, at: input.at ?? todayIn(primary?.timezone) });
+  const res: CoverageResolution = {
+    point: pt, precision: pt.precision ?? 'rooftop', covered,
+    primaryZoneId: primary?.id, containingZoneIds: containing.map(z => z.id),
+    travelCharge: primary?.travelCharge && primary.travelCharge.amount > 0 ? pick(primary.travelCharge) : undefined,
+    taxRatePpm: tax.ratePpm, taxLabel: tax.label, taxSource: tax.source,
+    eligibleWorkerIds: caller.isPublic ? [] : eligibleWorkerIds,
+    eligibleServiceIds,
+    nearestZone: covered ? undefined : nearestZone(pt),      // min distance from point to polygon edges, km
+    shopsInRange: shopsInRange(pt, input.serviceIds),
+    resolvedAt: now(), catalogRevisionId: publishedRevisionId(), coverageVersion: coverageVersion() };
+  if (!covered && caller.channel === 'online') emit('coverage.location.out_of_area_attempted', redact(res));
+  return res;
+}
+```
+
+### 10.5 Tax rate resolution `[I]`
+
+```ts
+function resolveTaxRate({ fulfillment, zone, shop, at, customer, jobOverride, lineTaxable }): { ratePpm: Ppm|null; label?: string; source } {
+  if (lineTaxable === false || customer?.taxExempt) return { ratePpm: 0, source: 'none' };
+  if (jobOverride != null) return { ratePpm: jobOverride, source: 'job_override' };     // 05 field [S: T16]
+  const pickRate = (rates: EffectiveTaxRate[]) => rates
+      .filter(r => r.effectiveFrom <= at).sort((a, b) => b.effectiveFrom.localeCompare(a.effectiveFrom))[0];
+  if (fulfillment === 'shop' && shop) {
+    const r = pickRate(shop.taxRates) ?? pickRate(resolveZones(shop.location, {channel:'crm'}).primary?.taxRates ?? []);
+    if (r) return { ratePpm: r.ratePpm, label: r.label, source: 'shop' };
+  }
+  if (fulfillment === 'mobile' && zone) {
+    const r = pickRate(zone.taxRates); if (r) return { ratePpm: r.ratePpm, label: r.label, source: 'zone' };  // [S: T11]
+  }
+  const d = settings.defaultTaxRatePpm;
+  return d != null ? { ratePpm: d, source: 'business_default' } : { ratePpm: null, source: 'none' };
+}
+// `at` = job's service date in the job location's timezone (not booking date) so effective-dated changes follow performance date.
+```
+
+### 10.6 Publish (validation, snapshot, atomic swap) `[I]`
+
+```ts
+async function publish(actor, expectedDraftHash, opts) {
+  return withBusinessLock(businessId, 'catalog_publish', async () => {     // serialises publishes per tenant
+    const draft = await loadDraftTree();
+    if (hashCanonical(draft) !== expectedDraftHash) throw VERSION_CONFLICT;  // someone edited after preview
+    const errors = [], warnings = [];
+    for (const s of draft.services.filter(live)) {
+      if (s.pricingMode !== 'quote_required' && s.price == null) errors.push(err(s, 'price_required'));
+      if (s.type === 'route' && !settings.routeOptimizationEnabled) errors.push(err(s, 'route_toolkit_off'));
+      if (!s.fulfillment.length) errors.push(err(s, 'fulfillment_required'));
+      if (!fulfillmentAllowedByCategory(s)) errors.push(err(s, 'category_restriction'));
+      if (imagePending(s.imageAssetId)) errors.push(err(s, 'image_processing'));
+      if (!(await anyWorkerCan(s.id))) warnings.push(warn(s, 'no_worker_for_service'));
+      if (!coverageServes(s)) warnings.push(warn(s, 'no_zone_or_shop_offers_service'));
+    }
+    for (const c of draft.categories.filter(live)) if (!draft.services.some(s => live(s) && !s.hidden && s.categoryId === c.id))
+      warnings.push(warn(c, 'empty_category_hidden_online'));
+    for (const p of draft.pairings) if (!live(byId(p.serviceId)) || !live(byId(p.addOnId))) p.enabled = false; // silently pruned
+    if (errors.length) return { status: 'rejected', errors, warnings };
+    const internal = buildInternalSnapshot(draft);
+    const pub = buildPublicSnapshot(internal);           // strips cost, company add-ons, notes, stock, worker ids; merges global questions
+    assertSize(gzip(pub) <= 300_000);                    // hard cap 300 KB; budget 30 KB
+    const prev = await getLiveRevision();
+    const rev = await insertRevision({ number: (prev?.number ?? 0) + 1, internal, pub, diff: diff(prev?.internal, internal), status: 'ready' });
+    const swapped = await cas('business.publishedRevisionId', prev?.id ?? null, rev.id);
+    if (!swapped) { await markRejected(rev); throw VERSION_CONFLICT; }
+    await markSuperseded(prev); await clearUnpublishedFlags(draft);
+    await outbox.add('catalog.revision.published', { revisionId: rev.id, number: rev.number, diff: summarize(rev.diff) });
+    for (const ch of rev.diff.priceChanges) await outbox.add('catalog.service.price_changed', { ...ch, revisionId: rev.id, applyToFutureRecurring: !!opts.applyPriceToFutureRecurring });
+    // cache purge happens in outbox consumer (retryable), not inline
+    return { status: 'live', revisionId: rev.id, number: rev.number, warnings };
+  });
+}
+```
+- Events go through a transactional **outbox** written in the same transaction as the pointer swap, so a crash never publishes without events or vice-versa `[I]`.
+
+### 10.7 Price selection (preview pricing for 01/03/05) `[I]`
+
+```ts
+function priceSelection(req, caller): PriceSelectionResult {
+  const rev = loadRevision(req.revisionId ?? publishedRevisionId());
+  const lines: PricedLine[] = []; const warnings = [];
+  let work = 0, buffer = 0;
+  for (const l of req.lines) {
+    const s = rev.service(l.serviceId) ?? throwErr('SERVICE_NOT_AVAILABLE');
+    if (!s.fulfillment.includes(req.fulfillment)) throwErr('FULFILLMENT_NOT_OFFERED');
+    const sel = l.variationSelections ?? autoSelectFromAsset(s, req.customerAssetId);  // 07 asset attributes
+    let price = s.price ?? 0, cost = s.cost, dur = s.duration;
+    for (const g of s.variationGroups) {
+      if (g.kind === 'single_choice') {
+        const o = g.options!.find(o => o.id === sel[g.id]) ?? (g.required ? throwErr('VARIATION_REQUIRED', g.id) : null);
+        if (!o) continue;
+        price += g.priceMode === 'replace_base' ? (o.price - (s.price ?? 0)) : o.price;
+        cost += o.costDelta; dur += o.durationDelta;
+      } else {
+        const u = clampUnits(l.units?.[g.id] ?? g.unit!.minUnits, g.unit!);
+        const billable = Math.max(0, u - g.unit!.includedUnits);
+        price += roundHalfEven(g.unit!.unitPrice * billable / 1000);
+        cost  += roundHalfEven(g.unit!.unitCost  * billable / 1000);
+        dur   += g.unit!.unitDuration * billable;
+      }
+    }
+    for (const a of answerSurcharges(s, l.questionAnswers)) { price += a.priceDelta ?? 0; dur += a.durationDelta ?? 0; }
+    if (s.pricingMode === 'hourly') price = roundHalfEven(s.hourlyRate! * dur / 3600);
+    lines.push({ kind: 'service', refId: s.id, label: s.name, detail: labels(sel), qty: 1, unitPrice: Math.max(0, price),
+                 amount: Math.max(0, price), cost, duration: Math.max(300, dur), taxable: s.taxable, catalogRevisionId: rev.id });
+    work += Math.max(300, dur); buffer = Math.max(buffer, s.bufferAfter);
+  }
+  for (const a of req.addOns) {
+    const ad = rev.addOn(a.addOnId);
+    if (!ad || (caller.isPublic && ad.audience === 'company')) throwErr('ADDON_NOT_AVAILABLE');
+    if (!req.lines.some(l => rev.paired(ad.id, l.serviceId))) throwErr('ADDON_NOT_PAIRED');
+    const qty = ad.quantity.selectable ? clamp(a.qty, ad.quantity.min, ad.quantity.max) : 1;
+    if (stockAvailable(ad) < qty && ad.outOfStock !== 'allow_backorder') (caller.isPublic ? throwErr('OUT_OF_STOCK') : warnings.push('out_of_stock'));
+    const d = ad.extraDuration * (ad.durationScalesWithQty ? qty : 1);
+    lines.push({ kind: ad.audience === 'company' ? 'company_addon' : 'addon', refId: ad.id, label: ad.name, qty,
+                 unitPrice: ad.price, amount: ad.price * qty, cost: ad.cost * qty, duration: d, taxable: ad.taxable, sku: ad.sku, catalogRevisionId: rev.id });
+    work += d;
+  }
+  const cov = req.fulfillment === 'mobile' ? resolveLocation({ location: req.location, serviceIds: req.lines.map(l => l.serviceId) }, caller) : null;
+  if (req.fulfillment === 'mobile' && !cov!.covered && !caller.canOverrideCoverage) throwErr('OUT_OF_AREA');
+  let travelLine;
+  if (cov?.travelCharge) {
+    const preSubtotal = sum(lines.map(l => l.amount));
+    const waived = cov.travelCharge.waiveAboveSubtotal != null && preSubtotal >= cov.travelCharge.waiveAboveSubtotal;
+    const n = cov.travelCharge.mode === 'per_mobile_service' ? lines.filter(l => l.kind === 'service').length : 1;
+    if (!waived) travelLine = { kind: 'travel_fee', refId: cov.primaryZoneId, label: cov.travelCharge.name, qty: n,
+                                unitPrice: cov.travelCharge.amount, amount: cov.travelCharge.amount * n, cost: 0, duration: 0,
+                                taxable: cov.travelCharge.taxable, catalogRevisionId: rev.id };
+  }
+  const tax = req.fulfillment === 'shop' ? resolveTaxRate({ fulfillment: 'shop', shop: shopById(req.location.shopId), ... })
+                                         : { ratePpm: cov!.taxRatePpm, source: cov!.taxSource };
+  const rd = req.recurringFrequencyId ? recurringDiscountSpec(rev, req) : undefined;    // spec only; 05 applies
+  return { lines: stripCostIfNeeded(lines, caller), travelLine, taxRatePpm: tax.ratePpm, taxSource: tax.source,
+           recurringDiscount: rd, totalWorkDuration: work, blockedDuration: work + buffer, revisionId: rev.id, warnings };
+}
+```
+
+### 10.8 Template instantiation `[I]`
+
+```ts
+function instantiateTemplate(t: PricingTemplate, mode, currency) {
+  const idMap = new Map<string, ID>();                     // template-local keys → new IDs
+  tx(() => {
+    if (mode === 'replace') for (const e of liveCatalogEntities()) referenced(e) ? setHidden(e) : archive(e);
+    for (const c of t.payload.categories) {
+      const name = mode === 'add_alongside' && nameTaken(c.name) ? `${c.name} (template)` : c.name;
+      idMap.set(c.key, createCategory({ ...c, name, status: 'draft' }));
+    }
+    for (const s of t.payload.services) idMap.set(s.key, createService({ ...s, categoryId: idMap.get(s.categoryKey),
+          price: localPrice(s, currency), cost: localCost(s, currency), shortLinkSlug: uniqueSlug(s.name), createdVia: 'template' }));
+    for (const ac of t.payload.addOnCategories) idMap.set(ac.key, createAddOnCategory(ac));
+    for (const a of t.payload.addOns) idMap.set(a.key, createAddOn({ ...a, categoryId: idMap.get(a.categoryKey), price: localPrice(a, currency) }));
+    for (const p of t.payload.pairings) setPairing(idMap.get(p.addOnKey), p.serviceKeys === 'all' ? 'all' : p.serviceKeys.map(k => idMap.get(k)));
+  });
+  // localPrice: native regional price if present, else FX-convert then roundToNicePrice (…9 or …5 endings, ≥ 1 major unit)
+}
+```
+
+### 10.9 Duplicate service (deep copy) `[I]`
+
+```ts
+function duplicateService(src: Service, opts): Service {
+  const copy = structuredClone(src);
+  copy.id = newId(); copy.status = 'draft'; copy.hidden = src.hidden; copy.version = 1;
+  copy.name = opts.newName ?? nextFreeName(`${src.name} (copy)`, src.categoryId);   // "(copy 2)", "(copy 3)"…
+  copy.categoryId = opts.categoryId ?? src.categoryId; copy.duplicatedFromId = src.id; copy.createdVia = 'duplicate';
+  copy.shortLinkSlug = uniqueSlug(copy.name);
+  remapIds(copy.variationGroups, copy.checklist.items, copy.questions.items, copy.recurring.frequencies); // fresh child IDs; showIf references remapped
+  if (!opts.copy.variations) copy.variationGroups = [];
+  if (!opts.copy.checklists) copy.checklist = defaultChecklistConfig();
+  if (!opts.copy.questions) copy.questions = { includeGlobal: true, items: [] };
+  if (!opts.copy.recurring) copy.recurring = defaultRecurring();
+  insert(copy);
+  if (opts.copy.pairings) copyPairings(src.id, copy.id);
+  if (opts.copy.workerSkills) requestSkillCopy(src.id, copy.id);   // command to 09
+  if (opts.copy.coverageScope) { /* zoneIds/shopIds already cloned */ } else { copy.zoneScope = 'all'; copy.shopScope = 'all'; }
+  return copy;
+}
+```
+
+### 10.10 Shops in range / distance filter `[I]`
+
+```ts
+function shopsInRange(p: LatLng, serviceIds?: ID[]) {
+  return activeShops()
+    .filter(s => s.acceptOnlineBookings)
+    .filter(s => !serviceIds || s.serviceScope === 'all' || serviceIds.every(id => s.serviceIds!.includes(id)))
+    .map(s => ({ shop: s, km: haversineKm(p, s.location) }))
+    .filter(({ shop, km }) => !shop.distanceFilter?.enabled || shop.distanceFilter.metric !== 'straight_line_km' || km <= shop.distanceFilter.max)
+    .sort((a, b) => a.km - b.km)
+    .slice(0, 25)
+    // drive_minutes filters: batch a single matrix request (origins=[p], destinations=shops) — one provider call, cached 24h by rounded p
+    .then(applyDriveMinuteFilters);
+}
+```
+
+### 10.11 Inventory reservation (idempotent, race-safe) `[I]`
+
+```ts
+async function reserve(itemId, qty, jobLineId, idemKey) {
+  if (await movements.exists(businessId, idemKey)) return movements.get(idemKey).result;   // idempotent replay
+  return tx(async () => {
+    const item = await selectForUpdate(itemId);              // or CAS loop on version
+    const available = item.onHand - item.reserved;
+    if (available < qty && item.outOfStockBehavior !== 'allow_backorder' && !callerMayOversell()) throw OUT_OF_STOCK(available);
+    await update(item, { reserved: item.reserved + qty, version: item.version + 1 });
+    await movements.insert({ type: 'reserve', qtyDelta: 0, reservedDelta: qty, jobLineId, idempotencyKey: idemKey });
+    await maybeEmitThresholdEvents(item);                     // edge-triggered low/depleted
+  });
+}
+// consume(jobLineId): reserved -= q, onHand -= q (one movement). release: reserved -= q. Each keyed by `${jobLineId}:${op}:${lineVersion}`.
+// Nightly reconciler recomputes onHand/reserved from the ledger and open job lines; mismatches → alert + auto-correct movement 'count'.
+```
+
+### 10.12 Short-link slug generation `[I]`
+
+```ts
+function uniqueSlug(name: string): string {
+  let base = slugify(name, { lower: true, strict: true, transliterate: true }).slice(0, 48) || 'service';
+  if (RESERVED.has(base)) base += '-service';                 // reserved: 'admin','api','s','book','login',…
+  let slug = base, n = 2;
+  while (shortLinks.exists(businessId, slug)) slug = `${base}-${n++}`;
+  return slug;
+}
+// Rename never changes slug automatically; owner may edit slug → old slug kept as redirect (active=true, targetId same).
+// Slug reuse by a different service is blocked for 180 days after archive to avoid misdirecting old marketing links.
+```
+
+### 10.13 Zone change impact preview `[I]`
+
+```ts
+async function previewZoneChange(zoneId, patch) {
+  const before = getZone(zoneId), after = { ...before, ...patch };
+  const jobs = await jobsApi.futureJobs({ zoneIdOrContainedBy: before.bbox ∪ after.bbox, status: ['scheduled','unassigned'] }); // 03/04 query
+  return {
+    futureJobsNowUncovered: jobs.filter(j => inside(j.point, before) && !resolveZonesWith(j.point, after).primary).map(id),
+    futureJobsFeeChanged:   jobs.filter(j => j.zoneId === zoneId && feeDiffers(before, after)).map(id),
+    futureJobsTaxChanged:   jobs.filter(j => j.zoneId === zoneId && taxDiffers(before, after, j.date)).map(id),
+    overlaps: otherActiveZones().filter(z => intersects(z.geometry, after.geometry)).map(z => z.id),
+  };
+}
+```
+
+---
+
+## 11. Edge cases & failure modes
+
+### 11.1 Catalog editing & publishing
+1. Two admins edit the same service concurrently → `version` mismatch on autosave → field-level merge dialog; never last-write-wins silently.
+2. Admin A publishes while admin B is mid-edit → B's unsaved local edits stay in B's draft queue; B's next autosave lands in the (now new) draft; B sees "Published by A 1 min ago — your changes are still unpublished".
+3. Publish preview shown, then someone edits → `expectedDraftHash` mismatch → re-preview required (prevents publishing something not reviewed).
+4. Two publishes at once → per-tenant lock + CAS; second gets `VERSION_CONFLICT`.
+5. Publish succeeds but CDN purge fails → outbox retries purge; snapshot endpoint also checks `publishedRevisionId` with 60 s max-age, so worst-case staleness ≤ 60 s.
+6. Booking session started on revision N, publish to N+1 mid-checkout → checkout re-prices against N+1; if price changed, 01 shows "Price updated from $X to $Y" and requires confirmation; if service removed, the cart line is flagged unavailable. Grace option `[I]`: honour revision N for 15 minutes after `priceSelection` returned (quote token).
+7. Service archived while in someone's cart → same as 6.
+8. Category made "Mobile only" while it contains shop-only services → validation error listing the services; offer "Switch these to mobile" bulk action.
+9. Empty category (all services hidden) → hidden online automatically; warning only.
+10. Price 0 services (free inspection) → allowed; booking site shows "Free"; Agent 05 must handle $0 jobs (no card capture unless deposit rule).
+11. Cost > price → allowed with negative-margin warning (loss leaders exist).
+12. Duration very long (multi-day jobs, e.g. 12 h ceramic coating) → allowed up to 24 h; > 24 h jobs are out of scope v1 (Q8).
+13. Variation "replace base" option cheaper than base → price decreases; must never go < 0 (clamped, validation warns).
+14. Variation group required but customer's asset doesn't map → customer must choose manually; never default silently to cheapest when asset mapping exists but is ambiguous.
+15. Asset auto-selection disagrees with customer choice → customer choice wins online; CRM shows "Asset is SUV but Sedan pricing selected" warning.
+16. Question with `showIf` referencing a deleted question → validation removes the condition and warns; on duplicate, references remapped.
+17. Global questions toggled off but a global question is marked "required for all services" (legal waiver) `[I]` → global items can be flagged `cannotBeDisabled`; per-service toggle hides only the others.
+18. Image upload of HEIC/CMYK/huge PNG → server transcodes; failure keeps the previous image and shows error; publish blocked while processing (max 60 s), then fails gracefully with "Image could not be processed".
+19. SVG icon upload with scripts → sanitised by Agent 11 pipeline; rejected if unsanitisable.
+20. Service renamed → slug unchanged; reports group by ID, display latest name; job snapshots keep old name.
+21. Unicode/emoji/RTL in names → NFC normalise; uniqueness compares case-folded NFC; max length counts grapheme clusters, not bytes.
+22. Template applied twice (`add_alongside`) → "(template)" suffix collision → "(template 2)".
+23. Template replace while recurring series reference old services → those services hidden, not archived; series continue.
+24. Route Optimization turned off in Toolkit while route services are live → route services hidden online at next publish; CRM keeps existing route jobs; warning banner.
+25. Route service with recurring weekly → allowed; Agent 03 assigns to weekly route day.
+26. Autosave offline for hours → local queue persists; on reconnect replays in order with original `expectedVersion`; conflicts surface for merge.
+27. Browser crash mid-edit → local draft recovered on reopen ("Restore unsaved changes?").
+28. Auto-publish mode + half-finished edit → auto-publish runs only after validation passes and 5 s idle; never publishes a service in invalid state (it stays draft).
+29. Rollback to revision with now-archived worker skills/zones → rollback creates a new revision; services referencing archived zones fall back to `zoneScope='all'` with warning.
+30. Very large catalogs (500+ services, e.g. multi-location franchise) → public snapshot paginated by category beyond 300 KB; admin list virtualised.
+
+### 11.2 Add-ons & inventory
+31. Add-on paired to zero services → never shown; warning "Not offered with any service".
+32. New service created → gets pairings from add-ons with `pairWithFutureServices`; owner sees them listed in the service editor (no hidden surprise).
+33. Add-on paired with service A only, cart has A and B → shown once; attached to A for duration/split.
+34. Two customers book the last unit simultaneously → atomic reservation; second gets `OUT_OF_STOCK`; booking site re-fetches and shows "Sold out" before payment, not after.
+35. Reservation leak (job deleted without event) → nightly reconciler releases reservations for lines that no longer exist.
+36. Job completed offline in worker app, synced later → consume uses idempotency key; double sync doesn't double-decrement.
+37. Job reopened after completion → `return` movement re-adds stock and re-reserves.
+38. Stock adjusted negative by count correction below reserved → available negative → status `out`; future reserved jobs flagged "Insufficient stock for job #123".
+39. Quantity limits changed after bookings exist → existing job lines keep their qty; only new selections validated.
+40. SKU duplicated across a customer add-on and a company add-on representing the same physical product → allowed if both link to the **same** `InventoryItem` `[I]` (one stock pool); otherwise SKU uniqueness error.
+41. Company add-on with editable POS price → worker enters negative or huge amount → bounds: 0 ≤ amount ≤ 10× configured price or manager approval (05/09 enforce).
+42. Add-on added after job completed → blocked `[S: T07]`; route user to invoice adjustment (05).
+43. Add-on extra duration pushes job into next appointment → warning to adder and dispatcher; never auto-reschedule.
+44. Archived add-on referenced by subscription "free add-on" entitlement → archive blocked or replacement required (06 reference index).
+
+### 11.3 Coverage
+45. Isochrone provider down/slow → 10 s timeout → circle fallback or manual draw; zone creation never blocked.
+46. Isochrone returns multipart shape with islands (bridges, rivers) → tiny parts dropped, part containing center kept, other large parts kept.
+47. Center on an island/ferry-only location → isochrone tiny; warn "This area is very small (0.4 km²) — check your center or travel time".
+48. Self-intersecting manual polygon → client highlights; server rejects or auto-repairs with confirmation showing repaired shape.
+49. Polygon crosses antimeridian → rejected (out of market scope); zones > 50,000 km² rejected.
+50. Overlapping zones with different travel fees/tax → deterministic primary per §10.3; overlap shown on map with hatching and listed in zone editor ("Overlaps Round Rock — Austin wins (priority 1)").
+51. Address exactly on a boundary → inside (deterministic).
+52. Address geocodes to postal-code centroid (rural, new build) → mobile booking requires pin confirmation; CRM warns.
+53. Geocoder returns wrong city for ambiguous street name → bias by business country and zone bboxes; show the resolved address back to the customer for confirmation.
+54. Customer address changes after booking (CRM edit) → re-resolve coverage; if zone changed → travel fee/tax recalculation proposed (05) and eligible workers re-evaluated (03); if now uncovered → requires override permission.
+55. Zone shrunk so future booked jobs fall outside → jobs are **kept** (no auto-cancel), flagged in impact preview and as "Outside service area" on the job; dispatcher decides.
+56. Zone deleted/archived with assigned workers and future jobs → staff assignments ended; jobs retain `zoneId` snapshot for reporting; future jobs flagged.
+57. Only zone archived → mobile online booking disabled; booking site shows shop services only, or "Online booking unavailable" if none; confirm dialog states this.
+58. Zone has zero staff → falls back to all eligible workers with warning (Q3); if business turns on strict mode `[I]`, zero-staff zone = not bookable online.
+59. All zone staff deactivated → `team.worker.deactivated` triggers warning on zone and on affected future jobs.
+60. Worker assigned to zone but not allowed any service offered there → 09/02 warning "Worker can't perform any service in this zone".
+61. Shop address in no zone → shop booking still works (shop is independent); shop tax falls back to business default.
+62. Shop distance filter by drive minutes but matrix provider down → fall back to straight-line with a 1.3 detour factor, log degraded mode.
+63. Customer far away with a shop service and filter off → allowed (owner chose).
+64. Business operates across timezones (zone far from HQ) → zone `timezone` used for "today", tax effective dates and route days.
+65. Tax rate changes at midnight local → effective-dated; job performed on/after date uses the new rate; jobs already invoiced unchanged.
+66. Tax rate entered as 8.25 vs 0.0825 confusion → UI accepts percent only, shows "8.25%" preview and a sample "$100 → $8.25 tax"; reject > 30%.
+67. Travel fee in a zone where business wants per-mile pricing → not supported v1 (fixed only per `[S: T11]`); open question Q9.
+68. Travel fee waived threshold uses pre-discount subtotal; discount code dropping below threshold does not re-add fee (documented) — or does? decision needed by 05 (Q10).
+69. CRM override job: no zone, no travel fee, business default tax; reporting buckets as "Outside service areas".
+70. Out-of-area event spam (bots hammering address checks) → per-IP rate limit, event dedupe per session/address hash per 24 h.
+71. Privacy: out-of-area points stored rounded (~100 m) and address hashed for analytics; full address only kept if the customer submits the lead form.
+72. Geocode cache poisoning across tenants → cache key is address-only but values are provider output (not tenant input); tenant corrections (pin moves) stored per tenant, never written to shared cache.
+
+### 11.4 Cross-module / data integrity
+73. Event delivered twice → consumers idempotent on `eventId`; inventory ops keyed by idempotency key.
+74. Event out of order (`job.line.removed` before `job.line.added`) → inventory handler checks line version; stale events ignored, reconciler fixes residue.
+75. Subscription package references a service that becomes hidden → still valid for subscription bookings (hidden ≠ archived).
+76. Discount code tied to archived service → 06 marks code partially invalid; archive dialog lists the code.
+77. Worker skill rows (09) for archived service → retained for history; excluded from dispatch.
+78. Reports grouping by category when a service moves categories → report uses job snapshot `categoryId` (historical truth) with option "current categories" `[I]`.
+79. Currency changed after setup → disallowed once any transaction exists; before that, all catalog money converted with confirmation.
+80. Bookings MCP/AI agent attempts to read cost or company add-ons → stripped server-side (public role); CRM MCP destructive ops require `confirm: true`.
+81. AI website import extracts nonsense prices ($0, $99999) → flagged low-confidence; never auto-published.
+82. Clock skew between worker device and server for consume timestamps → server time authoritative for ledger; device time stored as metadata.
+
+---
+
+## 12. Better than Fieldd
+
+### 12.1 Concrete improvements
+1. **One save/publish model with a diff.** Fieldd mixes publish (services) and autosave-live (add-ons, zones) (D2). We autosave every draft, publish atomically with a human-readable diff ("Interior Detail $149 → $159; 2 add-ons added"), and offer one-click rollback to any revision.
+2. **Draft preview link** of the booking site before publishing (signed, noindex).
+3. **Pricing variations built in** (vehicle size, bedrooms, sq ft, per-unit) with **asset auto-selection** from the customer's saved vehicle/home (07) — fewer taps for returning customers, fewer under-quoted jobs.
+4. **Price-impact guardrails:** publish dialog counts affected recurring series and asks whether to apply new prices to future occurrences — no silent price hikes, no silent revenue loss.
+5. **Coverage tester:** type any address on the Service Areas map and see covered?/zone/travel fee/tax/eligible workers instantly — removes guesswork when customers call.
+6. **Zone change impact preview** before saving (jobs that become uncovered, fees/tax changing).
+7. **Deterministic overlap rules** (priority → smallest area → nearest center), visible on the map with hatching.
+8. **Effective-dated tax rates** and tax components (state + city) with a "$100 → $8.25" preview.
+9. **Travel fee options:** per visit vs per service, waive above subtotal, exempt route services, taxable flag — all optional, defaults match Fieldd's simple fixed fee.
+10. **Inventory that actually reserves stock** for future jobs, has an append-only ledger, low-stock alerts, reorder list and CSV import/export — Fieldd shows stock fields only on the add-on `[S: T07]`.
+11. **Dead short-link protection:** renamed services keep their links; archived services' links land on a friendly fallback, not a 404.
+12. **Quick-create from CRM is safe:** creates a hidden-online service so phone bookings ("take a phone call and build a service/booking for the client live" — owner requirement) never leak unreviewed items to the public site.
+13. **AI/website import as draft with confidence scores**, never auto-live (`[S: llms]` AI setup made safer).
+14. **Tiny, cache-friendly public snapshot** (≤ 30 KB gz target, ETag + stale-while-revalidate, images by responsive URL with blurhash placeholders) → no layout shift, fast TTI on mid-range 4G phones (BRIEF performance bar).
+15. **Offline-tolerant admin editing:** local autosave queue, crash recovery, conflict merge dialog.
+16. **Accessibility:** polygon editor has a keyboard/list mode (edit vertices numerically, "expand by 2 km" buffer tool), all pickers screen-reader labelled, color is never the only zone identifier (names + patterns).
+17. **Bulk operations:** multi-select services → change category, adjust prices by % or fixed amount (with rounding to .99/.00), toggle mobile/shop, pair add-ons.
+18. **Cost privacy enforced server-side** by permission, not hidden in UI.
+19. **Stable IDs and reference index** → safe archive with "Replace with…" mapping for recurring series, subscriptions and discounts.
+20. **Native-app readiness:** every admin command in §8 is a plain API usable by the future desktop/iPhone apps (owner requirement) — e.g. a staffer on site can adjust a client's package/selected options live via `priceSelection` + job line edits.
+
+### 12.2 Budget tier notes `[I]` (final packaging decided with owner; Fieldd's tiers per `[S: llms]` gate heatmaps etc. at Pro)
+
+| Capability | Starter (just-starting business) | Growth | Pro |
+|---|---|---|---|
+| Templates, categories, services, add-ons, checklists/photos/questions, short links, recurring options | ✓ | ✓ | ✓ |
+| Pricing variations (single group) | ✓ | ✓ (3 groups) | ✓ |
+| Per-unit pricing, question surcharges | — | ✓ | ✓ |
+| Company add-ons | ✓ | ✓ | ✓ |
+| Inventory stock tracking (counts, low-stock alert) | ✓ (≤ 25 tracked items) | ✓ | ✓ |
+| Reservations ledger, reorder list, CSV inventory | — | ✓ | ✓ |
+| Service zones | 1 zone + 1 shop | 5 zones / 3 shops | unlimited |
+| Drive-time isochrone generation | ✓ (rate-limited) | ✓ | ✓ |
+| Manual polygon editing, multipart/holes | ✓ | ✓ | ✓ |
+| Travel fee per zone, custom zone tax | ✓ | ✓ | ✓ |
+| Effective-dated tax, tax components | — | ✓ | ✓ |
+| Revision rollback, draft preview link | preview ✓, rollback last 3 | ✓ | ✓ |
+| AI website import | 1 run | ✓ | ✓ |
+| Out-of-area demand heatmap | — | — | ✓ |
+
+Cost drivers to watch (feed the API keys & integrations register): geocoding calls (cache aggressively, 90-day TTL), isochrone calls (only on Draw; cached 30 days), distance-matrix calls (only for drive-minute shop filters; cached 24 h by rounded point), image processing/storage. **Integrations register entries from this module:** geocoding provider key, isochrone/routing provider key, distance-matrix key (may be same vendor), map tiles key (booking-site map + admin map; client-exposed key must be domain-restricted to the tenant booking hosts), image storage/CDN credentials, AI extraction model key (website import). All are **platform-owned** keys stored in the platform secret store, rotated at least every 90 days `[I]`; tenants never supply keys for these in v1.
+
+---
+
+## 13. Open questions
+
+| # | Question | Why it matters | Default until answered |
+|---|---|---|---|
+| Q1 | Is Fieldd's catalog screen "Settings → Pricing" or "Settings → Services" today (D1), and are add-ons separate tabs? | Navigation/IA | "Services & Pricing" with tabs |
+| Q2 | Is the zone travel charge applied once per booking or per mobile service line (D5)? | Totals | once per visit |
+| Q3 | What happens when a zone has no staff assigned — bookable by anyone or not bookable? | Solo operators vs. teams | all eligible workers + warning |
+| Q4 | Do add-on "min/max quantities" mean per-booking quantity limits or inventory par levels (D4)? | Data model & UI | model both |
+| Q5 | Does Fieldd's default zone at signup use a drive-time isochrone (what minutes?) or the city boundary? | Signup seeding | 30-min isochrone |
+| Q6 | When a service price changes, do existing recurring series re-price in Fieldd? | Revenue/customer trust | keep locked; owner opt-in to apply |
+| Q7 | Where are route days configured (per zone? per service? per worker)? Does route service carry a duration? | 02/03 boundary | 03 owns; 02 exposes optional `routeDays` |
+| Q8 | Multi-day services (e.g. 2-day paint correction) — supported? | Duration model | not v1 |
+| Q9 | Should travel charge support distance/time-based amounts (per mile beyond X) in addition to fixed? | Competitive feature | fixed only v1 |
+| Q10 | Travel-fee waiver threshold: pre- or post-discount subtotal? Is the travel fee taxable by default? | Tax compliance, 05 | pre-discount; not taxable |
+| Q11 | Are per-service checklists able to disable global checklists (as questions can)? | Worker workflow | yes (toggle) |
+| Q12 | Do add-ons require Publish in Fieldd or go live on autosave? Should our solo-operator "auto-publish" default be on? | D2, onboarding friction | off; on for signup seed only |
+| Q13 | Shop distance-based filtering: straight-line distance or drive time? Units? | Booking UX | support both, default straight-line |
+| Q14 | Are zone/shop "custom icons" map markers, or tiles on a location-choice step of the booking page? | 01/11 UI | map markers + location tiles |
+| Q15 | Can a service have different prices per zone or per shop (e.g. city vs suburbs)? | Pricing model | not v1 (use travel fee); add `ZonePriceOverride` later |
+| Q16 | Does duplicate copy add-on pairings and worker assignments in Fieldd? | Duplicate behavior | yes |
+| Q17 | Are customer questions answered per service or once per booking when the same global question applies to multiple services? | Booking UX | once per booking (deduped by question ID) |
+| Q18 | Tax-inclusive pricing for non-US tenants (AU/UK/CA GST/HST) — required at launch? | 05 tax math | flag supported, US-first |
+| Q19 | Should hidden services be bookable through short links (private offers)? | Marketing | yes via `allowViaLinkWhenHidden` |
+| Q20 | Signup event ownership (`account.business.created`) — Agent 01, 09 or 10? | Seeding trigger | Agent 10 to assign |
+
+---
+
+## 14. Verify against video
+
+The owner's walkthrough (https://youtu.be/vyELvdWCdnc, customer side) plus any future admin recording. Customer-side items first, then admin items (if the admin CRM is shown).
+
+### 14.1 Customer side (booking site on the business subdomain)
+- [ ] Are categories shown as separate pages/steps, as tabs, or as a single scrolling list? Order of categories vs. settings order. `[S: T06]`
+- [ ] Category icon style (line/filled), size, and whether an image or icon appears per category.
+- [ ] Service card layout: image position/aspect, name, description length/truncation ("read more"?), price format ("$149", "From $149"), duration shown or not.
+- [ ] Is there a vehicle-size / home-size choice? Where (before services, inside service card, as a separate step)? Does price change live?
+- [ ] Is the address asked **before** or **after** choosing services? What happens when the address is outside the service area (message text, lead capture, phone number shown)?
+- [ ] Is there a map showing service areas or shops? Marker icons (custom icons `[S: T11]`), polygon displayed or not.
+- [ ] Mobile vs shop choice: how the customer picks "we come to you" vs "visit our shop"; how shops are listed (distance shown? sorted?).
+- [ ] Is a travel fee shown? As a separate line, at which step, with what label?
+- [ ] Is tax shown separately before checkout? Label and rate shown?
+- [ ] Add-on step: categories with images `[S: T07]`, add-on cards (image, description, price, extra time shown?), quantity selectors, "sold out" states, multi-select behaviour, skip button.
+- [ ] Are add-ons offered only for some services (pairing evidence)?
+- [ ] Recurring options: frequency choices, discount display ("Save 10%"), default selection, one-time option `[S: T06]`.
+- [ ] Customer questions: placement, required markers, answer types seen (text, choice, photo?), whether global and service questions are merged `[S: T06]`.
+- [ ] Route-type service: "Anytime {day}" style day picker instead of times `[S: T02]`.
+- [ ] Short link behaviour: opening a service-specific link skips category pages? URL format (`/s/...`, query param, path?) `[S: T06]`.
+- [ ] Booking-site load: does the catalog appear instantly or after a spinner? Any layout shift? Image loading behaviour.
+- [ ] Dark mode availability on the booking site (owner requirement; Agent 11).
+
+### 14.2 Admin side (if recorded)
+- [ ] Exact nav path and labels: Settings → Pricing / Services / Services & Pricing (D1); tab names "Customer add-ons", "Company add-ons".
+- [ ] Template banner/picker: list of industries, preview content, what happens if applied over an existing catalog.
+- [ ] Category editor fields: name, mobile only (shop only?), icon picker style `[S: T06]`.
+- [ ] Service editor: field order and labels (name, description, image, price, cost, duration, mobile/shop), section names (checklists, photos, recurring, questions, short link) `[S: T06d]`; is there a variation/size pricing section?
+- [ ] Route option placement on the service editor and whether a duration is still required `[S: T02]`.
+- [ ] Checklist editor: item types, required flags, before/after photo count inputs; global checklist location `[S: T06]`.
+- [ ] Recurring options: frequency list editor, discount type (% / $), "let customers choose" toggle.
+- [ ] Questions: answer types, "turn off global questions" toggle wording.
+- [ ] Short link format and copy button; QR option?
+- [ ] Duplicate: what is copied, resulting name ("Copy of …"?).
+- [ ] Publish button location, unpublished-changes indicator, confirmation dialog, and whether add-ons need publishing (D2, Q12).
+- [ ] Add-on editor: kind (service/product), extra time, part number, stock, min/max quantities and their meaning (D4), pairing UI (all on by default) `[S: T07]`, autosave indicator.
+- [ ] Company add-ons: identical editor? Any extra fields (editable price at POS)?
+- [ ] Service areas: default zone shape at signup (isochrone vs city boundary, Q5), "+" placement, max travel time input units/range, Draw animation, vertex editing tools `[S: T11]`.
+- [ ] "Add staff to zone?" prompt after save — exact wording and UI `[S: T11]`.
+- [ ] Travel charge fields (name + fixed $) and custom tax rate input format (percent decimals) `[S: T11]`.
+- [ ] Shop editor fields; distance-based filter setting (units, drive time vs distance, Q13); custom icon setting `[S: T11]`.
+- [ ] Overlapping zones: does Fieldd allow them, and how does it display/resolve them?
+- [ ] Worker profile: service area and shop assignment controls, allowed-services list `[S: T13]`.
+- [ ] CRM booking out-of-area override: warning text and flow `[S: T11]`; inline "create new service" from the booking form `[S: T15]` `[S: T19]`.
+- [ ] Adding add-ons after booking in CRM job card and worker POS; blocked after completion? `[S: T07]`
+- [ ] Inventory: is there any stock list/report outside the add-on editor? Low-stock alerts?
+- [ ] Empty states (no services, no add-ons, no zones) and error messages seen.

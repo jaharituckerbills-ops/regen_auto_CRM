@@ -1005,3 +1005,466 @@ MCP exposure (Fieldd exposes CRM/Bookings MCP [S: llms.txt]): read-only queries
 MCP; **money-moving commands** (`chargeJob`, `createRefund`, `chargeOffSession`) require an explicit
 human confirmation step and are never exposed to the customer-level Bookings MCP except
 `prepareBookingPayment` (which only returns a client secret for the customer to confirm) `[I]`.
+
+---
+
+## 9. Interfaces with other modules
+
+Canonical event domain for this module is **`payments.`** (`payments.<entity>.<verb>`). Every
+payments event carries the envelope `{event_id, occurred_at, business_id, correlation_id,
+causation_id, schema_version}` and money as `{amount_minor, currency}` pairs. Events are published
+via a transactional outbox (written in the same DB transaction as the state change) and delivered
+at-least-once; consumers must dedupe on `event_id`.
+
+### 9.1 PRODUCES (events)
+
+| Event | Payload (beyond envelope) | Main consumers |
+|---|---|---|
+| `payments.account.updated` | `{status, charges_enabled, payouts_enabled, requirements_due[], deadline?}` | 01 (downgrade checkout), 08 (owner alert) |
+| `payments.account.activated` | `{provider_account_id}` | 01, 08, 10 |
+| `payments.account.restricted` | `{reason, requirements_due[]}` | 01, 04 (POS banner), 08 |
+| `payments.breakdown.computed` | `{job_id, version, grand_total, tax_total, discount_total, inputs_hash}` | 04 (invoice lines), 08 |
+| `payments.job.payment_plan_set` | `{job_id, collection_mode, booking_requirement, deposit_required}` | 04, 03 (badge) |
+| `payments.job.balance_changed` | `{job_id, invoice_id?, grand_total, amount_paid, amount_refunded, amount_due, payment_status, balance_version}` | 04 (invoice state), 03 (calendar chip), 08 (reminders cancel), 01 (portal) |
+| `payments.payment.succeeded` | `{payment_id, job_id?, invoice_id?, customer_id?, subscription_id?, purpose, method, channel, amount, tip, tax_portion, fee?, collected_by_user_id?, allocations:[{invoice_id, amount}], attributions:[{worker_id, revenue, tip}]}` | 04, 06, 08 (receipt N-P01), 09 (tips/commission), 07 (LTV) |
+| `payments.payment.authorized` | `{payment_id, job_id, amount, capture_before}` | 04, 08 (N-P02) |
+| `payments.payment.requires_action` | `{payment_id, job_id?, customer_id, action_url}` | 08 (customer auth link), 06 |
+| `payments.payment.failed` | `{payment_id, job_id?, subscription_id?, purpose, failure:{code, decline_code, retryable}, amount}` | 04, 06 (dunning), 08 (N-P03), 03 (`payment_at_risk`) |
+| `payments.payment.canceled` | `{payment_id, reason}` | 04 |
+| `payments.payment.reversed` | `{payment_id, reason:'nsf_check'\|'entered_in_error', amount}` | 04, 08 |
+| `payments.authorization.placed` / `.renewed` / `.rescheduled` / `.voided` / `.expired` | `{authorization_id, job_id, amount, capture_before?}` | 04, 03, 08 |
+| `payments.authorization.failed` | `{authorization_id, job_id, customer_id, failure, update_card_url, retries_left}` | 03 (flag/hold release), 01, 08 |
+| `payments.deposit.collected` (alias of `payment.succeeded` with purpose=deposit, emitted additionally for convenience) | `{payment_id, job_id?, payment_session_id, amount}` | 01, 04, 08 (N-P02) |
+| `payments.tip.added` | `{payment_id, job_id, tip, allocations:[{worker_id, amount}]}` | 09 (payroll), 08 (leaderboard) |
+| `payments.card.saved` / `.removed` / `.updated` (account updater) | `{payment_method_id, customer_id, brand, last4, exp}` | 06 (subs), 07 (profile), 01 (portal) |
+| `payments.card.expiring` | `{payment_method_id, customer_id, exp, used_by:{subscription_ids[], future_job_ids[]}}` — 30 days before expiry, only if in use | 08 (N-P04), 06 |
+| `payments.refund.created` / `.succeeded` / `.failed` | `{refund_id, payment_id, job_id?, amount, tip, tax, destination, reason, allocations}` | 04 (invoice netPaid), 06 (gift card refunds), 08 (N-P05), 09 (tip clawback) |
+| `payments.dispute.opened` / `.updated` / `.closed` | `{dispute_id, payment_id, job_id?, subscription_id?, amount, reason, status, evidence_due_by, outcome?}` | 08 (A-06), 06 (auto-pause sub), 04 (job flag), 08 (review requests suppressed) |
+| `payments.payout.paid` / `.failed` | `{payout_id, amount, arrival_date, bank_last4, failure_code?}` | 08 (A-07) |
+| `payments.cash.collected` / `.variance_detected` / `.outstanding_on_deactivation` | `{worker_id, expected, counted, variance}` | 09, 08 |
+| `payments.reconciliation.mismatch` (internal ops) | `{scope, expected, actual}` | platform ops |
+| `payments.booking_session.orphaned` | `{payment_session_id, draft_booking_id, action:'refunded'\|'voided'}` | 01, 08 (customer + business notice) |
+
+### 9.2 CONSUMES (events & data)
+
+| From | Event / data | Our reaction |
+|---|---|---|
+| **01** Booking | `booking.appointment.created {job_id, payment_session_id?}` | attach session → job (`attachBookingToJob`); post deposit ledger |
+| 01 | `booking.session.abandoned {draft_booking_id}` | cancel PaymentSession / SetupIntent, release gift-card holds |
+| 01 | `booking.domain.verified {hostname}` / `booking.domain.removed` | register / unregister wallet payment-method domain |
+| 01 | `booking.appointment.canceled` / `.rescheduled` (customer self-service) | same as 04/03 equivalents below |
+| **02** Catalog & Coverage | `PricedLine[]` via `catalog.priceLines(job)` (service, add-ons, company add-ons, travel fee, question surcharges; `amount`, `cost`, `taxable`, `taxRatePpm`, `taxSource`, `pricesIncludeTax`) | input to §10.1; we never re-derive catalog prices |
+| 02 | `coverage.tax_rate.changed {zone_id, rate_ppm, applyToJobIds?}`, `coverage.travel_charge.changed` | recompute non-finalized breakdowns for listed jobs; emit `payments.breakdown.computed` |
+| **03** Scheduling | `scheduling.job.scheduled`, `scheduling.job.rescheduled {job_id, start, end}`, `scheduling.job.unscheduled` | (re)plan authorization `hold_at` (§10.5); cancel holds when unscheduled |
+| 03 | `scheduling.assignment.created` / `.changed {job_id, workers:[{worker_id, share_bp, lead}]}` | attribution snapshot for future payments (past payments keep their snapshot) |
+| **04** Job lifecycle | `jobs.lineitem.added` / `job.lines.changed {job_id}` | recompute breakdown (not finalized) |
+| 04 | `job.job.completed {job_id, completed_by, at}` | trigger capture / auto-charge card on file (collection_mode) or nothing (POS handles) |
+| 04 | `jobs.invoice.created` / `invoice.invoice.finalized {job_id, invoice_id, breakdown_version}` | freeze breakdown; post revenue recognition entries |
+| 04 | `invoice.invoice.sent {invoice_id, pay_token}` | payment_status `invoice_sent` if completed |
+| 04 | `job.job.cancelled {job_id, fee_minor, deposit_policy:'refund'\|'retain'\|'partial', reason}` / no-show | W13: void hold / charge fee / refund-or-retain deposit |
+| 04 | `job.job.reopened` | unfreeze not allowed if paid: new invoice version via 04, delta handled as additional charge or refund |
+| **06** Subs/Discounts/Gift cards | modifier stages 3–6 (`pricing.evaluate` modifiers: coverage, member %, recurring, promo/manual) returning `DiscountApplication[]` with line allocations | applied in §10.1 step 2–3 |
+| 06 | `giftcards.authorize/hold(code, amount, ref)` → `{hold_id, usable}`; `giftcards.capture(hold_id)`; `giftcards.release(hold_id)`; `giftcards.refund(card, amount, ref)`; `giftcards.issueOrReload(customer, amount, ref)` | gift card tender lifecycle; our ledger entries mirror 06's gift-card ledger postings through `payments.ledger.post` |
+| 06 | `payments.chargeOffSession` calls for subscription cycles (06 currently names it `payments.charge.create`; alias accepted) | W12 |
+| **07** Customers | `customer.customer.merged {survivor_id, merged_id}` | remap ProviderCustomer rows (1:N), StoredPaymentMethods, A/R subledger dims; never detach PMs |
+| 07 | `customer.customer.unmerged` | reverse mapping from merge log |
+| 07 | `customer.customer.erased {customer_id}` (privacy) | detach PMs at processor, null PII in consents; **retain** financial records (legal retention) with pseudonymized customer ref |
+| 07 | customer `tax_exempt` + certificate ref (read) | tax = 0 with exemption reference |
+| **08** Comms & Reporting | none consumed for money logic; reads our events for N-P01…N-P05, A-05…A-07 | — |
+| **09** Team | `team.worker.deactivated` / `team.member.deactivated {worker_id}` | block POS for that worker; raise `payments.cash.outstanding_on_deactivation` if cash on hand > 0; tips payable remain |
+| 09 | permission checks (`payments.*` keys in 09 matrix rows 174–181) and refund limits | enforced at API |
+
+### 9.3 Contracts (typed, per agent)
+
+**Agent 01 — deposit / card / pre-auth at booking**
+```ts
+// 01 → 05
+prepareBookingPayment(i: { draftBookingId: string; customer: { id?: string; email?: string; phone?: string; name?: string };
+  lines: JobLineInput[]; zoneId?: string; shopId?: string; discountRefs: string[];
+  giftCardHolds: { holdId: string; amountMinor: number }[]; jobStart: string /* ISO, business TZ offset */ })
+  : { paymentSessionId: string; mode: BookingRequirement; amountMinor: number; currency: string;
+      breakdown: PriceBreakdown; processor: { publishableKey: string; accountId: string; clientSecret?: string };
+      expiresAt: string; consentText: string; consentTextVersion: string };
+confirmBookingPayment(i: { paymentSessionId: string }) : { status: 'ok'|'requires_action'|'failed'; failure?: Failure; paymentId?: string; paymentMethodId?: string; authorizationId?: string };
+attachBookingToJob(i: { paymentSessionId: string; jobId: string }): { ok: true };
+// Guarantees: 05 never creates the job; 01 never computes totals; amounts shown by 01 = breakdown.grand_total from 05.
+// Slot holds (03) must outlive PaymentSession.expiresAt (30 min) — 03 `scheduling.hold.extend` on requires_action.
+// Theme: 01 passes tenant theme tokens {colors(light/dark), radius, font family + font file URLs, spacing}
+//        → 05 maps to the processor element "appearance" config so card fields match the brand (owner req. 2026-11-13).
+```
+
+**Agent 04 — job / invoice**
+```ts
+// 04 → 05: saveBreakdown(jobId, inputs, expectedVersion) on every line change; finalize via invoice.invoice.finalized
+// 05 → 04: payments.job.balance_changed (authoritative amount_paid / amount_due); payments.payment.succeeded.allocations[]
+// Rules: invoice.amountPaid is derived from 05 allocations only (04 §987 agrees).
+// Overpayment: 04 sets creditDue flag; 05 decides refund vs customer_credit (setting prepayment_excess).
+// Void invoice with netPaid > 0 → 04 must call createRefund (or convert to credit) first; 05 returns 409 otherwise.
+// POS: 04 owns cart editing/completion; 05 owns tender screen. Hand-off object:
+interface PosHandoff { jobId: string; invoiceId: string; breakdownVersion: number; balanceVersion: number; amountDueMinor: number; allowedMethods: PaymentMethodKind[]; tipSettings: PaymentSettings['tipping'] }
+```
+
+**Agent 06 — subscriptions, discounts, gift cards**
+```ts
+// 05 → 06 (sync, inside quoteTotals): evaluateModifiers({ businessId, customerId, lines, codes, jobContext }) : DiscountApplication[]
+//   06 owns eligibility/stacking; 05 owns arithmetic order, allocation, clamping, tax after discounts.
+// 06 → 05: chargeOffSession({ purpose:'subscription'|'gift_card_purchase', ..., idempotencyKey })
+//   returns { paymentId, status:'succeeded'|'requires_action'|'failed'|'processing', failure?:{code, declineCode, retryable} }
+//   Final status always also arrives as payments.payment.* event; 06 dunning keys off events, not the sync reply.
+// Gift cards: tender only (never reduce tax base) — both specs agree (06 §5.1 stage 9).
+// Refund to gift card: 05 calls giftcards.issueOrReload / giftcards.refund; 06 posts its ledger; 05 posts revenue reversal.
+// Gift card purchase: revenue = none; liability 2400; sales tax none at sale `[I]`.
+```
+
+**Agent 08 — receipts, notifications, reports**
+```ts
+// 05 provides variable set VS-PAYMENT / VS-PAYOUT data via event payloads + getJobLedger(jobId).
+// Report metric definitions (05 is source for money metrics):
+//   gross_collected = Σ succeeded payment amounts (excl. tips) in range (cash basis, succeeded_at in business TZ)
+//   tips = Σ tip_minor; refunds = Σ succeeded refunds (by refund date); net_collected = gross_collected − refunds
+//   fees = Σ processor fee + application fee (processor users only)
+//   earned_revenue (accrual) = Σ finalized breakdown net (excl. tax, tips) by job completion date — owned by 08 for dashboards,
+//   computed from 05 ledger accounts 4000–4030 minus 4900/4950.
+// Every report tile must label its basis ("Collected" vs "Earned").
+```
+
+**Agent 09 — worker attribution & tips**
+```ts
+// 09 provides: assignment shares per job (share_bp sum = 10000, lead flag), worker status, permission matrix.
+// 05 provides: tipsPayable(workerId, periodStart, periodEnd) → { tips_minor, payments[] } for payroll export;
+//              revenueAttributed(workerId, range, basis) for leaderboard/commission; cashOnHand(workerId).
+// Attribution snapshot is taken at payment success; later reassignment does NOT re-attribute past payments
+// (manual "re-attribute" admin action posts reversing + new attribution rows).
+```
+
+**Agent 02** — consumes nothing from 05 except `payments.breakdown.computed` for profit views; 02 supplies priced lines and tax rate (02 §1341 aligns: "02 never totals").
+**Agent 03** — consumes `payments.authorization.failed` (03 currently listens to `payment.authorization.failed` / `payment.deposit.failed`) to release online-booking holds; consumes `payments.job.balance_changed` for the calendar payment chip [S: 08.txt].
+**Agent 07** — consumes `payments.card.*` for the profile "Payment methods" panel; LTV from `payments.payment.succeeded` minus refunds.
+
+### 9.4 Naming reconciliation for Agent 10
+
+Other specs use slightly different names for our events. Proposed canonical (left) and aliases seen:
+
+| Canonical | Seen in | Note |
+|---|---|---|
+| `payments.payment.succeeded` | 04 ✓; 08 `payment.payment.captured`; 06 `payments.charge.succeeded` | one event; `captured` not used because cash/check are never "captured" |
+| `payments.payment.failed` | 08 `payment.payment.failed`; 06 `payments.charge.failed`; 06 `subscription.payment.failed` is 06's own downstream event | |
+| `payments.chargeOffSession` (command) | 06 `payments.charge.create` | |
+| `payments.authorization.placed` | 08 `payment.preauth.created` | |
+| `payments.deposit.collected` | 08 `payment.deposit.captured`; 03 `payment.deposit.failed` → use `payments.payment.failed{purpose:'deposit'}` | |
+| `payments.authorization.failed` | 03 `payment.authorization.failed` | |
+| `payments.card.expiring` | 08 `payment.card.expiring` | |
+| `payments.refund.created`/`.succeeded` | 08 `payment.refund.created`; 04 `payments.refund.succeeded` ✓ | receipts should fire on `succeeded` for card refunds |
+| `payments.dispute.opened` | 08 `payment.dispute.opened` | |
+| `payments.payout.paid`/`.failed` | 08 `payment.payout.paid` | |
+| `payments.quoteTotals` (pricing façade) | 06 `pricing.evaluate()` | single pipeline; 05 hosts the façade, 06 supplies modifier stages; either name, one implementation |
+
+Rounding conflict: 06 §5.2 uses **half-even** for percent discounts; this spec uses **half-up**
+everywhere (tax jurisdictions generally expect half-up `[I]`). Results differ only at exact .5
+minor-unit ties. Proposal: half-up for tax (non-negotiable), single shared primitive for discounts —
+Agent 10 picks one (OQ12).
+
+### 9.5 API keys & integrations register (payments)
+
+Principle: **businesses never give us their processor secret keys.** With Connect, all calls use
+the platform's keys plus the connected account id. Secrets live in a managed secrets store with
+KMS envelope encryption, accessed only by service identity, never in source, env files in repos,
+logs, analytics, crash reports or support tooling. Separate test vs live everywhere.
+
+| # | Service / secret | Purpose | Owner | Where stored | Exposure | Rotation |
+|---|---|---|---|---|---|---|
+| K1 | Stripe **live secret key** (`sk_live_…`) — replaced in production by **restricted keys** (`rk_live_…`) per service | All server-side API calls | Platform | Secrets manager; injected at runtime into payments service only | Server only | Every 90 days `[I]` + on staff departure/incident; roll with overlap (new key deployed, old key expired after verify) |
+| K2 | Restricted key: payments-core (write PaymentIntents, SetupIntents, Refunds, Customers, PaymentMethods, Terminal) | money movement | Platform | Secrets manager | payments service | 90 days |
+| K3 | Restricted key: read-only (balance transactions, payouts, disputes read, events) | reconciliation, reporting, webhook re-fetch | Platform | Secrets manager | reconciler/report workers | 90 days |
+| K4 | Restricted key: disputes write (evidence submission) + accounts (onboarding sessions) | admin flows | Platform | Secrets manager | payments-admin service | 90 days |
+| K5 | Stripe **publishable key** (`pk_live_…`) | client-side elements (booking widget, invoice pay page, apps) | Platform | Config (public) | Public by design | Rotated together with K1 |
+| K6 | **Webhook signing secret** — Connect endpoint (`whsec_…`) | verify connected-account events | Platform | Secrets manager | webhook receiver | 180 days `[I]` or on suspicion; roll with overlap window, verify against both secrets during window |
+| K7 | Webhook signing secret — platform-account endpoint | platform events (application fees, account) | Platform | Secrets manager | webhook receiver | as K6 |
+| K8 | Stripe **Terminal connection tokens** | Tap to Pay / reader SDK auth | Platform-minted, per device session | Not stored (short-lived) | worker app memory | per session |
+| K9 | Embedded Connect component **account session** client secrets | onboarding/payout/dispute components | Per business, minted per page load | Not stored | browser memory | per session (short-lived) |
+| K10 | Apple Pay **domain registration** (web, via processor) | Apple Pay on platform subdomain + every custom booking domain (Agent 01) | Per business hostname (records), platform API | DB (`payment_method_domains`) | — | re-register on domain change; no secret |
+| K11 | Apple **Merchant ID + payment processing certificate** (native iOS app, later phase) | in-app Apple Pay | Platform | Apple developer account; cert generated via processor CSR | — | certificate expires ~every 25 months `[I]` — calendar reminder 60 days ahead |
+| K12 | Apple **Tap to Pay on iPhone entitlement**; Android tap-to-pay requirements | card-present on phones | Platform developer accounts | Apple/Google developer consoles | — | n/a (entitlement); track renewals of developer accounts |
+| K13 | Google Pay merchant ID (Android app, later) | in-app Google Pay | Platform | Google Pay console | — | n/a |
+| K14 | **Invoice pay-link / receipt-link token signing key** (our own, asymmetric or HMAC with `kid`) | customer tokens for `getPayableState`/`payInvoice`/tip links | Platform | Secrets manager (KMS) | server only | yearly + incident; keep old `kid` valid until longest token TTL elapses |
+| K15 | **Idempotency/outbox** — no secret; **ledger DB credentials** | DB access for ledger (separate role, insert-only on journal tables) | Platform | Secrets manager / IAM auth | services | DB credential rotation per infra policy (≤ 90 days) |
+| K16 | **CSV export signed-URL key** | time-limited download links | Platform | Secrets manager | server | 90 days |
+| K17 | Tax engine API key (phase 2: processor tax product or Avalara/TaxJar-class `[I]`) | multi-component tax | Platform | Secrets manager | tax adapter | per vendor policy |
+| K18 | Accounting integration **OAuth client id/secret** (QuickBooks Online, Xero — phase 2) | export journals | Platform | Secrets manager | integration service | per vendor policy |
+| K19 | Accounting integration **per-business OAuth access/refresh tokens** | business's own books | **Per business** | DB, column-encrypted with KMS data key; revocable by business | integration service | provider-driven refresh (rolling refresh tokens `[I]`); revoke on disconnect |
+| K20 | Connected account id (`acct_…`) | identifies business at processor | Per business (identifier, **not a secret**) | DB `PaymentAccount` | server | n/a |
+| K21 | Customer `cus_…` / `pm_…` ids | card on file references | Per business (identifiers) | DB, tenant-scoped | server; last4/brand to UI | n/a; detached on erase |
+| K22 | Future PFaaS provider keys (OQ3) | alternative processor | Platform | Secrets manager | adapter | per vendor |
+| K23 | "Bring your own gateway" OAuth tokens (not in v1) | businesses keeping their existing processor | Per business | DB encrypted | adapter | provider-driven |
+
+Not stored anywhere by us: card numbers, CVC, full bank account numbers, card-reader keys.
+Monitoring: alert on any 401 from processor (rotated/revoked key), webhook signature-failure rate
+spike, and keys approaching rotation date. Test-mode keys are never present in production config
+(deploy check fails if a `sk_test`/`pk_test` prefix appears in live).
+
+---
+
+## 10. Algorithms / pseudo-code
+
+### 10.1 computeTotals (pure, deterministic; same code on server, CRM, worker app, booking widget)
+
+```ts
+function computeTotals(inp: TotalsInput): PriceBreakdown {
+  const cur = inp.currency;
+  // 1. gross
+  const lines = inp.pricedLines.map(l => ({ ...l,
+     gross: roundHalfUp(l.unit_price_minor * l.qty_milli, 1000), net: 0, discount: 0, tax: 0 }));
+  lines.forEach(l => l.net = l.gross);
+
+  // 2. line-scoped modifiers from Agent 06, already ordered by stage (coverage → member % → recurring → scoped promo)
+  for (const m of inp.modifiers.filter(m => m.scope === 'lines')) {
+    const elig = lines.filter(l => m.eligible_line_ids.includes(l.line_id) && l.net > 0);
+    if (m.kind === 'free_item' || m.kind === 'percent') {
+      for (const l of elig) {
+        const d = m.kind === 'free_item' ? l.net : roundHalfUp(l.net * m.value_bp!, 10000);
+        apply(l, m, Math.min(d, l.net));               // clamp ≥ 0
+      }
+    } else { // fixed, spread across eligible lines
+      const amt = Math.min(m.value_minor!, sum(elig, 'net'));
+      allocateLargestRemainder(amt, elig.map(l => l.net)).forEach((a, i) => apply(elig[i], m, a));
+    }
+  }
+  // 3. order-level modifiers (manual discount [S: 16.txt], order-wide codes)
+  for (const m of inp.modifiers.filter(m => m.scope === 'order')) {
+    const elig = lines.filter(l => isDiscountable(l, inp.settings) && l.net > 0);
+    const base = sum(elig, 'net');
+    const want = m.kind === 'percent' ? roundHalfUp(base * m.value_bp!, 10000) : m.value_minor!;
+    const amt = Math.min(want, base);
+    if (amt < want) warn('DISCOUNT_CLAMPED', want - amt);
+    allocateLargestRemainder(amt, elig.map(l => l.net)).forEach((a, i) => apply(elig[i], m, a));
+  }
+  // 4. travel fee is already a line (class travel_fee) from Agent 02 [S: 11.txt]
+
+  // 5. tax
+  const exempt = inp.customerTaxExempt;
+  const groups = groupBy(lines.filter(l => isTaxable(l, inp.settings) && !exempt), l => l.tax_rate_id);
+  const taxLines = [];
+  for (const [rateId, ls] of groups) {
+    const ppm = rateOf(rateId, inp.taxOverridePpm);
+    if (inp.settings.tax.prices_include_tax) {
+      for (const l of ls) l.tax = roundHalfUp(l.net * ppm, 1_000_000 + ppm);   // embedded tax; net stays gross-inclusive
+    } else if (inp.settings.tax.rounding === 'per_line') {
+      for (const l of ls) l.tax = roundHalfUp(l.net * ppm, 1_000_000);
+    } else {                                                                   // per_invoice (default)
+      const base = sum(ls, 'net');
+      const total = roundHalfUp(base * ppm, 1_000_000);
+      allocateLargestRemainder(total, ls.map(l => l.net)).forEach((t, i) => ls[i].tax = t);
+    }
+    taxLines.push({ tax_rate_id: rateId, rate_ppm: ppm, taxable_base_minor: sum(ls, 'net'), tax_minor: sum(ls, 'tax'),
+                    inclusive: inp.settings.tax.prices_include_tax });
+  }
+  // 6–8
+  const subtotalNet = sum(lines, 'net');
+  const taxTotal = sum(taxLines, 'tax_minor');
+  const totalBeforeTip = inp.settings.tax.prices_include_tax ? subtotalNet : subtotalNet + taxTotal;
+  const tipBase = inp.settings.tipping.base === 'net_before_tax'
+        ? (inp.settings.tax.prices_include_tax ? subtotalNet - taxTotal : subtotalNet) : totalBeforeTip;
+  const tip = inp.tip?.minor ?? (inp.tip?.bp != null ? roundHalfUp(tipBase * inp.tip.bp, 10000) : 0);
+  return freeze({ lines, taxLines, subtotal_net_minor: subtotalNet, tax_total_minor: taxTotal,
+                  total_before_tip_minor: totalBeforeTip, tip_total_minor: tip,
+                  grand_total_minor: totalBeforeTip + tip, inputs_hash: sha256(canonicalJson(inp)), currency: cur });
+}
+```
+Determinism: integers only, stable ordering by `line_id` order from Agent 04, `canonicalJson`
+sorts keys. Property tests: Σ allocations == allocated amount; no negative nets; totals invariant
+under line reordering except tie-break; client and server produce byte-identical breakdowns for the
+same inputs (golden test vectors shared across platforms, incl. §5.5).
+
+### 10.2 allocateLargestRemainder (Hamilton)
+
+```ts
+function allocateLargestRemainder(amount: number, weights: number[]): number[] {
+  const W = weights.reduce((a, b) => a + b, 0);
+  if (amount === 0 || W === 0) return weights.map(() => 0);
+  const raw = weights.map(w => ({ q: Math.floor(amount * w / W), r: (amount * w) % W }));  // exact via BigInt in impl
+  let left = amount - raw.reduce((a, x) => a + x.q, 0);
+  const order = raw.map((x, i) => i).sort((i, j) => raw[j].r - raw[i].r || i - j);          // ties → earlier line
+  for (const i of order) { if (left === 0) break; raw[i].q += 1; left -= 1; }
+  return raw.map(x => x.q);
+}
+```
+(Use BigInt/128-bit for `amount * w` — 64-bit products can overflow for large invoices × weights.)
+
+### 10.3 chargeJob — double-charge prevention
+
+```ts
+async function chargeJob(cmd, actor, idemKey) {
+  return idempotent(actor.businessId, idemKey, 'chargeJob', hash(cmd), async () => {
+    return tx(async db => {
+      const plan = await db.lockRow('job_payment_plan', cmd.jobId);          // SELECT … FOR UPDATE
+      authorize(actor, 'payments.collect', plan);
+      if (plan.balance_version !== cmd.expectedBalanceVersion) throw Conflict('BALANCE_CHANGED', currentState(plan));
+      const due = amountDue(plan);
+      if (cmd.amountMinor - cmd.tipMinor > due) throw Unprocessable('AMOUNT_EXCEEDS_DUE');
+      if (cmd.amountMinor < processorMin(plan.currency)) throw Unprocessable('BELOW_PROCESSOR_MIN');
+      // partial unique index guarantees a single in-flight attempt per (job, purpose)
+      const pay = await db.insert('payment', { status: 'created', idempotency_key: `pay:${idemKey}`, … })
+                    .onUniqueViolation(() => { throw Conflict('PAYMENT_IN_PROGRESS', inFlight(plan)); });
+      return pay;
+    }).then(async pay => {
+      // outside DB tx: provider call with deterministic idempotency key
+      try {
+        const pi = await provider.createPaymentIntent({ amount: pay.amount_minor, currency, customer, payment_method,
+              off_session: cmd.method === 'card_on_file', confirm: cmd.method === 'card_on_file',
+              capture_method: 'automatic', application_fee_amount: fee(pay), metadata: { payment_id: pay.id, job_id } },
+              { idempotencyKey: `pi:${pay.id}`, stripeAccount });
+        await savePiId(pay.id, pi.id);            // persisted before anything else
+        return applyProviderState(pay.id, pi);    // same function the webhook uses
+      } catch (e) {
+        if (isNetworkOrTimeout(e)) { await markUnknown(pay.id); scheduleResolve(pay.id); return statusOf(pay.id); }
+        if (isCardError(e)) return applyFailure(pay.id, e);
+        throw e;
+      }
+    });
+  });
+}
+```
+Rules:
+- UI disables the pay button on first tap and keeps the same `idemKey` for retries of the **same** attempt (generated when the tender screen opens, regenerated only after a terminal failure).
+- `unknown` resolution: retrieve by stored `pi.id`; if no id was stored (crash before save), search provider by `metadata.payment_id` and/or replay the create with the **same** provider idempotency key `pi:{payment.id}` (returns the original object within the key's lifetime `[I]`).
+- Customer portal + worker POS racing on the same job: second caller gets `409 PAYMENT_IN_PROGRESS {by, channel, started_at}`; once the first succeeds, the second's `expectedBalanceVersion` is stale → `409 BALANCE_CHANGED` with the new due (possibly 0 → "Already paid").
+
+### 10.4 Webhook processing & out-of-order safety
+
+```ts
+async function receiveWebhook(raw: Buffer, sig: string) {
+  const evt = verifySignature(raw, sig, [K6.current, K6.previous], toleranceSec = 300);   // else 400
+  const inserted = await db.insertIgnore('processor_event', { provider_event_id: evt.id, type: evt.type,
+                     provider_account_id: evt.account, payload: raw, status: 'stored' });
+  return 200;                                   // ack fast (< 2 s); processing is async from the inbox
+}
+
+async function processEvent(e: ProcessorEvent) {
+  // Never trust the payload snapshot for state: re-fetch current object (handles out-of-order + stale payloads)
+  const obj = await provider.retrieve(objectRef(e), { stripeAccount: e.provider_account_id });
+  switch (kind(obj)) {
+    case 'payment_intent': return applyProviderState(paymentIdFrom(obj), obj);
+    case 'charge':         return applyChargeDetails(obj);       // card snapshot, balance txn → fee/net
+    case 'refund':         return applyRefundState(obj);
+    case 'dispute':        return applyDisputeState(obj);
+    case 'payout':         return applyPayout(obj);
+    case 'account':        return applyAccount(obj);
+    case 'payment_method': return applyPaymentMethod(obj);       // automatic card updates, detach
+  }
+}
+
+const RANK = { created:0, requires_payment_method:1, requires_confirmation:1, requires_action:2, processing:3,
+               authorized:4, failed:5, canceled:5, expired:5, succeeded:6, partially_refunded:7, refunded:8 };
+function applyProviderState(paymentId, pi) {
+  tx(db => {
+    const p = db.lockRow('payment', paymentId);
+    const next = mapStatus(pi);
+    if (RANK[next] < RANK[p.status] && !isLegalBackEdge(p.status, next)) return;   // stale → ignore
+    if (p.status === next) return;                                                  // idempotent
+    assert(pi.amount_received <= p.amount_minor && pi.currency === p.currency);
+    db.update('payment', paymentId, { status: next, … });
+    postLedger(`pay:${paymentId}:${next}`, entriesFor(p, next));                   // ledger idempotency key
+    outbox.emit(eventFor(next, p));
+    recomputeBalance(p.job_id);                                                      // bumps balance_version
+  });
+}
+```
+Legal back-edges: `requires_action → processing`, `failed → processing` is **not** legal (a retry is a
+new Payment). Events for objects we don't know (e.g., created in the processor dashboard by the
+business) are imported as `channel:'external'` payments linked to no job, shown in Card payments
+with a "Link to job" action.
+
+### 10.5 Authorization scheduling (beat the hold window)
+
+```ts
+function planHold(job, settings, now): Date | 'now' | 'none' {
+  if (settings.booking_requirement !== 'preauthorization') return 'none';
+  const lead = hours(settings.preauth.lead_hours);            // default 24h
+  const desired = job.start.minus(lead);
+  // assume conservative window W until we learn capture_before from the actual auth (W = 5 days `[I]`)
+  const latestSafeStart = now.plus(days(5)).minus(job.durationEstimate).minus(hours(12));
+  return job.start <= latestSafeStart ? 'now' : max(now, desired);
+}
+// After placing: renewal at capture_before − 12h if job not completed; completion after capture_before is
+// handled by charging the saved card off-session (W4/W5), never by capturing an expired auth.
+```
+Recompute on `scheduling.job.rescheduled`, card replacement, or settings change. The scheduler is a
+durable job queue keyed `hold:{job_id}:{generation}`; a generation bump invalidates queued work.
+
+### 10.6 Capture at completion with over/under amount
+
+```ts
+function settleAuthorizedJob(job, auth, due /* incl. tip */) {
+  if (due <= auth.amount_minor) capture(auth, due, key = `cap:${auth.id}`);           // remainder auto-released
+  else {
+    capture(auth, auth.amount_minor, key = `cap:${auth.id}`);
+    chargeOffSession(job, due - auth.amount_minor, key = `topup:${auth.id}`);        // card on file
+    // if topup fails → payment_status partially_paid + invoice for remainder (Agent 04) + N-P03
+  }
+  if (due === 0) cancel(auth);                                                        // e.g. fully gift-card paid
+}
+```
+
+### 10.7 Refund allocation
+
+```ts
+function allocateRefund(payment, amount, tipPart, linesOfPayment) {
+  assert(tipPart <= payment.tip_minor - refundedTip(payment));
+  const nonTip = amount - tipPart;
+  const remainingTax = payment.tax_portion_minor - refundedTax(payment);
+  const remainingNonTip = (payment.amount_minor - payment.tip_minor) - refundedNonTip(payment);
+  // final refund: true-up exactly so Σ refunds == original components
+  const tax = nonTip === remainingNonTip ? remainingTax : roundHalfUp(nonTip * remainingTax, remainingNonTip);
+  const revenue = nonTip - tax;
+  const lineAlloc = allocateLargestRemainder(revenue, linesOfPayment.map(l => l.remaining_revenue));
+  return { tip: tipPart, tax, revenue, lineAlloc };
+}
+```
+Payment-level `tax_portion_minor` is set at success by allocating the job's tax pro-rata to each
+tender (largest remainder over tenders, final tender absorbs the remainder) — needed because a job
+can be paid by deposit + gift card + card + cash.
+
+### 10.8 Worker summary (Transactions [S: 17.txt])
+
+```sql
+-- range = [weekStart, weekStart + 7d) in business TZ, converted to UTC instants at query time
+SELECT ra.worker_id,
+       COUNT(DISTINCT ra.job_id)                         AS jobs,
+       COUNT(DISTINCT ra.payment_id) FILTER (WHERE ra.refund_id IS NULL) AS payments,
+       SUM(ra.revenue_minor) FILTER (WHERE ra.refund_id IS NULL) AS gross,
+       SUM(ra.tip_minor)                                 AS tips,        -- refunds carry negative values
+       -SUM(ra.revenue_minor) FILTER (WHERE ra.refund_id IS NOT NULL) AS refunds,
+       SUM(ra.revenue_minor)                             AS net
+FROM revenue_attribution ra
+WHERE ra.business_id = $1 AND ra.occurred_at >= $from AND ra.occurred_at < $to
+  AND ($staff IS NULL OR ra.worker_id = ANY($staff))
+GROUP BY ra.worker_id;
+-- plus row "Unassigned" for payments on jobs with no worker (e.g. gift card sales, subscriptions)
+```
+Week start computed as local date math (DST weeks are 167 or 169 hours — never "now − 7×24h").
+
+### 10.9 Nightly reconciliation (per connected account)
+
+1. Pull balance transactions created in [D−2, D] (overlap absorbs late writes), upsert mirror.
+2. For each charge/refund/dispute txn: ensure a matching Payment/Refund/Dispute exists with equal amount, currency, and fee; post missing fee entries (`fee:{balance_txn_id}`).
+3. For each Payment `succeeded` in our DB without a provider charge → `reconciliation.mismatch` (critical).
+4. Payment stuck in `processing`/`unknown`/`requires_capture` past thresholds → re-retrieve; holds within 24 h of `capture_before` with job not complete → alert + renewal.
+5. Payouts: Σ net of txns with `payout_id` = payout amount; ledger `1100 processor_clearing` balance = provider pending + available balance (± in-flight) — difference alarms if ≠ 0 for 2 consecutive runs.
+6. PaymentSessions confirmed but without job after 15 min → orphan handling (void/refund + notify).
+7. Ledger invariants: every entry balanced; A/R per job equals 04's invoice balance; report diffs.
+
+### 10.10 Offline queue (worker app)
+
+- Card methods require connectivity; cash/check/custom recorded offline with `client_uuid` (UUIDv7), device time and monotonic sequence; shown as "Pending sync".
+- On reconnect: POST in sequence; server dedupes on `client_uuid`; if the job balance changed meanwhile (e.g., customer paid online) the server still records the cash (money physically received) and flags **overpayment** → `payments.job.balance_changed{overpaid}` + office task to refund or credit.
+- Device clock skew > 5 min → server time used for `succeeded_at`, device time kept as `occurred_at_device`.
+
+### 10.11 CSV export
+
+Columns: `date_local, time_local, timezone, payment_id, job_number, customer_name, staff_collected,
+staff_attributed, channel, method, card_brand, last4, purpose, status, currency, amount, tip, tax,
+fee, application_fee, net, refunded, payout_id, payout_arrival_date, processor_id`. Amounts in major
+units with fixed decimals (currency exponent) and a separate currency column. UTF-8 with BOM;
+RFC-4180 quoting; **formula-injection guard**: prefix `'` to any cell starting with `= + - @ \t \r`.
+> 10 000 rows → async job, emailed signed link (K16, 24 h expiry). Export audited (who, filters,
+row count).

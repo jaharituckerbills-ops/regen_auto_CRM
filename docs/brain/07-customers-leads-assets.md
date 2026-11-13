@@ -1681,3 +1681,179 @@ instant because of balances/jobs) [I]. All require an account session issued by 
   "new customer" discount anti-abuse [06 §5.7]).
 - `assets.summary(assetIds[])` → {YMM, color, plate, sizeClass, photo thumb, tire sizes} for
   03 calendar "vehicle on every job" [S: llms], 04 job card, 02 pricing variation selection.
+
+---
+
+## 9. Interfaces with other modules
+
+Event envelope (final shape owned by Agent 10) assumed: `{ eventId, type, businessId,
+occurredAt, actor, entityId, version, payload, causationId, correlationId }`. Delivery
+at-least-once; consumers idempotent on `eventId` and use `version` to drop stale updates [I].
+PII in payloads is minimized: events carry IDs, consumers call `customers.summary` for details.
+
+### 9.1 PRODUCES (07 → others)
+| Event | Payload (beyond envelope) | Consumers |
+|---|---|---|
+| `customer.customer.created` | kind, source, createdVia, tags, customerTypeId, serviceAreaId, consentSummary, suppressAutomations, importJobId?, leadId? | 08 ("new customer" drip trigger [S: T12], reports), 06 (new-customer eligibility), 10 |
+| `customer.customer.updated` | changedFields[] (names only) | 03/04 (cache), 08 |
+| `customer.customer.status_changed` | from, to, reason | 01 (blocked → refuse online booking), 08 (suppress), 03 (warn on future jobs) |
+| `customer.customer.merged` | survivorId, mergedIds, undoToken | **03, 04, 05, 06, 08, 01** must re-point or resolve `mergedIntoId` lazily |
+| `customer.customer.unmerged` | restoredIds | same |
+| `customer.customer.erased` | erasureReceiptId | 03 (cancel future), 04/05 (anonymize documents' PII snapshots where law allows), 06 (cancel subs — 06 transition 28), 08 (purge inbox PII, keep suppression hash), 01 (delete account) |
+| `customer.address.added` / `.updated` / `.geocoded` / `.archived` | addressId, geoChanged, serviceAreaId, outOfArea | 03 (recompute travel for future jobs [03 §9]), 02 |
+| `customer.contact_point.added` / `.updated` / `.verified` / `.archived` | contactPointId, type, label, verified | 08 (routing), 01 (OTP identifiers) |
+| `customer.consent.changed` | contactPointId, endpointHash, channel, purpose, status, method | 08 — **see conflict C1** |
+| `customer.tags.changed` / `customer.tags.bulk_changed` | ids, added[], removed[] | 08 (dynamic audiences), 06 (tag-targeted discounts if any) |
+| `customer.worker_blocklist.updated` | blockedWorkerIds | 03 (eligibility E4) |
+| `customer.account.linked` / `.relinked` | accountId, matchMethod | 01 (session scope), 08 ("has app installed") |
+| `customer.intake.updated` | formVersionId, answeredQuestionIds | 04 (job intake complete? → 08 `job.intake.incomplete`) |
+| `customer.import.validated` / `.completed` / `.reverted` / `.batch_committed` | counts, ids (chunked) | 08 (importer notification, optional drip enrollment), 10 |
+| `customer.export.completed` | filterHash, rowCount | 08 (owner security digest) |
+| `customer.privacy.request_completed` | type (export/erasure) | 08 (confirmation message) — name taken from 08's catalog |
+| `asset.asset.created` / `.updated` / `.archived` / `.transferred` / `.merged` | assetId, kind, customerId, changedFields | 03 (job cards), 04, 02 (size-class pricing; 02 calls this `customer.asset.updated` — alias), 08 (audiences) |
+| `asset.vehicle.decoded` | assetId, year, make, model, sizeClass | 02, 08 |
+| `asset.service_record.added` | assetId, jobId, completedAt, odometer | 08 ("service due" reminders, vehicle audiences) |
+| `asset.odometer.recorded` | assetId, value, unit, flag | 08 (mileage-based reminders) |
+| `lead.lead.created` | source, sourceRef, ownerUserId, customerId?, hasPhone, hasEmail, consentSummary | 08 (staff alert, lead drips, reports), 09 (n/a) |
+| `lead.lead.stage_changed` | fromStageId, toStageId | 08 (pipeline reports, stage-triggered drips) |
+| `lead.lead.assigned` | ownerUserId | 08 (notify new owner) |
+| `lead.attempt.abandoned` | attemptId, furthestStep, cartValueCents, resumeToken, consent flags | 08 ("finish your booking" drip [S: T12]) |
+| `lead.lead.won` / `lead.lead.converted` | jobId, customerId, valueCents, source attribution | 08 (cancel recovery drips; conversion reports), 01 (session converted) |
+| `lead.lead.lost` / `.reopened` / `.merged` / `.deleted` | reasonId | 08 (win-back drips) |
+| `lead.followup.scheduled` / `lead.followup.due` | assigneeId, dueAt | 08 (reminder push/email to staff) |
+| `lead.lead.stale` | daysInStage | 08 (digest) |
+| `lead.enrichment.completed` | fieldsFound, costCents | 05 (usage billing if platform-resold credits), 08 (none) |
+
+**Notification triggers fired by this module** (catalog + copy owned by 08): new lead assigned
+to you; follow-up due/overdue; lead won by self-completed booking; import finished/failed;
+export ready; duplicate queue weekly digest; consent revoked (owner digest — 08 A-21); customer
+privacy request received/completed; enrichment budget 80 %/100 %; vehicle service due
+(customer-facing, marketing vs. transactional classification by 08).
+
+### 9.2 CONSUMES (others → 07)
+| From | Event / call | 07 reaction |
+|---|---|---|
+| 01 | `portal.account.created` (01's name; my §4 W6 used `portal.account.registered` — **01's name is canonical**) | W6 match/link/create → `customer.account.linked` |
+| 01 | `portal.session.started` / `portal.session.step_reached` / `portal.session.contact_captured` / `portal.session.payment_started` / `portal.session.abandoned` / `portal.booking.confirmed` (01's names; my §4 W16 `booking.attempt.*` are aliases — **01's names canonical**) | W16 upsert lead; `payment_started` → "high intent" flag; `abandoned` → `lead.attempt.abandoned`; `confirmed` → Won |
+| 01 | `portal.visit.recorded` | funnel top-of-funnel counts only (no lead) [S: T05] |
+| 01 | sync calls `MatchCustomer`, `UpsertCustomer`, `CreateLead{reason:'out_of_area'}` | served by `customers.findMatches(strict)`, `customers.resolveForBooking`, `leads.create(source:'out_of_area')` |
+| 01 | QR scan (campaign/other QR) | `leads.ingestQrScan` |
+| 02 | `coverage.location.out_of_area_attempted` (point rounded ~100 m, sessionId) | attach to session's lead (if contact captured) as `outOfArea`; no lead from the event alone |
+| 02 | `catalog.service.archived` | leads' `interestServiceIds` show "(archived)"; no mutation |
+| 02 | service-area changes | re-resolve `Address.serviceAreaId` in background |
+| 03 | `scheduling.hold.expired` (sessionId) | lead `holdExpiredAt` (intent signal) |
+| 03 | `scheduling.job.scheduled` / `.rescheduled` / `.unscheduled` | `CustomerStats.nextJobAt`, asset upcoming |
+| 03/04 | `job.job.completed` (alias 04: `jobs.job.completed`), `job.job.reopened`, `job.job.cancelled`, `job.job.no_show` | W12 projections (lastServiceAt, jobsCompleted, asset service records, odometer); no-show count on profile |
+| 04 | `jobs.job.created {leadId, origin:'lead_conversion'}` and quote accepted | per 04 W17: lead Won when job reaches `scheduled` (appointment) or quote `approved`; **see C3** |
+| 04 | quote sent/viewed/declined | LeadActivity on linked lead; declined → 04 says lead → Lost (we propose → "Follow-up" stage, owner decides; **C3**) |
+| 05 | `payments.card.saved` / removed / expiring (08 `payment.card.expiring`) | `CustomerStats.hasCardOnFile` badge [S: T16] |
+| 05 | payment succeeded/refunded/dispute events | `lifetimeRevenueCents`, `balanceDueCents`; dispute → profile flag |
+| 06 | `subscription(s).subscription.activated` / `.cancelled` / `.past_due` / `.paused` (alias pairs `subscription.*` vs `subscriptions.*`) | subscriber badge, filter, inactive-status guard |
+| 06 | gift card issued/redeemed to customer | profile Payments tab list (read via 06 API) |
+| 08 | `comms.consent.changed` (STOP, unsubscribe, keyword opt-in, complaints) | profile consent badges, filters (**C1**) |
+| 08 | `comms.message.failed` (hard bounce / carrier unreachable) | `ContactPoint.deliveryStatus` |
+| 08 | `comms.message.sent/delivered`, `comms.conversation.message_received` | `lastContactedAt`; LeadActivity `sms_*`/`email_*` on open leads of that customer/endpoint |
+| 08 | `review.review.received` | `avgRatingGiven`, ratings count (Q3) |
+| 08 | `marketing.postcard.scanned` {campaignId, recipientToken, address} | W17: log activity on recipient's lead/customer; create address-only lead with source `postcard_qr` if none |
+| 08 | `customer.contact_point.verification_requested` (08 name) | none — 08 sends; 07 sets `verifiedAt` on `customers.contactPoint.verify` callback |
+| 09 | `team.worker.deactivated` | reassign open leads; remove from `preferredWorkerIds`/`blockedWorkerIds` display (keep IDs for history) |
+| 09 | role/permission changes | cache invalidation for visibility windows |
+
+### 9.3 Per-agent contracts (summary)
+- **01 Booking portal:** 01 owns identity, sessions, funnel step list, consent checkbox UI and
+  disclosure rendering, resume links; 07 owns customer matching, link, profile/garage/intake
+  storage, leads. 01 must send contact data only on blur/step advance after notice (§5.10) and
+  must never display matched-profile data to an unverified guest (§W7). 07 returns
+  `blocked: true` but 01 shows a neutral message.
+- **02 Catalog:** reads `taxExempt`, asset size class/attributes for variation auto-selection;
+  intake-form vs. per-service questions split (02 owns per-service questions; 01 owns intake
+  definition; 07 stores intake answers) [02 §note on intake].
+- **03 Scheduling:** jobs reference `customerId`, `addressId` (+ snapshot), `assetIds`
+  (+ snapshot), `notifyContactPointIds`; 03 reads `blockedWorkerIds`, `preferredWorkerIds`;
+  search by plate/VIN delegated to 07 [03 §search].
+- **04 Job lifecycle:** quote/invoice side panel uses 07 customer picker, address book, asset
+  picker with inline add [S: T04]; on completion emits asset IDs + odometer + photo IDs for
+  history. Lead conversion calls 04 `CreateJob{origin:'lead_conversion', leadId}`.
+- **05 Payments:** cards on file are 05 records keyed by `customerId`; 07 never stores PAN;
+  merges trigger 05 to move processor customer objects (or keep a mapping table) — 05 decides.
+- **06 Subscriptions/discounts:** subs keyed by `customerId` (+ `serviceAddressId`, `assetIds`);
+  discounts may target `customerTypeId` [S: T09] and "new customer" via
+  `customers.newCustomerCheck`; erasure cancels subs (06 transition 28).
+- **08 Marketing/comms:** segments via `customers.segmentQuery` and 08's audience builder fields
+  (tags, customer type, last service date, asset attributes, lead stage, abandoned step) —
+  all exposed as filterable read models; consent checked at **send time**; 08 owns STOP handling.
+- **09 Team:** owns RBAC; 07's keys in §7.12. Note 09 uses `customers.contact_info.view` with
+  time-boxed worker visibility (job start − 24 h → job end + 72 h) — **adopt 09's window** in
+  place of the 24 h-after default in §2 (C6).
+
+### 9.4 Event-name alias table (for Agent 10 to normalize)
+| Concept | 07 uses | Others use | Recommendation |
+|---|---|---|---|
+| customer created | `customer.customer.created` | 04/06: `customers.customer.created`; 08: same as 07 | singular domain `customer.*` |
+| customer merged | `customer.customer.merged` | 03: `customer.merged` | `customer.customer.merged` |
+| asset updated | `asset.asset.updated` | 02: `customer.asset.updated` | Agent 10 pick one; 07 OK with `customer.asset.*` |
+| booking attempt | `booking.attempt.*` (§4) | 01: `portal.session.*` | **01's** |
+| account created | `portal.account.registered` (§4) | 01: `portal.account.created`; 08: `customer.account.created` | `portal.account.created` (01) + `customer.account.linked` (07) |
+| job completed | `job.job.completed` | 04: `jobs.job.completed` | singular `job.*` |
+| subscription | `subscription.subscription.*` | 06: `subscriptions.subscription.*` | singular |
+| consent changed | `customer.consent.changed` | 08: `comms.consent.changed` | see C1 |
+| postcard scan | `portal.qr.scanned` (§4 W17) | 08: `marketing.postcard.scanned` | 08's for postcards; 01's for generic QR |
+
+### 9.5 API keys & integrations register (07's third-party dependencies)
+Per owner requirement 2026-11-13. "Platform" = our company's account/keys; "Business" = each
+tenant brings its own key or buys credits through us. Storage for all secrets: a managed
+secrets store / KMS-encrypted vault (stack TBD), never in the DB in plaintext, never in client
+bundles; per-tenant keys encrypted with a per-tenant data key [I].
+
+| Service (examples, vendor TBD) | Used for | Secret(s) | Owner | Storage | Rotation | Tier / cost notes |
+|---|---|---|---|---|---|---|
+| Geocoding + address autocomplete (e.g. Google Maps Platform, Mapbox, HERE, or self-hosted Pelias/Nominatim) | address autocomplete, lat/lng, timezone | server API key (geocode); separate browser key restricted by HTTP referrer for autocomplete | Platform (shared with 01/02/03 — single key family) | vault; browser key is public-but-restricted | 90 days server; browser key on abuse | per-request fees; cache geocodes per normalized address [I] |
+| Phone parsing | E.164 normalization | none (open-source library) | — | — | library updates | free |
+| Carrier / line-type lookup (e.g. Twilio Lookup) | mobile vs landline (SMS capability) | account SID + auth token (or API key pair) | Platform (shared with 08 SMS account) | vault | 90 days | per-lookup fee; run once per new number, cache 180 days; Scale+ [I] |
+| Email validation (optional) | typo/MX check | API key | Platform | vault | 90 days | MX check can be done free in-house |
+| VIN decode — NHTSA vPIC | VIN → YMM/specs (US/CA market vehicles) | none (public API) | Platform | — | — | free; rate-limit politely, cache by VIN pattern [I] |
+| VIN decode / vehicle catalog — commercial (e.g. DataOne, ChromeData, CarAPI) | trims, factory tire sizes, colors, non-US VINs | API key | Platform (resold) | vault | 90 days | paid; higher tiers [I] |
+| Plate → VIN lookup (commercial provider) | plate lookup [S: llms] | API key + account ID | Platform (resold) or Business BYO | vault | 90 days | paid per lookup; DPPA: vehicle data only; Scale+ |
+| Vehicle history reports (CARFAX / CARFAX Canada partner program [S: llms]) | history in vehicle profile | partner credentials / OAuth client | Platform partnership required | vault | per partner terms | partner agreement needed (Q8); Pro tier |
+| Recalls (NHTSA recalls API) | open recalls | none | Platform | — | — | free |
+| Contact enrichment / skip-trace (vendor TBD) | address → contact ("magic data") | API key | **Business BYO** (default) or platform-resold credits | vault, per-tenant encrypted | business-managed; we prompt every 180 days | per-match fees; off by default; region-gated (§5.8) |
+| DNC registry scrub (FTC SAN access via vendor) | before calling enriched leads | SAN + vendor API key | Business (registry access is per organization) | vault | annual SAN renewal | required only if enrichment + calling enabled [I-legal] |
+| Object storage (photos, imports, exports) | files | access key / workload identity | Platform | vault / workload identity (preferred) | 90 days or keyless | shared platform service |
+| Bot protection for public lead forms (e.g. Turnstile/hCaptcha) | spam control on `leads.submitForm` | site key (public) + secret key | Platform | vault (secret) | 180 days | free tiers available; shared with 01 |
+| Barcode/VIN scan in team app | camera scanning | none (on-device library) or SDK license key | Platform | app config (license key is not secret-grade) | per license | prefer free on-device lib [I] |
+| AI assistant/MCP access tokens to our API | customer/lead/asset commands | per-business OAuth tokens | Business | token store (hashed) | user-revocable; 90-day refresh | scopes per §8 |
+
+### 9.6 Conflicts & decisions for Agent 10
+- **C1 Consent ledger ownership.** 07 §5.9/§7.2 and 08 §5.6 both define an append-only consent
+  ledger; 08's is keyed per business × endpoint (E.164/email) × purpose, 07's per contact point.
+  **Recommendation:** one ledger, **owned by 08** (it handles STOP/HELP, unsubscribes, send-time
+  checks), keyed by endpoint (consent belongs to the number/address, not to a customer row —
+  survives merges and duplicate customers sharing a phone). 07 keeps: capture UIs (CRM add,
+  import attestation, lead forms), `ContactPoint → endpoint` mapping, read projection for
+  badges/filters; `customers.consent.record` becomes a thin proxy to 08's command, and
+  `customer.consent.changed` is dropped in favour of `comms.consent.changed`.
+- **C2 Attempt/session event names** → adopt 01's `portal.session.*`.
+- **C3 Lead win timing.** 04: Won when job reaches `scheduled` / quote approved; declined quote
+  → Lost. 07 proposes: Won at job creation as appointment (a booked, unscheduled job is still a
+  win), and declined quote → stage "Follow-up" with an auto-task, not Lost (owners lose
+  re-quotable deals otherwise). Needs one rule.
+- **C4 Abandonment threshold:** 01 uses 30 min inactivity; 07 default 30 min — aligned; make it
+  one tenant setting owned by 01, read by 07.
+- **C5 Out-of-area capture:** 02 emits rounded point only; 01 calls `CreateLead{reason:'out_of_area'}`
+  only when contact given — aligned with 07 (no lead from anonymous location).
+- **C6 Worker visibility window:** adopt 09's (start − 24 h → end + 72 h).
+- **C7 Intake form ownership:** 02 note says "Agent 01/07"; decision: 01 owns definition,
+  07 owns answers (§0.2).
+
+### 9.7 Tenant branding touchpoints (owner requirement 2026-11-13)
+07 has no theming engine (owned by 01/Agent 10), but its customer-facing and staff surfaces must
+consume the tenant theme tokens (light/dark palettes, radius, shadows, density, custom fonts,
+custom icons, logos per placement, copy overrides):
+- Customer-facing: account/profile, garage cards, vehicle detail, intake form, preference
+  centre, lead form widget, postcard QR landing — all labels overridable ("Garage" → "My cars",
+  "Assets" → "My properties") via copy keys `customers.*`, `assets.*`, `leads.form.*` [I].
+- Asset kind icons and lead source icons are icon-slot tokens (tenant can upload SVGs).
+- Staff CRM: list/board/profile honour the workspace theme (light/dark + custom palettes);
+  stage colours and tag colours are validated for contrast against **both** light and dark
+  palettes (≥ 4.5:1 text contrast) — auto-adjusted text colour on chips [I].
+- Exports/PDFs (vehicle history PDF) use the tenant's document logo placement.

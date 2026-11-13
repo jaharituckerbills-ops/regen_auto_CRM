@@ -1312,3 +1312,294 @@ cost, ROI.
 5. Caps: max rewards per referrer per year (default 10); program budget cap.
 6. Rewards issued via Agent 06 commands (credit ledger / discount code / gift card); 08 never
    writes money balances.
+
+### 5.10 Metric dictionary (every number the owner sees)
+[S: T09 tiles/leaderboard; T17 worker summary; LLMS reporting] — formulas are `[I]` unless noted.
+
+#### 5.10.1 Global conventions
+1. **Time zone.** All bucketing uses `Business.timezone` (IANA). A "day" is local midnight to the
+   next local midnight, so DST days have 23 or 25 hours. "Today" means the business-local date.
+   In a multi-business hub [S: LLMS], each business is bucketed in its own zone and labeled. Its
+   numbers are never summed across currencies (matches Agent 05's rule).
+2. **Week** starts on Monday by default (business setting). The default range is the
+   current week, matching Transactions [S: T17].
+3. **Two money bases, always labeled:**
+   - **Accrual (default for Dashboard and Reports):** revenue is recognized on the job's
+     revenue-recognition date. That is Agent 05's ledger `effective_date` for revenue accounts
+     4000–4030, posted when Agent 04 finalizes the invoice, which in practice is at job completion.
+   - **Cash (default for Transactions views):** money is counted on the payment or refund
+     `effective_date` (business-local), as Agent 05's RevenueAttribution does.
+   The two bases never mix inside one tile. The basis badge ("Accrual" or "Cash") appears in the tile
+   footer and in CSV headers.
+4. **Source of truth.** Money metrics read Agent 05's ledger (through rollups). Job counts read
+   Agent 04/03 job state events. Ratings read 08's reviews. Hours read Agent 09's timesheets.
+   08 never recomputes money from job line items when a ledger fact exists.
+5. **Exclusions everywhere:** test-mode jobs and payments, deleted/voided documents, jobs
+   whose business has `is_demo = true`, and quote-only jobs that were never booked.
+6. **Money** is integer minor units. Sums are exact. Averages and ratios round half-up only for
+   display (5.14).
+
+#### 5.10.2 Money metrics
+| ID | Name (UI) | Formula | Basis/date | Includes | Excludes |
+|---|---|---|---|---|---|
+| M-GROSS | Gross sales | Σ credits to revenue accounts 4000 (services), 4010 (add-ons), 4015 (products), 4020 (travel fees) | Accrual: revenue effective_date | Customer add-ons and company add-ons [S: T07], travel fees [S: T11] | Tax, tips, gift card sales, deposits not yet earned |
+| M-DISC | Discounts | Σ debits to 4900 (contra) | Accrual | Discount codes, recurring and subscription discounts [S: T14, T01], manual discounts | — |
+| M-REFUND | Refunds (revenue portion) | Σ debits to 4950, revenue portion only | Accrual view: posted on the **refund date** (no restatement, matching the ledger). "Restated" view: allocated back to the original job's recognition date (optional toggle) | — | Refunded tax, refunded tips |
+| M-FEE-INC | Cancellation & no-show fees | Σ credits to 4030 | Accrual | Fees [S: T05 cancellation policy] | — |
+| **M-NET** | **Revenue (Net sales)** — the default "Revenue" everywhere | `M-GROSS − M-DISC − M-REFUND + M-FEE-INC` | Accrual | Gift card *redemptions* count, because the service was delivered | Tax, tips, gift card *sales* (a liability), processing fees, subscription prepayments not yet consumed |
+| M-COLLECTED | Collected revenue | Σ succeeded payments' `amount − tip − tax` − Σ succeeded refunds' revenue portion | Cash: payment/refund date | Card, cash, check, other tenders [S: T16], invoice payments | Gift card and store-credit tenders (non-cash), tips, tax |
+| M-CASHIN | Total money in | Σ all succeeded tenders, including tips, tax and gift card sales | Cash | Everything received | Refunds shown as a separate negative line |
+| M-TAX | Tax collected | Σ credits to 2200 − refund reversals | Accrual (cash toggle) | Zone tax [S: T11] | — |
+| M-TIPS | Tips | Σ tip portions of succeeded payments − refunded tips | Cash | — | — |
+| M-PROC-FEE | Processing fees | Σ processor fee per payment (Agent 05 `fee_minor`) | Cash | — | Estimated fees (never shown) |
+| M-NET-DEPOSIT | Net deposits | M-CASHIN − refunds − M-PROC-FEE (card tenders only) | Cash | — | Cash/check |
+| M-COST | Cost of services | Σ line `cost_snapshot × qty` from Agent 02 cost fields [S: T06, T07] on recognized lines | Accrual | — | Labor (separate: M-LABOR) |
+| M-LABOR | Labor cost | Σ approved timesheet hours × effective rate [S: T03] | Timesheet date | Approved and paid entries | Rejected or pending entries |
+| M-MARGIN | Gross margin | `M-NET − M-COST` (and % = margin / M-NET) | Accrual | — | Labor, unless "include labor" is toggled |
+| M-AOV | Average ticket | `M-NET / M-JOBS-DONE` over the same period | Accrual | $0 jobs are counted unless the "exclude $0 jobs" toggle is on | — |
+| M-MRR | Monthly recurring revenue | Σ active subscriptions' normalized monthly price (weekly × 52/12; yearly ÷ 12; a prepaid commitment is spread over its term) from Agent 06 | Snapshot at period end | Active and past-due subscriptions | Canceled or paused |
+| M-GC-SOLD | Gift cards sold | Σ gift card sale amounts (liability) | Cash | — | Not part of revenue |
+| M-AR | Outstanding invoices | Σ open invoice balances (Agent 04/05) | Snapshot | — | Voided or written-off invoices |
+
+#### 5.10.3 Job & booking metrics
+| ID | Name | Formula | Date basis |
+|---|---|---|---|
+| M-BOOKINGS | Bookings | Count of booking events: job created in a booked state (not a draft quote). A recurring series counts as 1 booking; each materialized occurrence counts in M-JOBS-SCHED | `booked_at` local date |
+| M-JOBS-SCHED | Jobs scheduled | Jobs whose scheduled start falls in the period and whose status is not canceled | Scheduled start (job tz converted to business date) |
+| M-JOBS-DONE | Jobs completed ("bookings completed" [S: T09]) | Jobs whose latest transition into `completed` falls in the period. A job reopened and completed again counts once, on its last completion date. Jobs canceled after completion are excluded | `completed_at` |
+| M-CANCEL | Cancellations / rate | Count of jobs canceled with a scheduled start in the period; rate = canceled ÷ (completed + canceled + no-show) for the same scheduled-start window. Split by actor: customer, business, system | Scheduled start |
+| M-NOSHOW | No-shows / rate | Same as M-CANCEL, using status `no_show` (Agent 03/04) | Scheduled start |
+| M-RESCHED | Reschedules | Count of `rescheduled` events whose time changed, by actor | Event date |
+| M-LEAD-TIME | Booking lead time | Median of `(scheduled_start − booked_at)` in hours, over jobs booked in the period | `booked_at` |
+| M-DUR-ACC | Duration accuracy | Median of `actual_minutes ÷ scheduled_minutes` over completed jobs. Actual = started → completed from Agent 04 | `completed_at` |
+| M-ON-TIME | On-time arrival | Share of jobs whose arrival (start) is ≤ scheduled start + grace (10 min) | `completed_at` |
+| M-UTIL | Utilization (business) | Σ scheduled minutes of completed jobs ÷ Σ available minutes across active workers (Agent 09 availability minus time off) | Day |
+| M-SOURCE | Booking sources [S: T05] | M-BOOKINGS grouped by `source` (online portal, customer app, CRM, worker app, API/MCP, recurring, quote acceptance) and by `attribution.channel` (UTM, referral, postcard, short link [S: T06]) from Agent 01 | `booked_at` |
+| M-FUNNEL | Booking funnel | Portal visits (unique visitor-days, Agent 01 `portal.visit.recorded`) → sessions started → contact captured → booked. Step conversion = next ÷ previous | Event date |
+| M-ABANDON | Abandoned sessions / recovered | Abandoned = sessions that captured contact details and then reached `abandoned`. Recovered = abandoned sessions whose contact booked within 7 days (any source). Rate = recovered ÷ abandoned | Abandon date |
+
+#### 5.10.4 Customer metrics
+| ID | Name | Formula |
+|---|---|---|
+| M-CUST-NEW | New customers | Customers whose **first completed job** falls in the period. Using created date instead would count imports [S: T18] as new |
+| M-CUST-CREATED | Customers added | Customers created in the period, any source |
+| M-CUST-RET | Returning customers | Customers with a completed job in the period **and** a completed job before the period start |
+| M-CUST-ACTIVE | Active customers | Customers with ≥1 completed job in the trailing 365 days at period end |
+| M-REBOOK | Rebook rate | Cohort = jobs completed in the period. A job is "rebooked" if the same customer had another non-canceled job with `booked_at ∈ (completed_at − 0, completed_at + N days]`, **or** already held a future job at completion time (recurring or subscription). Rate = rebooked ÷ cohort. N defaults to 60. A cohort less than N days old is labeled "maturing" |
+| M-LTV | Customer lifetime value | Σ M-NET for the customer, all time |
+| M-BEST-CUST | Best customers [S: T09] | Rank by M-NET in the period. Tie-break: more completed jobs, then most recent completion, then name. Optional switch to rank by job count |
+| M-CHURN-RISK | Lapsed customers | Active customers whose days since last completed job exceed 1.5 × their median interval between jobs (minimum 2 prior jobs), or exceed 120 days for one-time customers. Feeds the "haven't booked in a while" audiences [S: T10] |
+| M-RATING-GIVEN | Rating given | Average of ratings this customer gave [S: T09 profile ratings] |
+
+#### 5.10.5 Service, area, team metrics
+| ID | Name | Formula |
+|---|---|---|
+| M-SVC-REV | Top services [S: T09] | Per service: Σ net line revenue. Each line's revenue = line gross − allocated discount − allocated refund (allocations from Agent 05, largest remainder). Also shows quantity, jobs containing the service, margin (line cost), and share of M-NET |
+| M-ADDON-ATTACH | Add-on attach rate | Completed jobs with ≥1 add-on ÷ M-JOBS-DONE. Add-on revenue per job = add-on net ÷ jobs done [S: T07] |
+| M-AREA | Service areas [S: T09, T11] | Per zone or shop: M-JOBS-DONE, M-NET, travel fees (4020), average travel minutes. The zone is the **snapshot** on the job at booking time, so later redrawing a zone does not rewrite history. Jobs outside any zone (manual override [S: T11]) go to "Outside areas" |
+| M-W-REV | Revenue generated (worker) [S: T09, T17] | Accrual: for each completed job, line-level worker assignment if the job is split by service [S: LLMS], otherwise job M-NET × worker `share_bp` (Agent 09/05 shares; default equal). Largest-remainder cents go to the lead worker. Cash view = Agent 05 RevenueAttribution rows |
+| M-W-JOBS | Bookings completed (worker) [S: T09] | Count of completed jobs where the worker was assigned at completion. A split job gives **1 full count to each worker** (display) and a fractional `share_bp` count (option for fairness) |
+| M-W-REVIEWS | Reviews received (worker) [S: T09] | Count of ratings received in the period on jobs the worker was on, plus average rating. For **ranking**, use the Bayesian average `(C·m + Σr) ÷ (C + n)`, where m = business average over the trailing 365 days and C = 5. This stops a worker with a single 5★ rating from ranking first |
+| M-W-UTIL | Utilization (worker) | Scheduled minutes of the worker's completed jobs ÷ the worker's available minutes |
+| M-W-HOURS | Hours worked | Σ approved timesheet hours, net of unpaid breaks [S: T03] |
+| M-W-REV-HR | Revenue per labor hour | M-W-REV ÷ M-W-HOURS (shown only when hours > 0) |
+| M-W-UPSELL | Upsell revenue | Σ net of lines added by the worker after booking (`addedByWorkerId`, Agent 04) [S: T07 "upsells … in the worker app POS"] |
+| M-W-TIPS | Tips | Agent 05 tip distribution rows |
+
+#### 5.10.6 Leaderboard, MVP, reviews, presence
+- **Leaderboard metrics** [S: T09]: bookings completed (M-W-JOBS), reviews received
+  (M-W-REVIEWS, count; average and Bayesian average shown alongside), revenue generated
+  (M-W-REV). We add **Composite** [I]: the mean of each worker's percentile rank across the three
+  metrics, with configurable weights.
+- **Eligibility:** workers active at any point in the period with ≥ 1 completed job (minimum
+  configurable). Deactivated workers keep their history but are hidden from the current
+  period after deactivation (Agent 09 contract).
+- **Ranking:** descending by value. Ties share a rank (competition ranking "1, 1, 3"). Display order
+  among ties uses a secondary metric (revenue → jobs → name).
+- **MVP view** [S: LLMS]: rank 1 on Composite (default) or on the selected metric, with a
+  minimum of 5 completed jobs in the period. If nobody qualifies, the view says "Not enough
+  activity yet".
+- **Business review metrics:** count, average, star distribution, share of 5★, response rate
+  (low-rating tasks resolved ÷ low ratings), public-link click rate (Google clicks ÷ ratings).
+- **Active now** [S: LLMS]: customers = distinct contacts or anonymous visitors with a booking-site
+  or customer-app heartbeat in the last 5 minutes (from Agent 01). Team = workers with a
+  worker-app heartbeat in the last 5 minutes **or** currently clocked in (Agent 09).
+- **Team availability** [S: LLMS]: from Agent 09/03, today's free/busy per worker with next
+  free slot.
+
+#### 5.10.7 Marketing metrics
+Defined in 5.7 (campaign and drip metrics, attribution). In addition:
+- **SMS cost** = Σ segments × (provider rate + carrier fee).
+- **Email cost** = emails × rate.
+- **Postcard cost** = pieces × (print + postage).
+Shown per campaign, per drip and per month. **List growth** = net change in marketing-consented
+contacts per channel. **Opt-out rate** = opt-outs ÷ delivered marketing messages.
+
+### 5.11 Dashboard tile catalog
+[S: T09 "visual tiles that are easy to read and customize"; LLMS new dashboard] — tile set and
+sizes `[I]`.
+
+| Tile ID | Title | Viz | Metric(s) | Default size (cols×rows) | Default on | Tier |
+|---|---|---|---|---|---|---|
+| T-REV-TREND | Revenue trend [S: T09] | Line or column with comparison line | M-NET by day/week/month | 8×3 | Yes | All |
+| T-KPI | KPI row | Stat tiles with sparkline and delta | M-NET, M-JOBS-DONE, M-AOV, M-CUST-NEW, M-REBOOK, avg rating | 12×1 | Yes | All |
+| T-GOALS | Goals [S: LLMS] | Progress bars with pace marker | Goal metrics | 12×1 | Yes | All |
+| T-UPCOMING | Upcoming schedule load | Column chart, next 14 days | M-JOBS-SCHED and booked value | 6×2 | Yes | All |
+| T-TOP-SVC | Top services [S: T09] | Horizontal bar | M-SVC-REV top 5 | 4×2 | Yes | All |
+| T-BEST-CUST | Best customers [S: T09] | Ranked list | M-BEST-CUST top 5 | 4×2 | Yes | All |
+| T-TOP-WORKERS | Top team members / MVP [S: T09, LLMS] | Ranked list with podium | Leaderboard metric | 4×2 | Yes | All |
+| T-AREAS | Service areas [S: T09] | Bar list or map choropleth (top tier) | M-AREA | 4×2 | Yes | All (map: Top) |
+| T-SOURCES | Booking sources [S: T05] | Donut, ≤ 6 slices + "Other" | M-SOURCE | 4×2 | Yes | All |
+| T-FUNNEL | Booking funnel | Funnel bars | M-FUNNEL, M-ABANDON | 6×2 | No | All |
+| T-REVIEWS | All reviews [S: LLMS] | Feed and average | Latest reviews, M-W-REVIEWS business-wide | 4×3 | Yes | All |
+| T-PHOTOS | All photos [S: LLMS] | Grid of latest job photos (Agent 04) | — | 4×2 | Yes | All |
+| T-TEAM-AVAIL | Team availability [S: LLMS] | Timeline strips | 5.10.6 | 6×2 | Yes | All |
+| T-NOTIFS | Notifications [S: LLMS] | Feed | A-series in-app items | 4×3 | Yes | All |
+| T-ACTIVE | Active now [S: LLMS] | Counters and avatars | 5.10.6 | 4×1 | Yes | All |
+| T-FORECAST | Forecast [S: LLMS] | Line with confidence band | 10.12 | 8×3 | No | Mid |
+| T-CASH | Money in / payouts | Stat and bar | M-COLLECTED, M-TIPS, M-PROC-FEE, next payout (Agent 05) | 4×2 | No | All |
+| T-AR | Unpaid invoices | Stat and aging buckets | M-AR (0–30 / 31–60 / 61–90 / 90+) | 4×2 | No | All |
+| T-SUBS | Subscriptions | Stat and line | M-MRR, active subscriptions, churn | 4×2 | No | All |
+| T-MKT | Marketing results | Table | Top campaigns and drips by attributed revenue | 6×2 | No | Mid |
+| T-LEADS | Leads pipeline | Stage bars | Agent 07 lead stages, abandoned count | 4×2 | No | All |
+| T-UTIL | Utilization | Gauge per worker | M-UTIL, M-W-UTIL | 4×2 | No | Mid |
+| T-HEATMAP | Job heatmap [S: LLMS Pro "heatmaps"] | Map density | Completed jobs by location | 8×4 | No | Top |
+| T-CUSTOM | Custom metric [S: LLMS Pro "custom analytics"] | Any | User-defined metric over the semantic layer (10.10.5) | any | No | Top |
+| T-MARGIN | Profit | Stat and bar | M-MARGIN, M-COST, M-LABOR | 4×2 | No | Mid |
+
+Tile rules:
+- A tile's period follows the dashboard range unless the tile overrides it (the override is shown
+  as a chip).
+- Each tile has at most 1 query and is served from rollups (10.10).
+- Every tile exposes "Download CSV" and "Download PNG" [S: T09] and an "i" popover with the
+  metric definition and basis.
+
+### 5.12 Messaging providers & budget (cost model)
+All prices are approximate public list prices from memory **[I — re-quote before committing]**. The
+design is provider-agnostic (adapter per provider, 7.7 `ProviderAccount`).
+
+| Need | Primary (budget) | Alternates | Approximate cost basis | Notes |
+|---|---|---|---|---|
+| SMS/MMS US/CA (two-way, 10DLC and toll-free) | Telnyx | Twilio, Bandwidth, Plivo, AWS End User Messaging | Telnyx ≈ $0.004 per segment; Twilio ≈ $0.008 per segment; plus carrier pass-through ≈ $0.002–0.005 per segment on registered 10DLC; numbers ≈ $1–2 per month; MMS ≈ 2–4× SMS | Choose a provider with an ISV/reseller 10DLC API (subaccounts per business) |
+| 10DLC registration | via SMS provider (TCR) | — | Brand ≈ $4 one-time; secondary vetting ≈ $40 (optional); campaign vetting ≈ $15 one-time; campaign ≈ $1.50–$10 per month | Sole-proprietor brand for businesses without an EIN (1 campaign, 1 number, low throughput) |
+| Toll-free verification | via SMS provider | — | Verification fee ≈ $0 at most providers; TF number ≈ $2 per month; per-message rates similar to 10DLC | Recommended starter default: no monthly campaign fee, faster approval |
+| Transactional email | Amazon SES | Postmark (best deliverability for transactional), Resend, Mailgun, SendGrid | SES ≈ $0.10 per 1,000; Postmark ≈ $15 per 10k | Separate IP pools or streams for transactional and marketing |
+| Marketing email | Amazon SES (separate configuration set and IP pool) | Mailgun, SendGrid | Same as above | One-click unsubscribe headers required for bulk senders by Gmail and Yahoo (since 2024) [I] |
+| Push | FCM (Android and web), APNs (iOS) direct | OneSignal, Expo (if the app stack chooses it) | Free | Branded apps need per-tenant credentials (Agent 01/11) |
+| Postcards | Lob | PostGrid, Click2Mail | ≈ $0.60–$1.10 per 4×6 including postage, by mail class and volume | Address verification (CASS/NCOA) included |
+| Link shortening and tracking | Self-hosted on tenant domain (Agent 01) | — | ~0 | Public shorteners are filtered by carriers |
+| Reviews (public) | Google Business Profile API | — | Free (OAuth per business) | Optional review fetch and reply |
+| Phone number intelligence | Provider lookup (line type, carrier) | — | ≈ $0.005 per lookup | Run once per new number, cached, so landlines are not texted |
+| Reassigned Numbers Database | FCC RND | — | Subscription tiers | Top tier, for consent older than 12 months |
+| Optional AI copy / intent | Platform LLM provider | — | Per token | Used by AI marketing builder [S: LLMS] and opt-out intent detection |
+
+**Per-business monthly cost formula:**
+`SMS = Σ_messages segments × (rate + carrier_fee) + numbers × number_fee + campaign_fee`.
+
+**Worked example for a starter business** (100 jobs per month) [I]:
+- Message mix: N-B01 + N-B04 + N-D01 + N-R01 ≈ 4 SMS per job, × 1.3 average segments = 520
+  segments.
+- Cost at Telnyx: 520 × ($0.004 + $0.003) ≈ **$3.64**.
+- Fixed costs: TF number $2 → about **$6 per month total**.
+- Email: ≈ 600 transactional emails ≈ **$0.06**.
+- Result: a starter plan can include about 500 SMS segments and 5,000 emails and stay profitable.
+
+Budget controls:
+- Per-business monthly cap with alerts at 50%, 80% and 100% (A-17).
+- At 100%: **marketing pauses**, transactional continues. Owner can choose "pause SMS
+  transactional too, fall back to email".
+- Overage is billed at pass-through plus margin (platform billing outside this module).
+
+**Failover realities** [I]:
+- **Email** can fail over between providers. Domain authentication must be set up for both
+  (dual DKIM).
+- **SMS cannot fail over transparently.** A number and its 10DLC campaign live on one provider. The
+  fallback for a transactional SMS outage is email or push, not a second SMS provider.
+- Platform-level SMS redundancy would need a second registered number per business on a second
+  provider. That costs double the fees, so it is offered only on the top tier.
+
+### 5.13 Tenant branding of every outbound surface (contract with Agent 11)
+[Owner requirement 2026-11-13: emails and SMS links match tenant branding] — mechanics `[I]`.
+1. **Brand source.** All rendering reads Agent 11's `BrandTheme` (versioned):
+   - light and dark palettes (full token sets);
+   - logo variants per placement, including an **email-header logo** and a **dark-mode logo**,
+     each with sizing controls;
+   - custom fonts (heading and body);
+   - radius, shadow and spacing tokens;
+   - icon set;
+   - copy overrides.
+   Each `OutboundMessage` stores `brand_theme_version` so the email a customer received can be
+   reproduced exactly.
+2. **Email adaptation.** Email clients are limited, so the renderer maps tokens:
+   - **Colors:** palette → inline styles. Dark mode → `color-scheme` meta and
+     `@media (prefers-color-scheme: dark)` overrides for clients that support it (Apple Mail,
+     iOS, some Outlook versions). Gmail forces its own inversion, so logos ship with
+     transparent-safe variants.
+   - **Fonts:** uploaded custom fonts → `@font-face` (works in Apple Mail and iOS) with a mapped
+     fallback stack for Gmail and Outlook. Agent 11 stores a "closest web-safe fallback" per font.
+   - **Shape and depth:** radius → button border-radius (VML fallback for Outlook). Shadows are
+     dropped in email; flat elevation is used instead.
+   - **Icons:** SVG icons are rasterized to PNG at 2× (Gmail strips SVG).
+   - **Accessibility:** the contrast checker runs on the **email-adapted** palette. If a tenant
+     palette fails 4.5:1 for button text, the renderer picks black or white text automatically
+     and warns in the editor.
+3. **Copy overrides.** Every customer-facing label in system templates (button text such as "Manage
+   booking" and "Pay now", headings, footers) is a key in Agent 11's copy-override registry.
+   Template bodies the business edits are their own copy. Default copy resolves through overrides
+   at render time.
+4. **SMS links on the tenant's domain.** Every SMS or email link (booking, manage, pay, tracking,
+   review, preference, unsubscribe, resume booking, referral, short links) is generated on the
+   tenant's **branded host**:
+   - the custom domain (e.g. `book.acme.com`, Agent 01) when it is active;
+   - otherwise the tenant's platform subdomain.
+   Link format is `https://{host}/s/{token}` (short) or a route path. If the custom domain
+   detaches (`portal.domain.detached`), new links use the subdomain. Old links keep working
+   through the platform redirect (Agent 01 keeps the legacy host alive).
+   Each SMS carries the **business name prefix** from `BrandTheme.display_name` (or an SMS-specific
+   short name, ≤ 20 characters).
+5. **Landing pages** for those links (tracking, rating, preference center, unsubscribe, chat, pay)
+   render with the tenant theme. They honor the visitor's light or dark preference with a toggle
+   (Agent 11 requirement) and are responsive (phone first).
+6. **Push.** Tenant-branded app (top tier): uses the tenant app icon and name. Otherwise the
+   platform app uses the business name in the title.
+7. **Postcards.** The designer starts from the brand theme (CMYK conversion warning for colors out
+   of print gamut; minimum logo resolution 300 dpi at print size).
+8. **Platform branding.** "Powered by" footers in emails and landing pages can be removed on the
+   tier Agent 01/11 defines (Fieldd: Pro [S: LLMS]).
+9. **Staff-facing messages** (W- and A-series emails) use the business theme too (the business's CRM
+   workspace is branded per owner requirement). Platform-account emails (billing for our own
+   subscription) use platform branding.
+
+### 5.14 Money, rounding and numeric display in reports
+1. All stored values are integer minor units (`bigint`). Rollups store sums only, never
+   averages.
+2. Averages and ratios are computed at query time from integer sums and counts. Display rounding
+   is half-up at the final step only:
+   - money to cents;
+   - percentages to 1 decimal place;
+   - ratings to 1 decimal place (2 in CSV).
+3. Splits (worker shares, discount and refund allocation to lines) use **largest remainder**. The
+   allocations always sum exactly to the source amount. The remainder goes to the lead worker or
+   the largest line (consistent with Agent 05).
+4. CSV exports:
+   - money as decimal strings with the currency code column (`12.50`, `USD`), never float;
+   - dates in ISO 8601 business-local with an offset;
+   - a header comment row with the basis (accrual/cash), time zone and generation time.
+5. Percent change versus the previous period: if the previous value is 0, show "—" (never ∞ or
+   NaN). For negative bases, show the absolute change.
+
+### 5.15 Ownership reconciliation (with specs already written)
+- **Consent ledger:** Agent 07 owns the **system of record** (07 §"consent ledger", events
+  `customer.consent.changed`). Agent 08:
+  - **captures** keyword, unsubscribe, complaint and bounce evidence and writes it **through
+    07's command** `customer.consent.record` (schema = 5.6.1 `ConsentEvent`);
+  - **enforces** consent at send time from a local read projection `SendEligibility`, updated
+    from `customer.consent.changed` and written synchronously on opt-out, so a STOP takes
+    effect even before the projection catches up;
+  - owns the **email/phone suppression list** (bounces, complaints, carrier blocks).
+- **Templates for quotes and invoices:** Agent 04 owns the document style model. Agent 08 owns the
+  email and SMS templates that carry them [S: T04] (matches 04 §"Settings → Communication → Email").
+- **Abandoned-booking capture:** Agents 01/07 own sessions and leads. 08 owns the drip that
+  follows up.
+- **Masked customer↔worker messaging:** Agent 09 requests a relay (09 contact-visibility rule);
+  08 provides it via the business number (4.14, 7.5).
