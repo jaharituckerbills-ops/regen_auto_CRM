@@ -793,12 +793,12 @@ prefix is `brand.` (and `appearance.` for viewer preferences).
 ### 4.11 Viewer changes appearance mode
 - **Customer on web**: menu choice → set cookie `pl_mode=dark|light|system` → `<html data-mode>`
   attribute updated without reload (CSS already contains both palettes §10.5) → if signed in,
-  `appearance.customer.updated` (stored on portal account; 07 stores profile? no — portal account
-  owned by 01; we store a small preference row keyed by account id) [D].
+  `appearance.customer.updated`; stored in 11's `AppearancePreference` row keyed by the portal account
+  id (the portal account itself is owned by 01) [D].
 - **Staff**: `UpdateMyAppearance` → stored per user; pushed to all their open sessions via the
   realtime channel; desktop/team apps apply immediately.
-- **Business changes default mode**: affects only viewers with `system`/no cookie? No — default applies
-  to viewers **without an explicit choice**; `system` is itself an explicit choice once selected.
+- **Business changes default mode**: applies only to viewers **without an explicit choice**; a viewer
+  who picked `system` keeps following their device (it is an explicit choice once selected).
 
 ### 4.12 Email render with brand (contract with 08)
 1. 08 renders template T for tenant at send time → asks 11 for `EmailTheme(releaseId)` (cached):
@@ -1069,11 +1069,11 @@ guardrail checks.
 
 | Name | Min width (CSS px) | Typical device | Layout columns | Gutter |
 |---|---|---|---|---|
-| `xs` | 0 | small phones (320–389) | 4 | 16 |
-| `sm` | 390 | phones (390–599) | 4 | 16 |
-| `md` | 600 | large phones landscape, small tablets, iPad mini portrait (744) | 8 | 24 |
-| `lg` | 900 | tablets portrait (820–1024) / landscape small | 12 | 24 |
-| `xl` | 1200 | tablets landscape (1180–1366), laptops | 12 | 32 |
+| `xs` | 0 | small/standard phones portrait (320–479) | 4 | 16 |
+| `sm` | 480 | large phones, phones landscape (480–767) | 4–8 | 16 |
+| `md` | 768 | tablets portrait (iPad mini 744 falls in `sm` upper edge → treated as `md` by container queries; iPad 820/834) | 8 | 24 |
+| `lg` | 1024 | tablets landscape (1024–1194), small laptops | 12 | 24 |
+| `xl` | 1280 | laptops, iPad Pro 12.9" landscape (1366) | 12 | 32 |
 | `2xl` | 1536 | desktops | 12 (max content 1440) | 32 |
 
 - Breakpoints apply to **viewport**-level layout (shell, nav); **components use container queries**
@@ -1170,10 +1170,10 @@ build; we render splash after launch from OTA tokens for subsequent "loading" st
 
 - All artifacts are content-addressed: URL contains hash → `Cache-Control: public, max-age=31536000,
   immutable` [I].
-- HTML is cached at the edge per `(host, path, locale, mode-cookie-bucket?)` — **no**: mode is applied
-  client-side via attribute and both palettes ship inline, so HTML is mode-independent except for the
-  initial `data-mode` attribute, which is set by an edge function from the cookie (tiny HTML rewrite)
-  → cache key excludes mode, avoiding cache fragmentation [D].
+- HTML is cached at the edge per `(host, path, locale)` — mode is **not** in the cache key: both
+  palettes ship inline, so HTML is mode-independent except the initial `data-mode` attribute on
+  `<html>`, which an edge function rewrites from the `pl_mode` cookie (tiny streaming rewrite). This
+  avoids cache fragmentation while still server-rendering the right mode [D].
 - Edge pointer `tenant:{id}:brand` (version + manifest) has TTL 60 s as safety net; publish writes it
   synchronously and purges HTML by tag; stale-while-revalidate ≤ 30 s.
 - Native: `GET /app/theme` returns `ETag = manifestHash`; app sends `If-None-Match`; 304 is cheap.
@@ -1216,8 +1216,8 @@ listed are on every tier (with only quantity limits).
   and `height` attributes always emitted (aspect ratio known) → zero layout shift.
 - Optical sizing default (`Apply suggested sizes`): `h = clamp(hMin, hBase × (aspect)^-0.35, hMax)`
   so a 6:1 wordmark renders shorter than a 1:1 mark with similar visual weight [D, heuristic].
-- Favicon/app icon from a **mark**: if only a wide logo exists, we crop to first glyph? **No** —
-  we use a monogram (initials on primary) and ask for a mark, never auto-crop text [D].
+- Favicon/app icon come from a **mark**: if only a wide logo exists we do **not** auto-crop it; we use a
+  monogram (initials on primary) and prompt the owner to upload a mark [D].
 - App icon iOS: 1024×1024 PNG, no transparency (App Store requirement [I]); we composite on background
   token. Android adaptive: 108×108 dp foreground with logo inside the 66 dp safe circle [I]; monochrome
   layer for Android 13 themed icons generated from the mark silhouette.
