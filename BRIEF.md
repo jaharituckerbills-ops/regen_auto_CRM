@@ -74,6 +74,30 @@ Phase 2 (after video): reconcile with the video, then build guideline, then code
 | 09 | Team, Permissions & Timesheets | workers, invites, RBAC matrix, service/zone assignment, availability, calendar sync, timesheets, pay rates | 03, 13 |
 | 10 | Systems Integrator — "the brain" | runs AFTER 01–09: unified entity graph, event catalog, end-to-end flows, cross-module contracts, conflicts, master index | all |
 
+| 11 | Branding, Theming & Responsive Design System | tenant brand customization on every surface, light/dark themes, design tokens, fonts/logos/icons upload, responsive desktop/tablet/phone, native-app surfaces | all + owner requirements below |
+
+## Owner requirements added 2026-11-13 (apply to every agent)
+- **Deep tenant branding.** Every business must be able to make the booking site, customer
+  portal/app, emails, SMS links, quotes/invoices — and its own CRM workspace — match its brand:
+  - Default light and dark themes, **plus fully editable color palettes for both modes**
+    (not just one accent color); end-customer and staff can switch light/dark.
+  - Adjustable **shadows** (elevation), corner radius, spacing density.
+  - **Custom fonts** uploaded by the business (headings/body), with sizes/weights.
+  - **Custom icons** (choose icon set or upload SVGs for categories/services/nav).
+  - **Logo uploads with sizing controls** per placement (header, mobile header, emails,
+    invoices, favicon/app icon), light- and dark-mode logo variants.
+  - Text/copy overrides for every customer-facing label.
+- **Responsive:** must work properly on desktop, tablet and phone.
+- **Native apps (later phase):** a real desktop app and iPhone app so staff can adjust a
+  client's package on site, or take a phone call and build a service/booking for the client live.
+- **API keys & integrations register:** list every third-party service, the keys/secrets it
+  needs, where they're stored, who owns them (platform vs. each business), and rotation.
+- **Later phases (do not decide now):** security review, timeout/slow-load risk review, then
+  choosing production-grade infrastructure "leagues better and safer than Supabase".
+- **Video:** the owner's walkthrough (customer side of a Fieldd-powered business site) is at
+  https://youtu.be/vyELvdWCdnc but is not yet readable from this environment; it will be
+  analyzed once the owner uploads the file. Keep "Verify against video" checklists.
+
 Notification ownership: Agent 08 owns the master notification catalog; other agents list the
 triggers their module fires and reference 08.
 
