@@ -1300,3 +1300,860 @@ publish). Plan loss → `suspended_plan`.
 `unset (business default) → light | dark | system`; `system` follows `prefers-color-scheme` changes live
 (`matchMedia` listener) without reload; signed-in choice syncs across devices; cookie wins on device
 until next sign-in sync where **most recent timestamp wins**.
+
+---
+
+## 7. Data model (stack-agnostic, TypeScript-style)
+
+### 7.1 Entities
+
+```ts
+type ID = string;            // ULID/UUIDv7
+type Instant = string;       // ISO-8601 UTC
+type Hex = string;           // "#RRGGBB" (normalized lowercase 6-digit, no alpha)
+type ColorValue = Hex | { alias: TokenPath } | { hex: Hex; alpha: number }; // alpha 0..1 only where allowed
+type TokenPath = string;     // e.g. "palette.primary.600", "color.bg.surface"
+type Locale = string;        // BCP-47, e.g. "en-US"
+type Mode = 'light' | 'dark';
+type ModePreference = 'light' | 'dark' | 'system';
+type Surface = 'booking' | 'account' | 'customer_app' | 'email' | 'sms_page' | 'document'
+             | 'tracking' | 'embed' | 'qr' | 'crm' | 'team_app';
+type PlacementKey =
+  | 'web_header_desktop' | 'web_header_mobile' | 'account_sidebar' | 'email_header'
+  | 'document_header' | 'document_footer_mark' | 'favicon' | 'app_icon' | 'splash'
+  | 'pwa_icons' | 'og_image' | 'crm_sidebar' | 'crm_sidebar_collapsed' | 'crm_login'
+  | 'team_app_header' | 'qr_center' | 'loading_mark' | 'map_pin_avatar';
+
+// ---------- Brand Kit (one per business; multi-brand later = 1:N) ----------
+interface BrandKit {
+  id: ID; tenantId: ID;                         // UNIQUE(tenantId)
+  draft: BrandDraft;
+  liveReleaseId: ID;                            // FK BrandRelease (status 'live')
+  scheduledReleaseIds: ID[];
+  managedByTemplateId?: ID;                     // hub template (pro)
+  lockedSections: ThemeSection[];               // from template locks
+  createdAt: Instant; updatedAt: Instant;
+}
+
+type ThemeSection = 'colors' | 'typography' | 'logos' | 'icons' | 'shape' | 'copy' | 'surfaces' | 'custom_css';
+
+interface BrandDraft {
+  revision: number;                             // optimistic concurrency; +1 per accepted patch
+  sectionRevisions: Record<ThemeSection, number>; // enables per-section merge (§10.13)
+  theme: ThemeDocument;                         // §7.2 schema
+  copy: { overrides: CopyOverride[] };          // draft overrides only
+  customCssId?: ID;
+  updatedBy: ID; updatedAt: Instant;
+}
+
+// ---------- Releases ----------
+interface BrandRelease {
+  id: ID; tenantId: ID;
+  version: number;                              // monotonic per tenant
+  status: 'compiling' | 'ready' | 'scheduled' | 'live' | 'superseded' | 'failed' | 'cancelled';
+  theme: ThemeDocument;                         // frozen copy
+  resolvedTokens: ResolvedTokens;               // full layer 0–5 resolution, both modes (§7.3)
+  copyBundle: { locale: Locale; overrides: Record<string, string> }[];
+  customCss?: { sanitizedCss: string; hash: string; included: boolean; exclusionReason?: string };
+  assetRefs: { assetId: ID; sha256: string; role: string }[];
+  fontRefs: ID[];                               // FontFamily ids
+  manifest?: ArtifactManifest;
+  compilerVersion: string;                      // e.g. "theme-compiler@3.4.1"
+  manifestRevision: number;                     // bumps on platform refresh recompiles (v12.c3)
+  contrastReport: ContrastReport;
+  contrastOverride?: { by: ID; at: Instant; typedConfirmation: string; failingPairs: string[] };
+  rollbackOfVersion?: number;
+  scheduleAt?: Instant;
+  note?: string; name?: string; pinned: boolean;
+  publishedBy: ID; publishedAt?: Instant;
+  idempotencyKey: string;                       // UNIQUE(tenantId, idempotencyKey)
+}
+
+interface ArtifactManifest {
+  hash: string;                                 // hash of all entry hashes → ETag for apps
+  entries: ArtifactEntry[];
+}
+interface ArtifactEntry {
+  kind: 'css_critical' | 'css_tenant' | 'css_custom' | 'css_workspace' | 'css_print'
+      | 'email_theme' | 'tokens_ios' | 'tokens_android' | 'tokens_desktop' | 'tokens_json'
+      | 'icon_sprite' | 'favicon_set' | 'web_manifest' | 'logo_derivative' | 'font_subset'
+      | 'copy_bundle' | 'og_image' | 'payment_appearance';
+  surface?: Surface; platform?: 'web' | 'ios' | 'android' | 'desktop';
+  locale?: Locale; placement?: PlacementKey; mode?: Mode;
+  url: string;                                  // immutable, content-addressed
+  sha256: string; bytes: number; contentType: string;
+  width?: number; height?: number; density?: 1 | 2 | 3; format?: 'svg' | 'png' | 'webp' | 'avif' | 'ico' | 'woff2' | 'json' | 'css';
+}
+
+// ---------- Assets ----------
+interface BrandAsset {
+  id: ID; tenantId: ID;
+  kind: 'logo' | 'image' | 'icon' | 'font_file' | 'licence_doc';
+  status: 'awaiting_upload' | 'scanning' | 'processing' | 'ready' | 'rejected' | 'quarantined' | 'deleted' | 'expired';
+  originalFilename: string;                     // display only, never used as storage key
+  detectedMime: string; bytes: number; sha256: string;   // UNIQUE(tenantId, sha256, kind) → dedupe
+  width?: number; height?: number; hasAlpha?: boolean;
+  trimmedBox?: { x: number; y: number; w: number; h: number };
+  dominantColors?: { hex: Hex; weight: number }[];
+  meanLuminance?: number;                       // 0..1, for dark-variant suggestions
+  sanitizeReport?: { removedElements: string[]; removedAttributes: string[]; removedRefs: number; warnings: string[] };
+  rejectReason?: string;
+  tags: ('primary' | 'mark' | 'wordmark' | 'on_dark' | 'monochrome' | string)[];
+  provenance: { source: 'upload' | 'import' | 'generated' | 'template'; url?: string; templateId?: ID };
+  storageKey: string;                           // private store key of sanitized master
+  createdBy: ID; createdAt: Instant; deletedAt?: Instant;
+}
+
+// ---------- Fonts ----------
+interface FontFamily {
+  id: ID;
+  tenantId: ID | null;                          // null = platform-shared (Google mirror, curated)
+  source: 'google' | 'upload' | 'system' | 'curated';
+  familyName: string;                           // as displayed; CSS family name is namespaced: "pl-{id}"
+  category: 'sans' | 'serif' | 'display' | 'handwriting' | 'mono';
+  faces: FontFace[];
+  variableAxes?: { tag: string; min: number; max: number; default: number }[];
+  scripts: ('latin' | 'latin-ext' | 'cyrillic' | 'cyrillic-ext' | 'greek' | 'vietnamese' | 'arabic' | 'hebrew' | string)[];
+  licence: FontLicence;
+  metrics: { unitsPerEm: number; ascent: number; descent: number; lineGap: number; xHeight?: number; capHeight?: number; avgCharWidth: number };
+  fallback: FallbackMetrics[];                  // one per candidate local font
+  status: 'processing' | 'ready' | 'rejected' | 'withdrawn' | 'takedown';
+  version?: string;                             // from name table / google version
+  createdAt: Instant;
+}
+interface FontFace {
+  id: ID; familyId: ID;
+  weight: number | [number, number];            // range for variable
+  style: 'normal' | 'italic';
+  originalAssetId?: ID;                         // uploaded file (kept for PDF embedding)
+  fsType: number;                               // OS/2 embedding bits
+  subsets: { name: string; unicodeRange: string; url: string; bytes: number; sha256: string }[];
+  features: string[];                           // e.g. ["tnum","liga","ss01"]
+}
+interface FontLicence {
+  kind: 'ofl' | 'apache' | 'ufl' | 'commercial_attested' | 'system';
+  attestedBy?: ID; attestedAt?: Instant;
+  attestationText?: string;                     // exact text agreed (versioned)
+  note?: string; url?: string; licenceDocAssetId?: ID;
+  pdfEmbeddingAllowed: boolean;                 // from fsType + attestation
+  webSubsettingAllowed: boolean;
+}
+interface FallbackMetrics {
+  localFamily: 'Arial' | 'Helvetica Neue' | 'Roboto' | 'Times New Roman' | 'Georgia' | 'Courier New' | string;
+  sizeAdjust: number;                           // percent, e.g. 104.2
+  ascentOverride: number; descentOverride: number; lineGapOverride: number; // percent
+}
+
+// ---------- Icons ----------
+interface IconSet {                             // platform-level catalog
+  id: 'lucide' | 'phosphor' | 'tabler' | 'material_symbols' | string;
+  name: string; licence: string; version: string;
+  styles: ('outline' | 'filled' | 'duotone')[];
+  strokeAdjustable: boolean;
+  glyphs: Record<SemanticIconName, string>;     // semantic → set glyph name
+}
+type SemanticIconName = string;                 // e.g. "nav.home", "action.add", "service.car-wash", "status.success"
+interface TenantIcon {
+  id: ID; tenantId: ID; assetId: ID;            // BrandAsset kind 'icon'
+  name: string; tags: string[];
+  recolorable: boolean;                         // true if converted to currentColor
+  viewBox: string;                              // normalized "0 0 24 24"
+}
+interface IconMapping {
+  targetType: 'category' | 'service' | 'addon' | 'nav' | 'step' | 'status' | 'asset_type';
+  targetRef: ID | string;                       // 02 id or nav/step key
+  icon: { set: string; glyph: string } | { tenantIconId: ID };
+  colorToken?: TokenPath;                       // default inherit (currentColor)
+  source: 'auto' | 'user';
+}
+
+// ---------- Copy ----------
+interface CopyKeyDefinition {                   // platform registry, versioned with platform builds
+  key: string;                                  // "booking.datetime.route_slot_label"
+  ownerModule: '01' | '02' | '03' | '04' | '05' | '06' | '07' | '08' | '09' | '11';
+  surfaces: Surface[];
+  kind: 'label' | 'short' | 'long' | 'richText';
+  maxLength: number;
+  placeholders: string[];                       // allowlist e.g. ["weekday","date"]
+  icu: boolean;                                 // plural/select allowed
+  locked: { mode: 'none' } | { mode: 'full' } | { mode: 'core_phrase'; phrases: Record<Locale, string> };
+  description: string;                          // shown to editors
+  screenshotRef?: string;
+  defaults: Record<Locale, string>;
+  deprecatedBy?: string;                        // key migration
+}
+interface CopyOverride {
+  tenantId: ID; key: string; locale: Locale;    // PK (tenantId, key, locale) within draft/release bundle
+  text: string;
+  origin: 'human' | 'machine_suggested' | 'import' | 'template';
+  updatedBy: ID; updatedAt: Instant;
+}
+interface LocaleSettings {
+  tenantId: ID;
+  defaultLocale: Locale;
+  enabledLocales: Locale[];                     // plan-limited
+  perSurface: Partial<Record<Surface, Locale[]>>;
+  showLanguageSwitcher: boolean;
+}
+
+// ---------- Custom CSS ----------
+interface CustomCss {
+  id: ID; tenantId: ID;
+  source: string;                               // as typed (≤ 20 KB)
+  sanitized?: string;                           // re-serialized AST output
+  scopes: ('booking' | 'account' | 'tracking' | 'sms_page' | 'embed')[];
+  status: 'draft_edited' | 'validating' | 'valid' | 'invalid' | 'disabled' | 'suspended_plan';
+  lintErrors: { line: number; col: number; rule: string; message: string }[];
+  lastGuardTest?: { releaseVersion: number; passed: boolean; failures: string[] };
+  disabled?: { by: ID; at: Instant; reason: string; bySupport: boolean };
+  updatedBy: ID; updatedAt: Instant;
+}
+
+// ---------- Viewer preferences ----------
+interface AppearancePreference {
+  subjectType: 'user' | 'portal_account';       // staff user (cross-business) or customer portal account
+  subjectId: ID;                                // PK (subjectType, subjectId)
+  mode: ModePreference;
+  textScale?: number;                           // 0.9..1.5 (staff); customers use browser/OS
+  density?: 'compact' | 'comfortable' | 'spacious';
+  reducedMotion?: 'system' | 'always';
+  highContrast?: boolean;
+  cvdAssist?: boolean;                          // patterns on status/calendar colors
+  locale?: Locale;
+  updatedAt: Instant;                           // last-write-wins across devices
+}
+
+// ---------- Audit / preview / templates / apps ----------
+interface ContrastReport {
+  generatedAt: Instant; revisionOrVersion: string;
+  pairs: {
+    id: string; surface: Surface | 'all'; mode: Mode;
+    fg: TokenPath; bg: TokenPath; fgHex: Hex; bgHex: Hex;
+    ratio: number; threshold: number; rule: '1.4.3' | '1.4.3-large' | '1.4.11' | '2.4.13' | 'qr' | 'image-text';
+    severity: 'pass' | 'info' | 'warning' | 'blocking';
+    suggestion?: { token: TokenPath; hex: Hex; ratio: number; deltaE: number };
+  }[];
+  summary: { pass: number; warning: number; blocking: number };
+}
+interface BrandAuditEvent {
+  id: ID; tenantId: ID; at: Instant; actorId: ID; actorKind: 'user' | 'support' | 'system' | 'hub';
+  action: string;                               // "draft.patch", "release.publish", "css.kill_switch" …
+  section?: ThemeSection; summary: string; before?: unknown; after?: unknown;
+}
+interface PreviewLink {
+  id: ID; tenantId: ID; tokenHash: string;      // token shown once; only hash stored
+  target: { kind: 'draft'; revision: number } | { kind: 'release'; version: number };
+  expiresAt: Instant; passcodeHash?: string; createdBy: ID; revokedAt?: Instant; views: number;
+}
+interface BrandTemplate {                       // hub (pro)
+  id: ID; hubId: ID; name: string; sourceTenantId: ID;
+  snapshot: ThemeDocument; copy: CopyOverride[]; assetRefs: ID[];
+  locks: ThemeSection[]; pushedTo: { tenantId: ID; at: Instant; status: 'pending' | 'applied' | 'published' }[];
+}
+interface AppBuild {
+  id: ID; tenantId: ID; app: 'customer' | 'team';
+  platform: 'ios' | 'android';
+  status: 'queued' | 'building' | 'built' | 'build_failed' | 'submitted' | 'in_review' | 'approved'
+        | 'released' | 'rejected' | 'blocked_credentials';
+  marketingVersion: string; buildNumber: number;
+  bakedReleaseVersion: number;                  // fallback theme inside binary
+  appName: string; bundleId: string;
+  storeRef?: string; rejectionReason?: string;
+  requestedBy: ID; createdAt: Instant; updatedAt: Instant;
+}
+interface EdgeBrandPointer {                    // replicated to edge KV, key tenant:{id}:brand
+  tenantId: ID; version: number; manifestHash: string;
+  criticalCssUrl: string; tenantCssUrl: string; customCssUrl?: string;
+  fontPreloads: { url: string; type: 'font/woff2' }[];
+  logo: Record<'light' | 'dark', { url: string; width: number; height: number }>;
+  defaultMode: ModePreference; allowToggle: boolean;
+  killSwitches: { customCss: boolean; quarantinedAssetHashes: string[]; fontTakedowns: ID[] };
+  updatedAt: Instant;
+}
+```
+
+Indexes/constraints [D]: `BrandKit(tenantId)` unique; `BrandRelease(tenantId, version)` unique;
+one `live` per tenant; `BrandAsset(tenantId, sha256, kind)` unique (dedupe); `CopyOverride` PK
+`(tenantId, key, locale, releaseOrDraft)`; `PreviewLink(tokenHash)` unique; all tables tenant-scoped
+(row-level isolation) except platform catalogs (`IconSet`, `CopyKeyDefinition`, platform `FontFamily`).
+
+### 7.2 ThemeDocument — editable schema (what the business's draft/release stores)
+
+Only **inputs and overrides** are stored; everything else is derived (§7.3). JSON Schema
+(draft 2020-12), abridged only where a pattern repeats (marked `…same shape…`):
+
+```json
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://platform.example/schemas/theme-document/1.json",
+  "title": "ThemeDocument",
+  "type": "object",
+  "required": ["schemaVersion", "seeds", "dark", "typography", "shape", "elevation", "density", "motion", "logos", "icons", "surfaces"],
+  "additionalProperties": false,
+  "$defs": {
+    "hex": { "type": "string", "pattern": "^#[0-9a-f]{6}$" },
+    "tokenPath": { "type": "string", "pattern": "^[a-z][a-z0-9-]*(\\.[a-z0-9-]+)+$" },
+    "colorValue": {
+      "oneOf": [
+        { "$ref": "#/$defs/hex" },
+        { "type": "object", "required": ["alias"], "properties": { "alias": { "$ref": "#/$defs/tokenPath" } }, "additionalProperties": false },
+        { "type": "object", "required": ["hex", "alpha"], "properties": { "hex": { "$ref": "#/$defs/hex" }, "alpha": { "type": "number", "minimum": 0, "maximum": 1 } }, "additionalProperties": false }
+      ]
+    },
+    "modeValue": {
+      "type": "object",
+      "properties": { "light": { "$ref": "#/$defs/colorValue" }, "dark": { "$ref": "#/$defs/colorValue" } },
+      "additionalProperties": false, "minProperties": 1
+    },
+    "rampOverride": {
+      "type": "object",
+      "propertyNames": { "enum": ["50","100","200","300","400","500","600","700","800","900","950"] },
+      "additionalProperties": { "$ref": "#/$defs/hex" }
+    },
+    "fontRef": {
+      "type": "object", "required": ["familyId"],
+      "properties": {
+        "familyId": { "type": "string" },
+        "fallbackStack": { "type": "array", "items": { "type": "string" }, "maxItems": 6 },
+        "display": { "enum": ["swap", "optional", "fallback"] },
+        "sizeAdjustOverride": { "type": "number", "minimum": 80, "maximum": 125 }
+      }, "additionalProperties": false
+    },
+    "logoPlacement": {
+      "type": "object",
+      "required": ["variant"],
+      "properties": {
+        "variant": { "enum": ["full", "mark", "auto"] },
+        "maxHeightPx": { "type": "integer", "minimum": 12, "maximum": 160 },
+        "maxWidthPx": { "type": "integer", "minimum": 16, "maximum": 600 },
+        "paddingPx": { "type": "integer", "minimum": 0, "maximum": 48 },
+        "safeAreaPct": { "type": "number", "minimum": 0, "maximum": 30 },
+        "align": { "enum": ["start", "center", "end"] },
+        "background": { "enum": ["transparent", "plate", "token"] },
+        "plateColor": { "$ref": "#/$defs/modeValue" },
+        "plateRadius": { "type": "integer", "minimum": 0, "maximum": 64 },
+        "enabled": { "type": "boolean" }
+      }, "additionalProperties": false
+    }
+  },
+  "properties": {
+    "schemaVersion": { "const": 1 },
+    "seeds": {
+      "type": "object", "required": ["primary"],
+      "properties": {
+        "primary":   { "$ref": "#/$defs/hex" },
+        "secondary": { "$ref": "#/$defs/hex" },
+        "accent":    { "$ref": "#/$defs/hex" },
+        "neutralTint": { "type": "number", "minimum": -1, "maximum": 1, "default": 0 },
+        "neutralSeed": { "$ref": "#/$defs/hex" },
+        "success": { "$ref": "#/$defs/hex" }, "warning": { "$ref": "#/$defs/hex" },
+        "danger":  { "$ref": "#/$defs/hex" }, "info":    { "$ref": "#/$defs/hex" },
+        "mapPin":  { "$ref": "#/$defs/hex" },
+        "rampCurve": { "enum": ["balanced", "vivid", "muted"], "default": "balanced" },
+        "hueShiftDeg": { "type": "number", "minimum": 0, "maximum": 20, "default": 6 }
+      }, "additionalProperties": false
+    },
+    "dark": {
+      "type": "object", "required": ["strategy"],
+      "properties": {
+        "strategy": { "enum": ["auto", "custom"] },
+        "seeds": { "$ref": "#/properties/seeds" },
+        "canvasLightness": { "type": "number", "minimum": 0.10, "maximum": 0.25, "default": 0.17 },
+        "imageDimPct": { "type": "number", "minimum": 0, "maximum": 15, "default": 0 },
+        "depthStyle": { "enum": ["lighter_surfaces", "shadows_only", "borders_only"], "default": "lighter_surfaces" }
+      }, "additionalProperties": false
+    },
+    "paletteOverrides": {
+      "type": "object",
+      "properties": {
+        "light": { "type": "object", "propertyNames": { "enum": ["primary","secondary","accent","neutral","success","warning","danger","info"] }, "additionalProperties": { "$ref": "#/$defs/rampOverride" } },
+        "dark":  { "type": "object", "propertyNames": { "enum": ["primary","secondary","accent","neutral","success","warning","danger","info"] }, "additionalProperties": { "$ref": "#/$defs/rampOverride" } }
+      }, "additionalProperties": false
+    },
+    "semanticOverrides": {
+      "description": "Pinned values for semantic tokens (§7.3 names). Key = token path without the 'color.' prefix allowed.",
+      "type": "object", "propertyNames": { "$ref": "#/$defs/tokenPath" },
+      "additionalProperties": { "$ref": "#/$defs/modeValue" }
+    },
+    "componentOverrides": {
+      "type": "object", "propertyNames": { "$ref": "#/$defs/tokenPath" },
+      "additionalProperties": { "oneOf": [ { "$ref": "#/$defs/modeValue" }, { "type": "number" }, { "type": "string", "maxLength": 64 } ] }
+    },
+    "defaultMode": { "enum": ["system", "light", "dark"], "default": "system" },
+    "allowModeToggle": { "type": "boolean", "default": true },
+    "linkStyle": { "enum": ["color", "underline"], "default": "color" },
+    "typography": {
+      "type": "object", "required": ["heading", "body"],
+      "properties": {
+        "heading": { "$ref": "#/$defs/fontRef" },
+        "body":    { "$ref": "#/$defs/fontRef" },
+        "mono":    { "$ref": "#/$defs/fontRef" },
+        "useTabularNumbers": { "type": "boolean", "default": true },
+        "baseSizePx": { "type": "number", "minimum": 14, "maximum": 18, "default": 16 },
+        "scaleRatio": { "type": "number", "minimum": 1.05, "maximum": 1.5, "default": 1.2 },
+        "fluidHeadings": { "type": "boolean", "default": true },
+        "weights": {
+          "type": "object",
+          "properties": {
+            "heading": { "type": "integer", "minimum": 100, "maximum": 900, "default": 700 },
+            "body": { "type": "integer", "minimum": 100, "maximum": 900, "default": 400 },
+            "strong": { "type": "integer", "minimum": 100, "maximum": 900, "default": 600 },
+            "button": { "type": "integer", "minimum": 100, "maximum": 900, "default": 600 }
+          }, "additionalProperties": false
+        },
+        "lineHeight": { "type": "object", "properties": { "body": { "type": "number", "minimum": 1.3, "maximum": 1.8 }, "heading": { "type": "number", "minimum": 1.0, "maximum": 1.4 } }, "additionalProperties": false },
+        "letterSpacingEm": { "type": "object", "properties": { "heading": { "type": "number", "minimum": -0.03, "maximum": 0.05 }, "caps": { "type": "number", "minimum": 0, "maximum": 0.12 } }, "additionalProperties": false },
+        "headingCase": { "enum": ["as_typed", "uppercase", "title"], "default": "as_typed" }
+      }, "additionalProperties": false
+    },
+    "shape": {
+      "type": "object",
+      "properties": {
+        "radiusBasePx": { "type": "integer", "minimum": 0, "maximum": 24, "default": 8 },
+        "button": { "oneOf": [ { "const": "base" }, { "const": "pill" }, { "type": "integer", "minimum": 0, "maximum": 32 } ] },
+        "input":  { "oneOf": [ { "const": "base" }, { "type": "integer", "minimum": 0, "maximum": 32 } ] },
+        "card":   { "oneOf": [ { "const": "base" }, { "type": "integer", "minimum": 0, "maximum": 32 } ] },
+        "dialog": { "oneOf": [ { "const": "base" }, { "type": "integer", "minimum": 0, "maximum": 32 } ] },
+        "chip":   { "oneOf": [ { "const": "pill" }, { "type": "integer", "minimum": 0, "maximum": 32 } ] },
+        "image":  { "oneOf": [ { "const": "base" }, { "type": "integer", "minimum": 0, "maximum": 32 } ] },
+        "borderWidthPx": { "enum": [0, 1, 1.5, 2], "default": 1 },
+        "borderEmphasis": { "enum": ["subtle", "default", "strong"], "default": "default" },
+        "focusRing": { "type": "object", "properties": { "style": { "enum": ["brand", "high_visibility"] }, "widthPx": { "type": "integer", "minimum": 2, "maximum": 4 } }, "additionalProperties": false },
+        "buttonStyle": { "enum": ["filled", "outline", "soft"], "default": "filled" },
+        "buttonLabelCase": { "enum": ["as_typed", "uppercase"], "default": "as_typed" }
+      }, "additionalProperties": false
+    },
+    "elevation": {
+      "type": "object",
+      "properties": {
+        "style": { "enum": ["none", "soft", "crisp", "hard_offset"], "default": "soft" },
+        "intensityPct": { "type": "integer", "minimum": 0, "maximum": 200, "default": 100 },
+        "tint": { "enum": ["neutral", "brand"], "default": "neutral" },
+        "levels": {
+          "type": "object",
+          "properties": {
+            "card": { "type": "integer", "minimum": 0, "maximum": 5 }, "popover": { "type": "integer", "minimum": 0, "maximum": 5 },
+            "dialog": { "type": "integer", "minimum": 0, "maximum": 5 }, "sheet": { "type": "integer", "minimum": 0, "maximum": 5 },
+            "headerOnScroll": { "type": "integer", "minimum": 0, "maximum": 5 }, "toast": { "type": "integer", "minimum": 0, "maximum": 5 }
+          }, "additionalProperties": false
+        }
+      }, "additionalProperties": false
+    },
+    "density": {
+      "type": "object",
+      "properties": {
+        "public": { "enum": ["compact", "comfortable", "spacious"], "default": "comfortable" },
+        "workspace": { "enum": ["compact", "comfortable", "spacious"], "default": "comfortable" }
+      }, "additionalProperties": false
+    },
+    "motion": {
+      "type": "object",
+      "properties": {
+        "level": { "enum": ["full", "reduced", "none"], "default": "full" },
+        "speed": { "type": "number", "minimum": 0.75, "maximum": 1.5, "default": 1 }
+      }, "additionalProperties": false
+    },
+    "logos": {
+      "type": "object",
+      "properties": {
+        "variants": {
+          "type": "object",
+          "properties": {
+            "full": { "type": "object", "properties": { "light": { "type": "string" }, "dark": { "type": "string" }, "darkAuto": { "enum": ["none", "invert_lightness", "recolor_white", "plate"] } } },
+            "mark": { "type": "object", "properties": { "light": { "type": "string" }, "dark": { "type": "string" }, "darkAuto": { "enum": ["none", "invert_lightness", "recolor_white", "plate"] } } },
+            "monochrome": { "type": "string" }
+          }, "additionalProperties": false
+        },
+        "placements": {
+          "type": "object",
+          "propertyNames": { "enum": ["web_header_desktop","web_header_mobile","account_sidebar","email_header","document_header","document_footer_mark","favicon","app_icon","splash","pwa_icons","og_image","crm_sidebar","crm_sidebar_collapsed","crm_login","team_app_header","qr_center","loading_mark","map_pin_avatar"] },
+          "additionalProperties": { "$ref": "#/$defs/logoPlacement" }
+        },
+        "hero": { "type": "object", "properties": { "assetId": { "type": "string" }, "focalX": { "type": "number", "minimum": 0, "maximum": 1 }, "focalY": { "type": "number", "minimum": 0, "maximum": 1 }, "scrim": { "$ref": "#/$defs/modeValue" }, "scrimOpacity": { "type": "number", "minimum": 0, "maximum": 0.9 } } },
+        "ogImageAssetId": { "type": "string" }
+      }, "additionalProperties": false
+    },
+    "icons": {
+      "type": "object",
+      "properties": {
+        "set": { "type": "string" },
+        "style": { "enum": ["outline", "filled", "duotone"] },
+        "strokeWidth": { "type": "number", "minimum": 1.25, "maximum": 2.25 },
+        "color": { "enum": ["inherit", "primary", "accent"] },
+        "sizeScale": { "enum": ["s", "m", "l"] },
+        "mappings": { "type": "array", "maxItems": 5000, "items": { "type": "object" } }
+      }, "additionalProperties": false
+    },
+    "surfaces": {
+      "type": "object",
+      "properties": {
+        "booking":  { "type": "object", "description": "header style, hero, card style, step indicator, poweredBy …" },
+        "email":    { "type": "object", "properties": { "widthPx": { "type": "integer", "minimum": 560, "maximum": 680 }, "header": { "enum": ["logo_on_canvas", "logo_on_plate", "banner"] }, "darkBehaviour": { "enum": ["adaptive", "force_light"] } } },
+        "document": { "type": "object", "properties": { "accentUsage": { "enum": ["header_bar", "rule", "none"] }, "paper": { "enum": ["letter", "a4", "auto"] }, "margins": { "enum": ["narrow", "normal", "wide"] }, "printFriendly": { "type": "boolean" }, "headingFont": { "enum": ["brand", "classic_serif"] } } },
+        "embed":    { "type": "object", "properties": { "mode": { "enum": ["inherit", "light", "dark", "match_host"] }, "transparentBackground": { "type": "boolean" } } },
+        "qr":       { "type": "object", "properties": { "foreground": { "$ref": "#/$defs/hex" }, "moduleStyle": { "enum": ["square", "rounded", "dots"] }, "logoCenter": { "type": "boolean" } } },
+        "customerApp": { "type": "object", "properties": { "displayName": { "type": "string", "maxLength": 30 } } },
+        "workspace": {
+          "type": "object",
+          "properties": {
+            "mode": { "enum": ["platform_plus_accent", "full_brand"] },
+            "sidebar": { "enum": ["neutral", "tinted", "solid"] },
+            "font": { "enum": ["platform", "brand_body"] },
+            "calendarPalette": { "type": "array", "items": { "$ref": "#/$defs/hex" }, "minItems": 8, "maxItems": 24 }
+          }
+        }
+      }, "additionalProperties": false
+    }
+  }
+}
+```
+
+### 7.3 Resolved token catalog — complete token schema (both modes)
+
+Format: W3C Design Tokens Community Group style (`$type`, `$value`) [I], with our extension that a
+color token's `$value` is an object `{ "light": …, "dark": … }` (split into two standard DTCG files on
+export). `{…}` = alias. Values shown are the **default derivation rules** — the compiler resolves them
+to concrete values per tenant. CSS custom property name = `--pl-` + path with dots → dashes
+(e.g. `color.bg.canvas` → `--pl-color-bg-canvas`).
+
+```json
+{
+  "palette": {
+    "$description": "Reference ramps generated per seed (§5.2). Steps: 50,100,200,300,400,500,600,700,800,900,950. Mode-independent unless dark.strategy = custom.",
+    "primary":   { "$type": "color", "$extensions": { "pl.generated": "ramp(seeds.primary)" } },
+    "secondary": { "$type": "color", "$extensions": { "pl.generated": "ramp(seeds.secondary ?? rotateHue(seeds.primary,150) chroma*0.6)" } },
+    "accent":    { "$type": "color", "$extensions": { "pl.generated": "ramp(seeds.accent ?? seeds.primary)" } },
+    "neutral":   { "$type": "color", "$extensions": { "pl.generated": "neutralRamp(seeds.primary.h, neutralTint)" } },
+    "success":   { "$type": "color", "$extensions": { "pl.generated": "ramp(seeds.success ?? platform.success)" } },
+    "warning":   { "$type": "color", "$extensions": { "pl.generated": "ramp(seeds.warning ?? platform.warning)" } },
+    "danger":    { "$type": "color", "$extensions": { "pl.generated": "ramp(seeds.danger ?? platform.danger)" } },
+    "info":      { "$type": "color", "$extensions": { "pl.generated": "ramp(seeds.info ?? platform.info)" } },
+    "white": { "$type": "color", "$value": "#ffffff" },
+    "black": { "$type": "color", "$value": "#000000" }
+  },
+
+  "color": {
+    "bg": {
+      "canvas":          { "$type": "color", "$value": { "light": "{palette.neutral.50}",  "dark": "darkCanvas(neutral, L=0.17)" } },
+      "surface":         { "$type": "color", "$value": { "light": "{palette.white}",       "dark": "lift(canvas, +0.035)" } },
+      "surface-raised":  { "$type": "color", "$value": { "light": "{palette.white}",       "dark": "lift(canvas, +0.07)" } },
+      "surface-sunken":  { "$type": "color", "$value": { "light": "{palette.neutral.100}", "dark": "lift(canvas, -0.02)" } },
+      "inverse":         { "$type": "color", "$value": { "light": "{palette.neutral.900}", "dark": "{palette.neutral.100}" } },
+      "brand":           { "$type": "color", "$value": { "light": "{color.action.primary.bg}", "dark": "{color.action.primary.bg}" } },
+      "brand-subtle":    { "$type": "color", "$value": { "light": "{palette.primary.50}",  "dark": "mix(palette.primary.900, canvas, 0.6)" } },
+      "accent-subtle":   { "$type": "color", "$value": { "light": "{palette.accent.50}",   "dark": "mix(palette.accent.900, canvas, 0.6)" } },
+      "selected":        { "$type": "color", "$value": { "light": "{palette.primary.100}", "dark": "mix(palette.primary.800, canvas, 0.5)" } },
+      "hover":           { "$type": "color", "$value": { "light": { "hex": "#000000", "alpha": 0.04 }, "dark": { "hex": "#ffffff", "alpha": 0.06 } } },
+      "pressed":         { "$type": "color", "$value": { "light": { "hex": "#000000", "alpha": 0.08 }, "dark": { "hex": "#ffffff", "alpha": 0.10 } } },
+      "disabled":        { "$type": "color", "$value": { "light": "{palette.neutral.100}", "dark": "lift(canvas, +0.05)" } },
+      "scrim":           { "$type": "color", "$value": { "light": { "hex": "#000000", "alpha": 0.48 }, "dark": { "hex": "#000000", "alpha": 0.64 } } },
+      "skeleton":        { "$type": "color", "$value": { "light": "{palette.neutral.100}", "dark": "lift(canvas, +0.06)" } },
+      "skeleton-highlight": { "$type": "color", "$value": { "light": "{palette.neutral.50}", "dark": "lift(canvas, +0.09)" } },
+      "header":          { "$type": "color", "$value": { "light": "{color.bg.surface}", "dark": "{color.bg.surface}" } },
+      "footer":          { "$type": "color", "$value": { "light": "{color.bg.canvas}",  "dark": "{color.bg.canvas}" } },
+      "selection":       { "$type": "color", "$value": { "light": "{palette.primary.200}", "dark": "{palette.primary.700}" } }
+    },
+    "fg": {
+      "default":     { "$type": "color", "$value": { "light": "{palette.neutral.950}", "dark": "{palette.neutral.50}" } },
+      "muted":       { "$type": "color", "$value": { "light": "{palette.neutral.700}", "dark": "{palette.neutral.300}" } },
+      "subtle":      { "$type": "color", "$value": { "light": "{palette.neutral.600}", "dark": "{palette.neutral.400}" } },
+      "placeholder": { "$type": "color", "$value": { "light": "{palette.neutral.600}", "dark": "{palette.neutral.400}" } },
+      "disabled":    { "$type": "color", "$value": { "light": "{palette.neutral.400}", "dark": "{palette.neutral.600}" } },
+      "inverse":     { "$type": "color", "$value": { "light": "{palette.neutral.50}",  "dark": "{palette.neutral.950}" } },
+      "on-brand":    { "$type": "color", "$value": { "light": "onColor(color.bg.brand)", "dark": "onColor(color.bg.brand)" } },
+      "brand":       { "$type": "color", "$value": { "light": "firstPassing(primary, ≥4.5 vs bg.surface)", "dark": "firstPassing(primary, ≥4.5 vs bg.surface, L≥0.70)" } },
+      "link":        { "$type": "color", "$value": { "light": "{color.fg.brand}", "dark": "{color.fg.brand}" } },
+      "link-hover":  { "$type": "color", "$value": { "light": "step(fg.link, +1)", "dark": "step(fg.link, -1)" } },
+      "selection":   { "$type": "color", "$value": { "light": "{color.fg.default}", "dark": "{color.fg.default}" } }
+    },
+    "border": {
+      "subtle":      { "$type": "color", "$value": { "light": "{palette.neutral.100}", "dark": "{palette.neutral.900}" } },
+      "default":     { "$type": "color", "$value": { "light": "{palette.neutral.200}", "dark": "{palette.neutral.800}" } },
+      "strong":      { "$type": "color", "$value": { "light": "{palette.neutral.400}", "dark": "{palette.neutral.600}" } },
+      "input":       { "$type": "color", "$value": { "light": "firstPassing(neutral, ≥3 vs bg.surface)", "dark": "firstPassing(neutral, ≥3 vs bg.surface)" } },
+      "input-hover": { "$type": "color", "$value": { "light": "step(border.input, +1)", "dark": "step(border.input, -1)" } },
+      "focus":       { "$type": "color", "$value": { "light": "{color.fg.brand}", "dark": "{color.fg.brand}" } },
+      "focus-outer": { "$type": "color", "$value": { "light": "{palette.white}", "dark": "{palette.black}" } },
+      "highlight":   { "$type": "color", "$value": { "light": { "hex": "#ffffff", "alpha": 0 }, "dark": { "hex": "#ffffff", "alpha": 0.06 } } },
+      "selected":    { "$type": "color", "$value": { "light": "{color.action.primary.bg}", "dark": "{color.action.primary.bg}" } }
+    },
+    "action": {
+      "primary": {
+        "bg":         { "$type": "color", "$value": { "light": "primaryButtonBg(light)", "dark": "primaryButtonBg(dark)" } },
+        "bg-hover":   { "$type": "color", "$value": { "light": "step(action.primary.bg, +1)", "dark": "step(action.primary.bg, -1)" } },
+        "bg-pressed": { "$type": "color", "$value": { "light": "step(action.primary.bg, +2)", "dark": "step(action.primary.bg, -2)" } },
+        "fg":         { "$type": "color", "$value": { "light": "onColor(action.primary.bg)", "dark": "onColor(action.primary.bg)" } },
+        "border":     { "$type": "color", "$value": { "light": "{color.action.primary.bg}", "dark": "{color.action.primary.bg}" } }
+      },
+      "secondary": {
+        "bg":         { "$type": "color", "$value": { "light": "{color.bg.surface}", "dark": "{color.bg.surface-raised}" } },
+        "bg-hover":   { "$type": "color", "$value": { "light": "{palette.neutral.100}", "dark": "lift(surface-raised, +0.03)" } },
+        "bg-pressed": { "$type": "color", "$value": { "light": "{palette.neutral.200}", "dark": "lift(surface-raised, +0.06)" } },
+        "fg":         { "$type": "color", "$value": { "light": "{color.fg.default}", "dark": "{color.fg.default}" } },
+        "border":     { "$type": "color", "$value": { "light": "{color.border.strong}", "dark": "{color.border.strong}" } }
+      },
+      "tertiary": {
+        "bg":         { "$type": "color", "$value": { "light": { "hex": "#000000", "alpha": 0 }, "dark": { "hex": "#000000", "alpha": 0 } } },
+        "bg-hover":   { "$type": "color", "$value": { "light": "{color.bg.hover}", "dark": "{color.bg.hover}" } },
+        "fg":         { "$type": "color", "$value": { "light": "{color.fg.brand}", "dark": "{color.fg.brand}" } }
+      },
+      "danger": {
+        "bg":         { "$type": "color", "$value": { "light": "firstPassingButton(danger)", "dark": "firstPassingButton(danger, dark)" } },
+        "bg-hover":   { "$type": "color", "$value": { "light": "step(action.danger.bg, +1)", "dark": "step(action.danger.bg, -1)" } },
+        "fg":         { "$type": "color", "$value": { "light": "onColor(action.danger.bg)", "dark": "onColor(action.danger.bg)" } }
+      },
+      "disabled": {
+        "bg":         { "$type": "color", "$value": { "light": "{color.bg.disabled}", "dark": "{color.bg.disabled}" } },
+        "fg":         { "$type": "color", "$value": { "light": "{color.fg.disabled}", "dark": "{color.fg.disabled}" } }
+      }
+    },
+    "status": {
+      "success": {
+        "bg":       { "$type": "color", "$value": { "light": "{palette.success.100}", "dark": "mix(palette.success.950, canvas, 0.6)" } },
+        "fg":       { "$type": "color", "$value": { "light": "{palette.success.800}", "dark": "{palette.success.200}" } },
+        "border":   { "$type": "color", "$value": { "light": "{palette.success.300}", "dark": "{palette.success.700}" } },
+        "solid":    { "$type": "color", "$value": { "light": "{palette.success.600}", "dark": "{palette.success.400}" } },
+        "on-solid": { "$type": "color", "$value": { "light": "onColor(status.success.solid)", "dark": "onColor(status.success.solid)" } },
+        "icon":     { "$type": "color", "$value": { "light": "{palette.success.600}", "dark": "{palette.success.400}" } }
+      },
+      "warning": { "$extensions": { "pl.sameShapeAs": "color.status.success", "pl.ramp": "warning" } },
+      "danger":  { "$extensions": { "pl.sameShapeAs": "color.status.success", "pl.ramp": "danger" } },
+      "info":    { "$extensions": { "pl.sameShapeAs": "color.status.success", "pl.ramp": "info" } },
+      "neutral": { "$extensions": { "pl.sameShapeAs": "color.status.success", "pl.ramp": "neutral" } }
+    },
+    "accent": {
+      "bg":       { "$type": "color", "$value": { "light": "{palette.accent.100}", "dark": "mix(palette.accent.900, canvas, 0.6)" } },
+      "fg":       { "$type": "color", "$value": { "light": "{palette.accent.800}", "dark": "{palette.accent.200}" } },
+      "solid":    { "$type": "color", "$value": { "light": "{palette.accent.600}", "dark": "{palette.accent.400}" } },
+      "on-solid": { "$type": "color", "$value": { "light": "onColor(accent.solid)", "dark": "onColor(accent.solid)" } }
+    },
+    "job-status": {
+      "$description": "CRM/team-app job lifecycle colors (states owned by 04). Re-tunable, hue-guarded, AA-enforced.",
+      "draft":       { "$extensions": { "pl.sameShapeAs": "color.status.success", "pl.ramp": "neutral" } },
+      "quote":       { "$extensions": { "pl.sameShapeAs": "color.status.success", "pl.ramp": "info" } },
+      "scheduled":   { "$extensions": { "pl.sameShapeAs": "color.status.success", "pl.ramp": "primary" } },
+      "on-my-way":   { "$extensions": { "pl.sameShapeAs": "color.status.success", "pl.ramp": "accent" } },
+      "in-progress": { "$extensions": { "pl.sameShapeAs": "color.status.success", "pl.ramp": "warning" } },
+      "completed":   { "$extensions": { "pl.sameShapeAs": "color.status.success", "pl.ramp": "success" } },
+      "cancelled":   { "$extensions": { "pl.sameShapeAs": "color.status.success", "pl.ramp": "neutral" } },
+      "overdue":     { "$extensions": { "pl.sameShapeAs": "color.status.success", "pl.ramp": "danger" } }
+    },
+    "data": {
+      "categorical": {
+        "$description": "16 worker/calendar colors (09 assigns). Each n = 1..16 has bg, fg, border, solid per mode; fg = onColor(bg) ≥4.5.",
+        "n": { "bg": { "$type": "color" }, "fg": { "$type": "color" }, "border": { "$type": "color" }, "solid": { "$type": "color" } }
+      },
+      "sequential": { "$type": "color", "$extensions": { "pl.generated": "primary 100..800, 7 steps, for charts/heatmaps" } }
+    },
+    "calendar": {
+      "today-bg":       { "$type": "color", "$value": { "light": "{color.bg.brand-subtle}", "dark": "{color.bg.brand-subtle}" } },
+      "now-line":       { "$type": "color", "$value": { "light": "{color.status.danger.solid}", "dark": "{color.status.danger.solid}" } },
+      "non-working-bg": { "$type": "color", "$value": { "light": "{color.bg.surface-sunken}", "dark": "{color.bg.surface-sunken}" } },
+      "travel-time":    { "$type": "color", "$value": { "light": "hatch(neutral.200)", "dark": "hatch(neutral.800)" } },
+      "grid-line":      { "$type": "color", "$value": { "light": "{color.border.subtle}", "dark": "{color.border.subtle}" } }
+    },
+    "map": {
+      "pin":         { "$type": "color", "$value": { "light": "seeds.mapPin ?? action.primary.bg", "dark": "seeds.mapPin ?? action.primary.bg" } },
+      "route-line":  { "$type": "color", "$value": { "light": "{palette.primary.600}", "dark": "{palette.primary.300}" } },
+      "area-fill":   { "$type": "color", "$value": { "light": { "alias": "palette.primary.500", "alphaOverride": 0.12 }, "dark": { "alias": "palette.primary.400", "alphaOverride": 0.16 } } },
+      "area-stroke": { "$type": "color", "$value": { "light": "{palette.primary.600}", "dark": "{palette.primary.300}" } },
+      "style":       { "$type": "string", "$value": { "light": "standard|muted", "dark": "dark" } }
+    }
+  },
+
+  "font": {
+    "family": {
+      "heading": { "$type": "fontFamily", "$value": ["pl-heading", "{fallback.metric-matched}", "system-ui", "-apple-system", "Segoe UI", "Roboto", "sans-serif"] },
+      "body":    { "$type": "fontFamily", "$value": ["pl-body", "{fallback.metric-matched}", "system-ui", "-apple-system", "Segoe UI", "Roboto", "sans-serif"] },
+      "mono":    { "$type": "fontFamily", "$value": ["ui-monospace", "SFMono-Regular", "Menlo", "Consolas", "monospace"] },
+      "email":   { "$type": "fontFamily", "$value": ["pl-body (web font where supported)", "Arial|Georgia (by category)", "Helvetica", "sans-serif"] },
+      "document":{ "$type": "fontFamily", "$value": ["pl-body (embedded if allowed)", "fallback per category"] }
+    },
+    "weight": {
+      "regular": { "$type": "fontWeight", "$value": 400 }, "medium": { "$type": "fontWeight", "$value": 500 },
+      "semibold": { "$type": "fontWeight", "$value": 600 }, "bold": { "$type": "fontWeight", "$value": 700 },
+      "heading": { "$type": "fontWeight", "$value": "typography.weights.heading → snapped" },
+      "body": { "$type": "fontWeight", "$value": "typography.weights.body → snapped" },
+      "strong": { "$type": "fontWeight", "$value": "typography.weights.strong → snapped" },
+      "button": { "$type": "fontWeight", "$value": "typography.weights.button → snapped" }
+    },
+    "size": {
+      "xs":  { "$type": "dimension", "$value": "base × r^-2" }, "sm":  { "$type": "dimension", "$value": "base × r^-1" },
+      "md":  { "$type": "dimension", "$value": "base" },        "lg":  { "$type": "dimension", "$value": "base × r" },
+      "xl":  { "$type": "dimension", "$value": "fluid(base × r^2)" }, "2xl": { "$type": "dimension", "$value": "fluid(base × r^3)" },
+      "3xl": { "$type": "dimension", "$value": "fluid(base × r^4)" }, "4xl": { "$type": "dimension", "$value": "fluid(base × r^5)" },
+      "5xl": { "$type": "dimension", "$value": "fluid(base × r^6)" },
+      "input-min-touch": { "$type": "dimension", "$value": "16px", "$extensions": { "pl.locked": true } }
+    },
+    "line-height": {
+      "tight": { "$type": "number", "$value": 1.15 }, "snug": { "$type": "number", "$value": 1.3 },
+      "body": { "$type": "number", "$value": "typography.lineHeight.body" }, "heading": { "$type": "number", "$value": "typography.lineHeight.heading" }
+    },
+    "letter-spacing": {
+      "heading": { "$type": "dimension", "$value": "typography.letterSpacingEm.heading em" },
+      "caps": { "$type": "dimension", "$value": "typography.letterSpacingEm.caps em" },
+      "normal": { "$type": "dimension", "$value": "0em" }
+    },
+    "numeric": { "$type": "string", "$value": "tabular-nums if useTabularNumbers and feature tnum present" }
+  },
+
+  "text": {
+    "$description": "Composite typography styles (DTCG 'typography').",
+    "display": { "$type": "typography", "$value": { "fontFamily": "{font.family.heading}", "fontSize": "{font.size.5xl}", "fontWeight": "{font.weight.heading}", "lineHeight": "lh(6)", "letterSpacing": "{font.letter-spacing.heading}" } },
+    "h1": { "$type": "typography", "$value": { "fontFamily": "{font.family.heading}", "fontSize": "{font.size.4xl}", "fontWeight": "{font.weight.heading}", "lineHeight": "lh(5)" } },
+    "h2": { "$type": "typography", "$value": { "fontFamily": "{font.family.heading}", "fontSize": "{font.size.3xl}", "fontWeight": "{font.weight.heading}", "lineHeight": "lh(4)" } },
+    "h3": { "$type": "typography", "$value": { "fontFamily": "{font.family.heading}", "fontSize": "{font.size.2xl}", "fontWeight": "{font.weight.heading}", "lineHeight": "lh(3)" } },
+    "h4": { "$type": "typography", "$value": { "fontFamily": "{font.family.heading}", "fontSize": "{font.size.xl}", "fontWeight": "{font.weight.heading}", "lineHeight": "lh(2)" } },
+    "h5": { "$type": "typography", "$value": { "fontFamily": "{font.family.heading}", "fontSize": "{font.size.lg}", "fontWeight": "{font.weight.strong}", "lineHeight": "{font.line-height.snug}" } },
+    "h6": { "$type": "typography", "$value": { "fontFamily": "{font.family.body}", "fontSize": "{font.size.md}", "fontWeight": "{font.weight.strong}", "lineHeight": "{font.line-height.snug}" } },
+    "body-lg": { "$type": "typography", "$value": { "fontFamily": "{font.family.body}", "fontSize": "{font.size.lg}", "fontWeight": "{font.weight.body}", "lineHeight": "{font.line-height.body}" } },
+    "body": { "$type": "typography", "$value": { "fontFamily": "{font.family.body}", "fontSize": "{font.size.md}", "fontWeight": "{font.weight.body}", "lineHeight": "{font.line-height.body}" } },
+    "body-sm": { "$type": "typography", "$value": { "fontFamily": "{font.family.body}", "fontSize": "{font.size.sm}", "fontWeight": "{font.weight.body}", "lineHeight": "{font.line-height.body}" } },
+    "label": { "$type": "typography", "$value": { "fontFamily": "{font.family.body}", "fontSize": "{font.size.sm}", "fontWeight": "{font.weight.strong}", "lineHeight": "{font.line-height.snug}" } },
+    "caption": { "$type": "typography", "$value": { "fontFamily": "{font.family.body}", "fontSize": "{font.size.xs}", "fontWeight": "{font.weight.body}", "lineHeight": "{font.line-height.snug}" } },
+    "overline": { "$type": "typography", "$value": { "fontFamily": "{font.family.body}", "fontSize": "{font.size.xs}", "fontWeight": "{font.weight.strong}", "letterSpacing": "{font.letter-spacing.caps}", "textTransform": "uppercase" } },
+    "button": { "$type": "typography", "$value": { "fontFamily": "{font.family.body}", "fontSize": "{font.size.md}", "fontWeight": "{font.weight.button}", "lineHeight": 1, "textTransform": "shape.buttonLabelCase" } },
+    "price": { "$type": "typography", "$value": { "fontFamily": "{font.family.body}", "fontSize": "{font.size.lg}", "fontWeight": "{font.weight.strong}", "fontVariantNumeric": "{font.numeric}" } },
+    "price-total": { "$type": "typography", "$value": { "fontFamily": "{font.family.heading}", "fontSize": "{font.size.xl}", "fontWeight": "{font.weight.heading}", "fontVariantNumeric": "{font.numeric}" } }
+  },
+
+  "radius": {
+    "none": { "$type": "dimension", "$value": "0px" }, "xs": { "$type": "dimension", "$value": "round(R*0.25)" },
+    "sm": { "$type": "dimension", "$value": "round(R*0.5)" }, "md": { "$type": "dimension", "$value": "R" },
+    "lg": { "$type": "dimension", "$value": "round(R*1.5)" }, "xl": { "$type": "dimension", "$value": "round(R*2)" },
+    "full": { "$type": "dimension", "$value": "9999px" }
+  },
+  "border-width": {
+    "hairline": { "$type": "dimension", "$value": "1px" }, "default": { "$type": "dimension", "$value": "shape.borderWidthPx" },
+    "thick": { "$type": "dimension", "$value": "2px" }, "focus": { "$type": "dimension", "$value": "max(2px, shape.focusRing.widthPx)", "$extensions": { "pl.lockedMin": "2px" } }
+  },
+  "focus": {
+    "ring": { "$type": "shadow", "$value": "brand: 0 0 0 {border-width.focus} {color.border.focus}; high_visibility: 0 0 0 2px {color.border.focus-outer}, 0 0 0 calc(2px + {border-width.focus}) {color.border.focus}" },
+    "offset": { "$type": "dimension", "$value": "2px" }
+  },
+
+  "space": {
+    "$description": "round(4 × n × densityMultiplier) px; density from density.public or density.workspace (+ viewer override in CRM).",
+    "0": { "$type": "dimension", "$value": "0" }, "0-5": { "$type": "dimension", "$value": "2" }, "1": { "$type": "dimension", "$value": "4d" },
+    "1-5": { "$type": "dimension", "$value": "6d" }, "2": { "$type": "dimension", "$value": "8d" }, "3": { "$type": "dimension", "$value": "12d" },
+    "4": { "$type": "dimension", "$value": "16d" }, "5": { "$type": "dimension", "$value": "20d" }, "6": { "$type": "dimension", "$value": "24d" },
+    "8": { "$type": "dimension", "$value": "32d" }, "10": { "$type": "dimension", "$value": "40d" }, "12": { "$type": "dimension", "$value": "48d" },
+    "16": { "$type": "dimension", "$value": "64d" }, "20": { "$type": "dimension", "$value": "80d" }, "24": { "$type": "dimension", "$value": "96d" },
+    "gutter-phone": { "$type": "dimension", "$value": "16px", "$extensions": { "pl.lockedMin": "12px" } },
+    "gutter-tablet": { "$type": "dimension", "$value": "24px" }, "gutter-desktop": { "$type": "dimension", "$value": "32px" }
+  },
+  "size": {
+    "control": { "sm": { "$type": "dimension", "$value": "28|32|36" }, "md": { "$type": "dimension", "$value": "36|40|44" }, "lg": { "$type": "dimension", "$value": "44|48|52" } },
+    "touch-target-min": { "$type": "dimension", "$value": "44px", "$extensions": { "pl.locked": true } },
+    "primary-action-phone": { "$type": "dimension", "$value": "48px", "$extensions": { "pl.lockedMin": "48px" } },
+    "icon": { "sm": { "$type": "dimension", "$value": "16|18|20 by icons.sizeScale" }, "md": { "$type": "dimension", "$value": "20|22|24" }, "lg": { "$type": "dimension", "$value": "24|28|32" }, "xl": { "$type": "dimension", "$value": "32|36|40" } },
+    "avatar": { "sm": { "$type": "dimension", "$value": "24px" }, "md": { "$type": "dimension", "$value": "32px" }, "lg": { "$type": "dimension", "$value": "48px" }, "xl": { "$type": "dimension", "$value": "64px" } },
+    "header-height": { "phone": { "$type": "dimension", "$value": "56px" }, "tablet": { "$type": "dimension", "$value": "64px" }, "desktop": { "$type": "dimension", "$value": "72px" } },
+    "sidebar": { "expanded": { "$type": "dimension", "$value": "248px" }, "rail": { "$type": "dimension", "$value": "72px" } },
+    "tabbar-height": { "$type": "dimension", "$value": "56px + safe-area-inset-bottom" },
+    "content-max": { "booking": { "$type": "dimension", "$value": "720px" }, "settings": { "$type": "dimension", "$value": "880px" }, "page": { "$type": "dimension", "$value": "1440px" }, "prose": { "$type": "dimension", "$value": "70ch" } },
+    "summary-rail": { "$type": "dimension", "$value": "clamp(320px, 28vw, 360px)" },
+    "drawer": { "sm": { "$type": "dimension", "$value": "480px" }, "md": { "$type": "dimension", "$value": "640px" }, "lg": { "$type": "dimension", "$value": "720px" } }
+  },
+  "shadow": {
+    "$description": "Two-layer composites per §5.9, transformed by elevation.style/intensity/tint and mode.",
+    "0": { "$type": "shadow", "$value": [] },
+    "1": { "$type": "shadow", "$value": [ { "offsetX": "0", "offsetY": "1px", "blur": "2px", "spread": "0", "color": "shadowColor(0.06)" }, { "offsetX": "0", "offsetY": "1px", "blur": "3px", "spread": "0", "color": "shadowColor(0.10)" } ] },
+    "2": { "$type": "shadow", "$value": [ { "offsetX": "0", "offsetY": "2px", "blur": "4px", "spread": "-1px", "color": "shadowColor(0.06)" }, { "offsetX": "0", "offsetY": "4px", "blur": "6px", "spread": "-1px", "color": "shadowColor(0.10)" } ] },
+    "3": { "$type": "shadow", "$value": [ { "offsetX": "0", "offsetY": "4px", "blur": "6px", "spread": "-2px", "color": "shadowColor(0.05)" }, { "offsetX": "0", "offsetY": "10px", "blur": "15px", "spread": "-3px", "color": "shadowColor(0.10)" } ] },
+    "4": { "$type": "shadow", "$value": [ { "offsetX": "0", "offsetY": "10px", "blur": "10px", "spread": "-5px", "color": "shadowColor(0.04)" }, { "offsetX": "0", "offsetY": "20px", "blur": "25px", "spread": "-5px", "color": "shadowColor(0.10)" } ] },
+    "5": { "$type": "shadow", "$value": [ { "offsetX": "0", "offsetY": "25px", "blur": "50px", "spread": "-12px", "color": "shadowColor(0.25)" } ] }
+  },
+  "elevation": {
+    "card": { "$type": "shadow", "$value": "{shadow[elevation.levels.card]}" }, "popover": { "$type": "shadow", "$value": "{shadow[elevation.levels.popover]}" },
+    "dialog": { "$type": "shadow", "$value": "{shadow[elevation.levels.dialog]}" }, "sheet": { "$type": "shadow", "$value": "{shadow[elevation.levels.sheet]}" },
+    "header-scrolled": { "$type": "shadow", "$value": "{shadow[elevation.levels.headerOnScroll]}" }, "toast": { "$type": "shadow", "$value": "{shadow[elevation.levels.toast]}" }
+  },
+  "motion": {
+    "duration": { "instant": { "$type": "duration", "$value": "0ms" }, "fast": { "$type": "duration", "$value": "120ms×speed" }, "base": { "$type": "duration", "$value": "200ms×speed" }, "slow": { "$type": "duration", "$value": "320ms×speed" }, "slower": { "$type": "duration", "$value": "480ms×speed" } },
+    "easing": { "standard": { "$type": "cubicBezier", "$value": [0.2, 0, 0, 1] }, "enter": { "$type": "cubicBezier", "$value": [0, 0, 0, 1] }, "exit": { "$type": "cubicBezier", "$value": [0.3, 0, 1, 1] } },
+    "reduced": { "$type": "string", "$value": "durations→0 for movement; fades ≤120ms" }
+  },
+  "opacity": { "disabled": { "$type": "number", "$value": 0.5 }, "image-dim-dark": { "$type": "number", "$value": "1 - dark.imageDimPct/100" }, "hero-scrim": { "$type": "number", "$value": "logos.hero.scrimOpacity" } },
+  "z": {
+    "base": { "$type": "number", "$value": 0 }, "sticky": { "$type": "number", "$value": 100 }, "header": { "$type": "number", "$value": 200 },
+    "dropdown": { "$type": "number", "$value": 300 }, "sheet": { "$type": "number", "$value": 400 }, "modal": { "$type": "number", "$value": 500 },
+    "toast": { "$type": "number", "$value": 600 }, "tooltip": { "$type": "number", "$value": 700 }, "guard": { "$type": "number", "$value": 800, "$extensions": { "pl.locked": true } }
+  },
+  "breakpoint": {
+    "xs": { "$type": "dimension", "$value": "0px" }, "sm": { "$type": "dimension", "$value": "480px" }, "md": { "$type": "dimension", "$value": "768px" },
+    "lg": { "$type": "dimension", "$value": "1024px" }, "xl": { "$type": "dimension", "$value": "1280px" }, "2xl": { "$type": "dimension", "$value": "1536px" }
+  },
+
+  "component": {
+    "button": {
+      "radius": { "$type": "dimension", "$value": "shape.button → radius.md | radius.full | px" },
+      "height": { "sm": "{size.control.sm}", "md": "{size.control.md}", "lg": "{size.control.lg}" },
+      "padding-x": { "sm": "{space.3}", "md": "{space.4}", "lg": "{space.5}" },
+      "text": "{text.button}",
+      "primary": { "bg": "filled→{color.action.primary.bg} | outline→transparent | soft→{color.bg.brand-subtle}", "fg": "filled→{color.action.primary.fg} | outline/soft→{color.fg.brand}", "border": "filled→transparent | outline→{color.action.primary.border} | soft→transparent" },
+      "secondary": { "bg": "{color.action.secondary.bg}", "fg": "{color.action.secondary.fg}", "border": "{color.action.secondary.border}" },
+      "shadow": "{shadow.0}"
+    },
+    "input": {
+      "bg": "{color.bg.surface}", "fg": "{color.fg.default}", "placeholder": "{color.fg.placeholder}",
+      "border": "{color.border.input}", "border-hover": "{color.border.input-hover}", "border-focus": "{color.border.focus}",
+      "border-error": "{color.status.danger.solid}", "radius": "shape.input → radius.md", "height": "{size.control.md}",
+      "font-size": "max({font.size.md}, {font.size.input-min-touch}) on pointer:coarse"
+    },
+    "card": { "bg": "{color.bg.surface}", "border": "{color.border.default} | none when elevation≥1 and style≠none", "radius": "shape.card → radius.lg", "shadow": "{elevation.card}", "padding": "{space.4}" },
+    "dialog": { "bg": "{color.bg.surface-raised}", "radius": "shape.dialog → radius.xl", "shadow": "{elevation.dialog}", "scrim": "{color.bg.scrim}" },
+    "sheet": { "bg": "{color.bg.surface-raised}", "radius-top": "{radius.xl}", "shadow": "{elevation.sheet}", "handle": "{color.border.strong}" },
+    "header": { "bg": "{color.bg.header}", "fg": "{color.fg.default}", "border": "{color.border.subtle}", "shadow-scrolled": "{elevation.header-scrolled}", "height": "{size.header-height.*}" },
+    "footer": { "bg": "{color.bg.footer}", "fg": "{color.fg.muted}", "link": "{color.fg.link}" },
+    "stepper": { "track": "{color.border.subtle}", "fill": "{color.action.primary.bg}", "label": "{color.fg.muted}", "current-label": "{color.fg.default}" },
+    "service-card": { "bg": "{component.card.bg}", "title": "{text.h5}", "price": "{text.price}", "duration": "{color.fg.muted}", "selected-border": "{color.border.selected}", "selected-bg": "{color.bg.selected}", "image-radius": "shape.image → radius.md" },
+    "slot-chip": { "bg": "{color.action.secondary.bg}", "fg": "{color.fg.default}", "border": "{color.border.default}", "selected-bg": "{color.action.primary.bg}", "selected-fg": "{color.action.primary.fg}", "disabled-fg": "{color.fg.disabled}", "radius": "{radius.md}", "min-height": "{size.touch-target-min}" },
+    "summary": { "bg": "{color.bg.surface-raised}", "shadow": "{elevation.sheet}", "total": "{text.price-total}" },
+    "badge": { "radius": "{radius.full}", "neutral": "{color.status.neutral.*}", "brand": "{color.accent.*}" },
+    "chip": { "radius": "shape.chip → radius.full", "bg": "{color.bg.surface-sunken}", "selected-bg": "{color.bg.selected}", "fg": "{color.fg.default}" },
+    "toast": { "bg": "{color.bg.inverse}", "fg": "{color.fg.inverse}", "shadow": "{elevation.toast}", "radius": "{radius.lg}" },
+    "tooltip": { "bg": "{color.bg.inverse}", "fg": "{color.fg.inverse}", "radius": "{radius.sm}" },
+    "table": { "header-bg": "{color.bg.surface-sunken}", "row-hover": "{color.bg.hover}", "row-selected": "{color.bg.selected}", "border": "{color.border.subtle}", "row-height": "32|40|48 by density" },
+    "calendar-event": { "bg": "{color.data.categorical.n.bg}", "fg": "{color.data.categorical.n.fg}", "accent-border": "{color.data.categorical.n.solid}", "radius": "{radius.sm}", "min-height": "24px" },
+    "nav": { "sidebar-bg": "workspace.sidebar → neutral {color.bg.surface} | tinted {color.bg.brand-subtle} | solid {color.bg.brand}", "item-fg": "{color.fg.muted} | onColor(sidebar-bg)", "item-active-bg": "{color.bg.selected}", "item-active-fg": "{color.fg.brand}" },
+    "tabbar": { "bg": "{color.bg.surface}", "fg": "{color.fg.muted}", "active-fg": "{color.fg.brand}", "border": "{color.border.subtle}", "height": "{size.tabbar-height}" },
+    "map-pin": { "bg": "{color.map.pin}", "fg": "onColor(color.map.pin)", "avatar": "logos.placements.map_pin_avatar" },
+    "skeleton": { "base": "{color.bg.skeleton}", "highlight": "{color.bg.skeleton-highlight}" },
+    "link": { "fg": "{color.fg.link}", "hover": "{color.fg.link-hover}", "decoration": "linkStyle | forced underline if contrast vs body < 3:1" },
+    "logo": {
+      "web-header-desktop": { "max-height": "logos.placements.web_header_desktop.maxHeightPx", "max-width": "…maxWidthPx", "padding": "…paddingPx" },
+      "web-header-mobile": { "$extensions": { "pl.sameShapeAs": "component.logo.web-header-desktop" } },
+      "email-header": { "width": "logos.placements.email_header.maxWidthPx", "align": "…align" },
+      "document-header": { "max-height": "logos.placements.document_header.maxHeightPx" },
+      "crm-sidebar": { "max-height": "logos.placements.crm_sidebar.maxHeightPx" }
+    },
+    "email": {
+      "width": "surfaces.email.widthPx", "canvas": "{color.bg.canvas} (light)", "card": "{color.bg.surface} (light)",
+      "button-radius": "min({component.button.radius}, 24px)", "button-bg": "{color.action.primary.bg} (light)",
+      "font-stack": "{font.family.email}", "dark-canvas": "{color.bg.canvas} (dark)", "dark-card": "{color.bg.surface} (dark)"
+    },
+    "document": {
+      "paper": "surfaces.document.paper", "margin": "narrow 12mm | normal 18mm | wide 25mm",
+      "accent": "{color.action.primary.bg} (light)", "accent-fg": "{color.action.primary.fg} (light)",
+      "rule": "{color.border.default} (light)", "zebra": "{color.bg.surface-sunken} (light)",
+      "heading-font": "brand → {font.family.heading} | classic_serif → Georgia stack"
+    },
+    "payment-element": {
+      "$description": "Mapped to the processor's appearance API by 05 (§10.12).",
+      "colorPrimary": "{color.action.primary.bg}", "colorBackground": "{color.bg.surface}", "colorText": "{color.fg.default}",
+      "colorDanger": "{color.status.danger.solid}", "borderRadius": "{component.input.radius}", "fontFamily": "{font.family.body} (only if processor can load it; else system)",
+      "spacingUnit": "{space.1}"
+    },
+    "qr": { "fg": "surfaces.qr.foreground (≥7:1 vs bg)", "bg": "#ffffff", "module-style": "surfaces.qr.moduleStyle", "center-logo": "logos.placements.qr_center" }
+  }
+}
+```
+
+Notes on the catalog:
+- Functions used in rules (`ramp`, `onColor`, `firstPassing`, `primaryButtonBg`, `lift`, `mix`, `step`,
+  `fluid`, `lh`, `shadowColor`, `hatch`) are defined in §10.1–§10.5.
+- Every token marked `pl.locked`/`pl.lockedMin` cannot be overridden below the stated minimum by
+  overrides or custom CSS (custom CSS re-declaring a locked var is stripped).
+- Token count (resolved, both modes): ≈ 650 color values + ≈ 180 non-color tokens. Each surface's
+  compiled CSS includes only tokens its components reference (tree-shaken).
