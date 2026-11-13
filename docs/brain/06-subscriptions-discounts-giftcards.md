@@ -1431,3 +1431,187 @@ interface GiftCardSettings { enabled: boolean; minCents: Cents; maxCents: Cents;
 - `Discount unique(businessId, codeNormalized) where status not archived`; `DiscountCode unique(businessId, codeNormalized)` (shared namespace with Discount codes).
 - `DiscountRedemption unique(idempotencyKey)`; `(discountId, customerId, status)`.
 - `GiftCard unique(businessId, codeHash)`; `GiftCardLedgerEntry unique(giftCardId, seq)`, `unique(idempotencyKey)`.
+
+---
+
+## 8. API surface
+
+Commands mutate; queries read. Transport-agnostic (REST/RPC/MCP tool names map 1:1) `[I]`. Every
+command takes `idempotencyKey` (required for anything that moves money or consumes a limited
+resource) and `expectedVersion` where it edits an existing record. Errors are typed
+(`code`, `message`, `field?`, `retryable`) — never free text only. Auth column uses Agent 09
+permission keys (§2); "customer" = authenticated booking-site/customer-app session scoped to own
+records; "public" = unauthenticated but rate-limited; "system" = internal scheduler/service
+identity. The CRM MCP exposes the staff commands; the Bookings MCP exposes only the customer
+ones `[S: llms]` `[I]`.
+
+Naming is aligned with peer specs: Agent 01 calls `QuoteSubscription`, `StartSubscription`,
+`ValidateCode`, `RedeemCode`, `QuoteGiftCard`, `IssueGiftCard`; Agent 05 calls
+`discounts.evaluate` and `giftcards.hold|capture|release|refund|issueOrReload`. Aliases are listed.
+
+### 8.1 Packages
+
+| Name | Input | Output | Auth |
+|---|---|---|---|
+| `subscription.package.create` | `PackageDraft` (all §7.1 version fields), `publish: boolean` | `{packageId, versionId, warnings[]}` | `subs.package.edit` (+`publish`) |
+| `subscription.package.update` | `packageId, expectedVersion, patch, propagation: 'new_only'\|'at_renewal', noticeDays?` | `{versionId, affectedSubscriptions, plannedChanges}` | `subs.package.edit` |
+| `subscription.package.publish` / `.unpublish` / `.archive` / `.duplicate` / `.delete` | `packageId` | package | `subs.package.publish` / `archive` / `edit` |
+| `subscription.package.get` | `packageId, versionId?` | `PackageVersion` + stats | `subs.package.view` |
+| `subscription.package.list` | filters (status, kind, selfPurchase, q), cursor | page | `subs.package.view` |
+| `subscription.package.listPublic` | `zoneId?, customerType?` | public package cards (no internal fields) | public |
+| `subscription.package.previewSavings` | `packageVersionId, sampleCart` | `{memberTotal, regularTotal, savings}` | `subs.package.view` / public for published |
+
+### 8.2 Subscriptions
+
+| Name | Input | Output | Auth |
+|---|---|---|---|
+| `subscription.quote` (alias 01 `QuoteSubscription`) | `{customerId?\|draftCustomer, packageVersionId, commitmentOptionId?, billingStart, addressId\|address, discountCode?, cart?}` | `QuoteSnapshot {firstChargeCents, taxCents, discounts[], nextChargeAt, periods preview, visits preview, cartRepriced?, quoteHash, expiresAt}` | `subs.subscription.create` / customer |
+| `subscription.create` (alias 01 `StartSubscription`) | `{quoteHash, customerId, packageVersionId, commitmentOptionId?, billingStart, collection, paymentMethodId?, firstVisit?{start, workerId?}, preferredWindow?, assetIds, consent: ConsentInput, channel, sendToCustomer?: boolean, idempotencyKey}` | `{subscriptionId, status, chargeResult?, checkoutLink?}` | `subs.subscription.create` / customer |
+| `subscription.get` | `subscriptionId` | full record + current period + entitlement balances + upcoming visits | `subs.subscription.view` / customer(own) |
+| `subscription.list` | filters (§3.3), sort, cursor | page + KPI strip | `subs.subscription.view` |
+| `subscription.listForCustomer` | `customerId` | subscriptions (+ bundles) | `subs.subscription.view` / customer(own) |
+| `subscription.changePlan` | `subscriptionId, newPackageVersionId, commitmentOptionId?, timing: 'now'\|'next_renewal', prorationPreviewHash, idempotencyKey` | `{plannedChange\|appliedChange, chargeOrCredit}` | `subs.subscription.edit` / customer if allowed |
+| `subscription.previewChange` | same minus hash | `ProrationPreview {creditCents, chargeCents, entitlementDiff[], repricedJobs[], hash}` | same |
+| `subscription.adjust` (live adjustment, §8.7) | `subscriptionId, ops: AdjustOp[], effective: 'now'\|'next_renewal'\|'this_job', previewHash, consent?, idempotencyKey` | `{applied[], charge?, jobRepriced[]}` | `subs.subscription.edit` (+ per-op permissions) |
+| `subscription.changeBillingDate` | `subscriptionId, newAnchorLocalDate, prorate: boolean` | updated + preview | `subs.subscription.edit` |
+| `subscription.updatePaymentMethod` | `subscriptionId, paymentMethodId` → triggers immediate retry if past due | `{retried, result?}` | `subs.subscription.edit` / customer(own) |
+| `subscription.sendPaymentUpdateLink` | `subscriptionId, channels` | `{linkId, expiresAt}` | `subs.subscription.edit` |
+| `subscription.pause` / `.resume` | `subscriptionId, startsAt\|'next_renewal', resumesAt?` | updated | `subs.subscription.pause` / customer if allowed |
+| `subscription.skipVisit` | `subscriptionId, jobId` | `{releasedEntitlements}` | `subs.subscription.edit` / customer if allowed |
+| `subscription.cancel` | `subscriptionId, mode, refund: 'none'\|'prorated', futureJobs: 'cancel'\|'convert_to_paid', reasonCode, reasonText?` | `{status, refundId?, jobsAffected[]}` | `subs.subscription.cancel` / customer (online-purchased always) |
+| `subscription.undoCancel` | `subscriptionId` | updated | `subs.subscription.cancel` / customer(own) |
+| `subscription.retryPayment` | `subscriptionId, periodId` | charge result | `subs.dunning.override` |
+| `subscription.recordManualPayment` | `periodId, paymentId` (Agent 05 cash/check) | period paid | `subs.dunning.override` |
+| `subscription.compPeriod` | `subscriptionId, reason` | period comped | `subs.subscription.comp` |
+| `subscription.refundPeriod` | `periodId, amountCents\|'full', expireUnconsumed: boolean` | `{refundId}` | `subs.subscription.refund` |
+| `subscription.entitlement.adjust` | `subscriptionId, entitlementDefId, windowId, delta, reason` | ledger entry | `subs.subscription.comp` |
+| `subscription.entitlement.balances` | `subscriptionId, at?` | per entitlement: granted/reserved/consumed/available/expiresAt | `subs.subscription.view` / customer(own) |
+| `subscription.coverageForJob` | `jobId` or `{customerId, serviceDate, lines}` | which lines are covered/discounted and by what | internal (03/04/05) / worker read |
+| `subscription.upsellCandidates` | `{cart, customerId?, zoneId, channel}` | ranked `{packageId, versionId, headline, savingsCents, memberCart}`[] | public / customer |
+| `subscription.reactivate` | `previousSubscriptionId, …create input` | new subscription | `subs.subscription.create` / customer |
+| `subscription.export` | filters | CSV job id | `subs.subscription.view` |
+| `subscription.import` | CSV rows (migration: external ids, next bill date, card token ref) | dry-run report / commit | owner |
+| `subscription.billing.runDue` | `{now, shard}` | counts | system |
+| `subscription.dunning.runDue` | `{now, shard}` | counts | system |
+
+### 8.3 Pricing / discounts
+
+| Name | Input | Output | Auth |
+|---|---|---|---|
+| `pricing.modifiers.evaluate` (alias 05 `discounts.evaluate`) | `EvalRequest {businessId, context:{channel, customerId?, customerFingerprint?, bookedAt, serviceAt, zoneId, shopId?, bookingType, seriesId?, occurrenceIndex?, subscriptionId?, assumeMembership?: versionId}, lines: PriceLine[] (post stage 2), codes: string[], manual?: ManualDiscount[], recurring?: RecurringModifier, dryRun}` | `EvalResult {lines with modifiers, applied: PriceModifierApplied[], rejected: {code, reason, failedConditions[]}[], entitlementPlan[], warnings[], evalHash}` | internal + staff + customer (no internal fields) |
+| `discount.validateCode` (alias 01 `ValidateCode`) | `code, cartContext` | `{valid, kind: 'discount'\|'giftcard'\|'referral', label, reason?}` (single field accepts all three) | public (rate-limited) |
+| `discount.redemption.reserve` (alias 01 `RedeemCode`) | `{evalHash, target, idempotencyKey}` | redemptions[] | internal |
+| `discount.redemption.commit` / `.release` / `.reverse` | `redemptionId` or `target` | updated | internal |
+| `discount.create` / `.update` / `.pause` / `.resume` / `.archive` / `.duplicate` | `DiscountDraft` / patch | discount + version | `discounts.create` / `edit` / `delete` |
+| `discount.generateBulkCodes` | `discountId, count ≤ 10,000, prefix` | job id → CSV | `discounts.create` |
+| `discount.test` | `discountId, sampleContext` | eligibility trace | `discounts.view` |
+| `discount.list` / `.get` / `.stats` | filters | page / detail / `{uses, cost, revenueInfluenced}` | `discounts.view` |
+| `discount.listApplicable` | `jobContext` | discounts staff can pick in Options `[S: 16]` | `discounts.apply_manual` |
+| `discount.issueForCustomer` (for 08 referral/drip rewards) | `{templateDiscountId\|spec, customerId, expiresAt?, reason}` | single-use code | system (08) / `discounts.create` |
+
+### 8.4 Gift cards and account credit
+
+| Name | Input | Output | Auth |
+|---|---|---|---|
+| `giftcard.quote` (alias 01 `QuoteGiftCard`) | `amountCents, designId, delivery` | `{totalCents, limitsOk}` | public |
+| `giftcard.issue` (alias 01 `IssueGiftCard`) | `{kind, amountCents, salePaymentId?, recipient, purchaser?, message?, designId?, delivery, expiresAt?, idempotencyKey}` | `{giftCardId, last4, status, revealOnceCode?}` | `giftcards.issue` (cap) / system after online payment |
+| `giftcard.lookup` | `code` | `{giftCardId, last4, balanceCents, status, expiresAt?}` | customer/public (rate-limited), staff |
+| `giftcard.authorize` | `code\|giftCardId, amountCents` | `{usableCents}` | internal |
+| `giftcard.hold` / `.capture` / `.release` | `{giftCardId, amountCents, paymentIntentId, ttl?}` / `holdId` | hold / ledger entry | internal (05) |
+| `giftcard.refund` | `{giftCardId, amountCents, refundId, idempotencyKey}` | ledger entry | internal (05) |
+| `giftcard.issueOrReload` (05 refunds-as-credit, 08 rewards) | `{customerId, amountCents, kind: 'store_credit'\|'promotional', reason, sourceRef}` | card (customer-bound credit, no shareable code needed) | internal / `giftcards.issue` |
+| `giftcard.adjust` | `giftCardId, deltaCents, reason` | ledger entry | `giftcards.adjust` |
+| `giftcard.void` / `.reissue` / `.freeze` / `.unfreeze` / `.cashOut` | `giftCardId, reason` | updated | `giftcards.void` / `adjust` / `refund` |
+| `giftcard.resend` / `.changeRecipient` / `.reschedule` | … | updated | `giftcards.issue` / purchaser (before delivery) |
+| `giftcard.reveal` | `giftCardId` | full code (audited) | `giftcards.view` + `giftcards.reveal` |
+| `giftcard.ledger` | `giftCardId` | entries | `giftcards.view` / holder |
+| `giftcard.list` / `.stats` | filters | page / liability, sold, redeemed, breakage | `giftcards.view` |
+| `giftcard.wallet.add` / `.list` | `code` / — | wallet | customer |
+| `giftcard.design.generate` | `{prompt, brandTokens}` | 4 candidate designs | `giftcards.issue` / owner (`[S: llms]` AI design) |
+| `giftcard.design.save` / `.list` / `.archive` | … | designs | `giftcards.issue` |
+| `giftcard.delivery.runDue` / `giftcard.expiry.runDue` | `{now}` | counts | system |
+
+### 8.5 Reporting queries (consumed by Agent 08)
+
+`report.recurring.mrr(range, groupBy)`, `report.recurring.churn(range)`,
+`report.recurring.dunning(range)`, `report.recurring.utilization(packageId, range)`,
+`report.discounts.cost(range, groupBy)`, `report.giftcards.liability(asOf)`,
+`report.giftcards.activity(range)`, `report.giftcards.escheat(asOf, stateRules)` — formulas §5.13.
+Auth `reports.recurring_revenue.view` / `discounts.view` / `giftcards.view`.
+
+### 8.6 Webhooks / outbound
+
+All §9 PRODUCES events are available to business webhooks/MCP subscribers with PII minimized
+(customer id, not contact details) `[I]`.
+
+### 8.7 Live package adjustment from native apps (owner requirement 2026-11-13)
+
+The owner wants staff to **adjust a client's package on site, or during a phone call, from the
+native desktop and iPhone apps** (BRIEF.md, 2026-11-13). This is an addendum workflow
+**W-SUB-12** (numbered after §4.21) plus the API it needs `[I]`.
+
+**Use cases**
+1. *On site:* worker/foreman at a vehicle: "Add interior to my plan" → upgrade package now,
+   cover today's add-on, card on file charged prorated difference, receipt on the customer's phone.
+2. *On a call:* office staff with the customer on the phone: downgrade at next renewal, pause
+   for vacation, move billing date, swap the visit day, add a second vehicle, apply a retention
+   discount, or build a brand-new subscription + first booking in one flow.
+3. *One-off goodwill:* comp today's add-on (`adjust` entitlement +1) without changing the plan.
+
+**AdjustOp vocabulary** (single command `subscription.adjust` composes several ops atomically):
+
+```ts
+type AdjustOp =
+  | { op: 'change_package'; packageVersionId: ID; commitmentOptionId?: ID }
+  | { op: 'custom_price'; priceCents: Cents; reason: string }            // per-subscription override, permission subs.subscription.custom_price
+  | { op: 'add_entitlement'; def: EntitlementDef; scope: 'this_window' | 'ongoing' }   // ongoing = subscription-level customization
+  | { op: 'remove_entitlement'; entitlementDefId: ID; effective: 'next_renewal' }
+  | { op: 'grant_once'; entitlementDefId: ID; quantity: number; reason: string } // goodwill
+  | { op: 'apply_discount'; discountId?: ID; spec?: { bp?: BasisPoints; cents?: Cents; cycles: number | 'forever' } }
+  | { op: 'change_frequency'; rule: RecurrenceRule }                      // forwarded to Agent 03
+  | { op: 'change_visit_slot'; daysOfWeek: number[]; startLocal: string; workerId?: ID }
+  | { op: 'add_asset'; assetId: ID }                                       // second vehicle → per-asset pricing rule from package
+  | { op: 'change_billing_date'; anchorLocalDate: LocalDate }
+  | { op: 'pause'; startsAt: Instant | 'next_renewal'; resumesAt?: Instant }
+  | { op: 'cancel'; mode: 'period_end' | 'immediate'; reasonCode: string };
+```
+
+Per-subscription customizations (custom price, ongoing extra entitlements) are stored as a
+**subscription-level overlay** `{ overrides: { priceCents?, extraEntitlements[], removedEntitlementIds[] } }`
+on top of the package version, so the package stays clean and reports can show "customized" `[I]`.
+
+**Steps (W-SUB-12)**
+1. Staff opens the customer (search by phone — caller-ID lookup on desktop app if telephony is
+   integrated later) or the job card on iPhone; the Subscription panel shows status, benefits
+   left, next charge, next visits.
+2. Staff composes changes; every edit calls `subscription.previewChange`/`adjust(dryRun)` which
+   returns: money now (charge/credit), next charge amount/date, entitlement diff, jobs repriced
+   (including **today's job** when on site), notices that will be sent, and a `previewHash`.
+   Preview must return in < 300 ms p95 so it feels live during a call `[I]`.
+3. **Consent capture** (required when price goes up, a new recurring charge starts, or the
+   commitment changes): on site → customer taps "I agree" on the staff device (signature-style
+   screen, terms text visible) or receives an SMS/email link to approve; on a phone call →
+   staff selects "Verbal consent" (recorded with staff id, timestamp, script text hash) **and**
+   the system sends the written confirmation with a cancel link immediately — some jurisdictions
+   require the confirmation for phone sales `[I]`. Stored as `ConsentRecord`.
+4. Staff taps **Apply**: `subscription.adjust({ops, previewHash, consent, idempotencyKey})`.
+   Server re-evaluates; if the hash no longer matches (price changed, someone else edited,
+   job moved) → `409 PREVIEW_STALE` with a fresh preview — never apply a different amount than
+   the one shown `[I]`.
+5. Side effects: plan change per §4.10 / proration §5.4; charge via Agent 05 off-session
+   (card present via Tap to Pay on iPhone possible through Agent 05 POS when the customer wants
+   to use a different card); today's job repriced through Agent 04/05 (`jobs.job.totals_changed`);
+   schedule changes forwarded to Agent 03; **E** `subscription.subscription.adjusted` (+ specific
+   events such as `plan_changed`); **N** confirmation to customer (Agent 08); audit row with
+   actor, device, channel (`native_desktop` / `native_ios` / `crm_web`) and, if phone,
+   call reference.
+6. **Offline (iPhone on site with poor signal)** `[I]`: preview requires the server (money must
+   be authoritative). The app may queue a *request* ("Adjust package — pending sync") but the
+   customer is told it's pending; on reconnect, the queued op is submitted with its original
+   idempotency key and the preview is re-shown to staff for confirmation if anything changed.
+   Benefits on today's job are not applied offline unless already reserved.
+
+Permissions: `subs.subscription.edit` (base), `subs.subscription.custom_price`,
+`subs.subscription.comp` (grant_once, cap per role e.g. 1 per window for workers),
+`discounts.apply_manual` with caps; workers default to `grant_once` + `change_package` to
+**published** packages only; office staff all ops; owner can restrict `cancel` to office roles.

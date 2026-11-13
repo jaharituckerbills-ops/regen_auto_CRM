@@ -1514,3 +1514,246 @@ onRealtimePatch(p):
 ```
 
 ---
+## 11. Edge cases & failure modes
+
+### 11.1 Concurrency & idempotency
+| # | Case | Handling |
+|---|---|---|
+| C1 | Two customers pick the same slot on the booking site at the same second | The first `hold.create` wins under the per worker-day lock and exclusion constraint. The second gets `409 SLOT_TAKEN` with alternatives. If another eligible worker is free at that time, the second customer is **transparently assigned to that worker**, so they never see the conflict. |
+| C2 | Booking site and CRM book the same worker/time simultaneously | Same lock and constraint. The CRM user sees "That time was just taken" plus refreshed suggestions, and all form inputs are kept (§3.6). |
+| C3 | Client retries `booking.commit` after a network timeout (the first request actually succeeded) | The idempotency record returns the original response. No second job is created. |
+| C4 | Same idempotency key reused with a different payload | `409 IDEMPOTENCY_MISMATCH`. Logged as a client bug. |
+| C5 | Two admins drag the same job at once | The second gets `VERSION_CONFLICT`. Their client reverts and shows who changed the job (§10.9). |
+| C6 | Admin drags job A into a gap while another admin books job B into the same gap | Per worker-day lock: one wins and the other gets `SLOT_CONFLICT`. |
+| C7 | Deadlock risk: a reschedule moves a job between two workers or dates | Lock keys are always acquired in sorted order. The transaction retries once on a deadlock error. |
+| C8 | Hold expires during 3-D Secure / payment | `hold.extend` allows up to 20 min total. If commit happens after expiry, the slot is re-acquired if still feasible. Otherwise `SLOT_TAKEN`, and 01 tells 05 to void the authorization (compensation). |
+| C9 | Payment succeeded but commit failed (slot taken in between) | The saga compensates: 05 refunds or voids, 01 offers alternatives, and **an exact-alternative re-try is attempted first**. Alert if compensation fails. |
+| C10 | Hold-spam / bot reserves all slots | Per-session/IP hold limits (§10.3), CAPTCHA escalation by 01, and holds are short. Admin can view and release holds. |
+| C11 | Expired holds not yet swept | Queries ignore `expiresAt ≤ now`, and commit treats them as absent. |
+| C12 | Recurring materializer and a manual booking target the same worker-time | Both go through `commitSchedule`. The materializer loser re-dispatches to another worker or leaves the occurrence unassigned. |
+| C13 | Materializer runs twice (crash mid-run, duplicate scheduler) | Unique `(seriesId, occurrenceKey)` plus a per-series lock makes it idempotent. |
+| C14 | Worker double-taps "Start route", or app retries | Idempotency key: returns the existing sequence. |
+| C15 | Outbox event delivered twice | Consumers dedupe on `eventId`. 08 must not send duplicate SMS. |
+| C16 | Event ordering: `rescheduled` processed by 08 before `scheduled` | Per-aggregate ordering guarantee. 08 also compares `aggregate.version`. |
+| C17 | Stale slot list (customer left tab open for 1 h) | Slots carry `computedAt`/`ttlSec`. 01 re-fetches on focus. `hold.create` re-validates anyway. |
+
+### 11.2 Time zones, DST, calendar math
+| # | Case | Handling |
+|---|---|---|
+| T1 | Slot inside the DST spring-forward gap | Dropped (§5.1). |
+| T2 | Fall-back repeated hour | Both instances offered with offset labels. The recurring rule uses the earlier one. |
+| T3 | Job spans the DST change | Duration is elapsed time. Calendar renders the 23 h/25 h day correctly. |
+| T4 | Job location in a different TZ from the business (e.g. near a state border) | Customer-facing times use `locationTz` with a label. The calendar can display in business or viewer TZ. |
+| T5 | Admin traveling in another TZ views the calendar | Display TZ defaults to business TZ, with a visible TZ badge and an optional switch. |
+| T6 | Worker availability overnight (22:00–06:00) | The rule is split across two local dates. Availability for "date d" includes the tail from d−1. |
+| T7 | Tenant changes business TZ | Future instants stay fixed. Recurring wall-clock rules keep their own `locationTz`. A warning dialog lists affected series. |
+| T8 | IANA tz rule change (government changes DST) | Nightly re-validation of future recurring occurrences against wall-clock intent creates conflicts if any time shifted. |
+| T9 | Monthly on the 31st | Clamped to the last day of the month. Never skips a month. |
+| T10 | Monthly "5th Tuesday" | Treated as "last Tuesday" (bySetPos −1). |
+| T11 | Leap day (Feb 29) monthly anchor | Clamped to Feb 28 in non-leap years. |
+| T12 | Client clock skew | The server is authoritative for "now", lead time and past checks. The client uses server time offset from response headers. |
+| T13 | Midnight-crossing job (e.g. 23:00–01:00) | `localDate` = start date. Blocks are indexed for both dates (the lock covers both keys). |
+| T14 | Job longer than a working day (multi-day jobs) | Online: not offered (a slot must fit inside availability). CRM: allowed as an `all_day` / multi-day block with a manual override. Phase-2 decision: multi-day as linked segments (Q-11). |
+
+### 11.3 Data & configuration
+| # | Case | Handling |
+|---|---|---|
+| D1 | Service has duration 0 or missing | Online booking is blocked for that service (02 validation). The CRM requires a duration on the inline service (§3.6.1). Legacy data defaults to 60 min plus a warning. |
+| D2 | Catalog duration edited after jobs booked | Existing jobs keep their snapshot. "Recalculate duration" is per job / per series. |
+| D3 | Add-on added on site extends the job into the next job | Soft conflict: next job at-risk → 08 running-late flow. The job is never blocked, since the work is real. |
+| D4 | Address cannot be geocoded | Online: 01 forces address correction. CRM: booking allowed with "travel not computed", zone unknown (override), and a ⚠ badge on the card. |
+| D5 | Address outside all service areas | Online: not bookable `[S: 11]`. CRM: override `[S: 11]` recorded in `overrides`. Eligibility then uses all workers allowed to perform the service, ranked by distance. |
+| D6 | Zone deleted / redrawn | Future jobs whose location falls outside any zone get soft `zone` conflicts. Nothing moves automatically. |
+| D7 | Worker removed from zone/service with future jobs | Soft `skill`/`zone` conflicts plus a bulk-reassign suggestion. |
+| D8 | Worker deactivated / deleted | All future assignments → conflicts + wizard. Historical jobs keep the worker reference (soft-delete only). |
+| D9 | No eligible workers at all (new tenant, solo operator not yet assigned to services) | The online page shows "No availability" plus an admin-only diagnostic (via 01). The CRM shows the reason list per worker: "Sam: not assigned to zone Austin". |
+| D10 | Solo operator (1 worker = owner) | All logic still applies. The UI hides worker columns and dispatch explanations. |
+| D11 | Time off created over existing jobs | Jobs are not cancelled. `availability` conflicts are listed with one-click reassign. |
+| D12 | Google Calendar busy event appears after a job was booked (sync lag) | Soft conflict notified to admin. Never auto-moves. |
+| D13 | Shop capacity reduced below current bookings | `capacity` conflicts for over-booked intervals. |
+| D14 | Customer has two jobs at the same time at different addresses | Allowed (different workers). Warn in CRM: "Customer already has #1040 at 09:00". |
+| D15 | Duplicate booking (same customer, service, start within 30 min) | Warn in CRM, and online the commit asks 01 to confirm "You already booked this". |
+| D16 | Job with split services where one worker's part is cancelled | The assignment is removed. The job window recomputes. If no assignments remain → `unassigned`. |
+| D17 | Crew job where one crew member becomes unavailable | The job becomes `conflicted` for that member only. The others stay assigned. Dispatch looks for a replacement with `keepTime`. |
+| D18 | Customer blocked a worker who is pinned to their series | The pin is invalid → conflict at materialization, and an admin prompt appears. |
+| D19 | Search range too large / abusive | Capped at 62 days online / 42 days calendar. `RANGE_TOO_LARGE`. Rate limits per IP and tenant. |
+| D20 | Huge tenant (200 workers, 2k jobs/day) | Search fans out per worker. Cache per worker-day. Paginate calendar by worker groups (virtualized columns). Map clusters pins. |
+
+### 11.4 Recurring
+| # | Case | Handling |
+|---|---|---|
+| R1 | Series created with an anchor date in the past | Allowed in CRM with `scheduling.past`. Past occurrences are not materialized unless "back-fill" is chosen. Count end includes them only if materialized. |
+| R2 | "After N jobs" with skips | Skips don't consume the count by default (§5.6). |
+| R3 | Customer cancels a single occurrence (via 04) | Counted per setting (default: does not consume). Series continues. |
+| R4 | Holiday move collides with the next regular occurrence | Falls back to `keep_and_flag` (§10.4). |
+| R5 | Edit "this and future" on an occurrence that is already in progress | Not allowed. Scope starts from the next occurrence. |
+| R6 | Price/discount change on future occurrences that are already paid (prepaid subscription) | Repricing skipped for paid jobs. Diff shows "3 prepaid jobs unchanged". |
+| R7 | Series worker on vacation for 2 weeks | Those occurrences go to the best other worker (continuity resumes after). Customer notified only if the worker is customer-visible. |
+| R8 | Infinite daily series materialized for 90 days | 90 jobs is fine. The horizon is per-frequency adjustable to cap rows (daily ≤ 30 days default) `[I]`. |
+| R9 | Series' customer merged/deleted | 07 `customer.merged` re-points. Delete → series ended, future jobs cancelled (confirm dialog). |
+| R10 | Subscription (06) cancelled mid-cycle with prepaid jobs remaining | 06 policy decides `end(fromDate)`. 03 honours it and never deletes fulfilled occurrences. |
+| R11 | Rule change produces fewer occurrences than materialized ones | Unmatched materialized jobs are cancelled (reason `series_changed`) and listed in the diff before confirm. |
+
+### 11.5 Routes
+| # | Case | Handling |
+|---|---|---|
+| RT1 | Route with 0 or 1 stops | 0: not shown / auto-complete. 1: no optimization needed and the route works the same. |
+| RT2 | Distance provider down at "start route" | Fallback T2 → T1 within 1 s. Route starts anyway. `optimization.provider` records the fallback. Re-optimizes silently when the provider returns, only if the worker hasn't departed for the next stop. |
+| RT3 | Worker offline at start | Local optimization (§10.6). Synced later. |
+| RT4 | Stop added mid-route (admin books a same-day route job) | Online cannot book a started route day for that worker (§10.7). CRM can add; the remaining stops are re-optimized with a fixed prefix and the current next stop. |
+| RT5 | Stop cancelled mid-route | Removed. Progress denominator excludes it. Re-optimize the remainder. |
+| RT6 | Worker never taps "start route" but completes jobs | First job start (04) implicitly starts the route (no reorder of a job already begun). Progress still tracked. |
+| RT7 | Worker completes stops out of optimized order | Allowed and logged. Remaining stops re-optimized from the current location. |
+| RT8 | Day ends with stops open | `closed_incomplete` at availability end + grace. Stops → `needs_reschedule`. Admin alert (§4.10). |
+| RT9 | Route day with timed anchors that cannot all be honoured | Optimizer flags a `travel` conflict before start (nightly preview) so the admin can fix it. |
+| RT10 | Two route containers for the same worker/day (bug or merge) | Unique `(tenantId, workerId, localDate)`. Merge logic on violation. |
+| RT11 | Route job rescheduled to a different day | Moved between route containers. Both re-sequenced. Old route progress recalculated. |
+| RT12 | GPS start location wildly wrong (e.g. 0,0) | Validated against the tenant region bounding box. If outside, falls back to the worker start location. |
+
+### 11.6 Past scheduling & misc
+- Past reschedule of an already-completed job: allowed with `scheduling.past`. 04 status unchanged. Timesheets/reports reflect the new date. Audit log entry required.
+- Reschedule into the past by drag (accidental): requires an explicit confirm "This time is in the past". Notifications off.
+- Notifications for jobs rescheduled multiple times quickly: coalesced (§5.9).
+- Reminders already sent for the old time: 08 sends "updated time" wording rather than a second confirmation.
+- Calendar realtime channel disconnect: client shows an "offline / reconnecting" badge and refetches the visible range on reconnect (full resync by `version`).
+- Permission revoked while a form is open: commit returns `403`, form keeps data, and the user sees a message.
+- MCP/AI agent bookings: same commands, same guards. Bookings-MCP is restricted to `public:booking` scope and cannot override `[S: llms]`. AI-initiated reschedules require `notify` to be explicit (no silent default) `[I]`.
+
+---
+
+## 12. Better than Fieldd
+
+Improvements are `[I]` (our design), framed against what the sources show.
+
+### 12.1 Reliability & correctness
+1. **Provable no-double-booking**: layered holds + worker-day locks + DB exclusion constraint + idempotency keys (§10.3). Fieldd claims "no double bookings" `[S: 19]`, but no mechanism is documented.
+2. **Same travel estimate at search and commit**: a slot that is shown is never rejected because of estimator noise.
+3. **Live slot holds during checkout**: the customer's chosen time is protected while paying (with 3-DS-safe extension).
+4. **DST-correct recurring engine**: wall-clock rules with explicit gap/overlap policy, plus nightly tz re-validation.
+5. **Conflict center**: one "Needs attention" list for every overlap, availability, zone, travel, overrun or unassignable problem, with one-click fixes. Problems are never silently moved.
+
+### 12.2 Speed & fewer clicks
+6. **Suggestions with reasons**: "Sam · Today 14:00 · +8 min drive · served this customer last time". Dispatch is explainable (`dispatch.explain`), not a black box.
+7. **Drop-zone feasibility heatmap while dragging** (green/amber/red), before the drop, instead of failing after.
+8. **Undo** for every drag/reassign (10 s) and **coalesced notifications** so customers don't get 3 SMS for one fix-up.
+9. **Keyboard-first calendar**: `N` new, `M` move, `/` search, arrow keys between jobs. Full keyboard alternative to drag (WCAG 2.1 AA).
+10. **Recurring edit preview diff** ("12 jobs move, 2 conflicts → reassigned to Alex") before committing "all future" changes `[S: 14]`.
+11. **Calendar empty-slot click → prefilled booking form** (date, time, worker).
+12. **Performance targets**: availability search p95 ≤ 300 ms, calendar week load p95 ≤ 500 ms for 30 workers, drag commit p95 ≤ 250 ms. Virtualized lists and columns.
+
+### 12.3 Smarter field ops
+13. **Route ETA windows to customers the night before**, from a preview optimization (Fieldd only shows "Anytime Thursday" `[S: 02]`), refreshed at start-route.
+14. **Offline start-route** with local optimization in the worker app.
+15. **Learning travel model**: per-zone speed/circuity calibrated from actual on-my-way→arrived times.
+16. **Running-late detection** with an optional automatic customer heads-up.
+17. **Compact scheduling mode**: offers slots adjacent to existing jobs to cut dead time. A cheap win for mobile businesses.
+18. **Block trimming on early completion** frees time for same-day bookings.
+
+### 12.4 Phone & on-site workflows (owner requirement 2026-11-13)
+19. The CRM booking form (§3.6) is designed for **"build a booking live while on the phone"**: single column on phone/tablet, suggestions appear as soon as service + address exist, inline service creation, and no page reloads. The same commands back the later native desktop/iPhone apps (BRIEF 2026-11-13). Commands are transport-agnostic (§8), so native clients reuse them unchanged.
+20. **Responsive calendar**: desktop resource grid → tablet 3-day/2-worker view → phone agenda with worker chips (§3.2).
+21. **Theming**: calendar/job-card colors, worker calendar colors, route/travel block styling, the "Anytime {weekday}" label and all customer-facing scheduling copy (slot labels, "No availability", hold-expired text) must come from the tenant theme and copy-override system owned by **Agent 11 (branding/theming)**. Light/dark palettes must keep **status and conflict colors distinguishable** (green/amber/red drop zones also carry icons/patterns, not color alone). Worker calendar colors are checked for contrast in both modes, with an auto-adjusted text color.
+
+### 12.5 Budget tier (what a starter business needs vs. gating)
+| Capability | Starter (cheap) | Higher tiers |
+|---|---|---|
+| Availability engine, holds, no-double-booking, CRM booking, drag/drop, filters, search | ✓ (core, never gated) | ✓ |
+| Travel time | T1 estimate + T2 self-hosted road network | T3 traffic-aware (per-element cost passed through or capped) |
+| Auto-dispatch strategies | Earliest / Closest | Balanced, Preferred-first, custom weights |
+| Recurring jobs (daily/weekly/monthly, end, discount) | ✓ (Fieldd includes recurring in Start `[S: llms]`) | — |
+| Holidays calendar | ✓ | country presets |
+| Split jobs / crews | ✓ crew; split-by-service | — |
+| Route optimization | ✓ up to 12 stops/day, T2 matrix | larger routes, T3 matrix, nightly cross-worker balancing, ETA windows |
+| Map "who is free" | ✓ (last job location) | live GPS positions (depends on 09/04 tracking tier) |
+| Running-late auto-notify, learning travel model | — | ✓ |
+| Calendar sync out (Google/ICS) | ✓ ICS feed | two-way sync (09) |
+
+**Cost note**: the biggest variable cost in this module is commercial distance-matrix calls. The default architecture never calls a paid API on a customer-facing slot search. Paid calls happen at most once per route start, behind a monthly cap. External keys this module needs (to be added to the **API keys & integrations register**, BRIEF 2026-11-13): commercial matrix/routing API key (platform-owned, optional); geocoding API key (platform-owned, shared with 01/07); Google Calendar OAuth client (platform-owned, tokens per worker, owned by 09). The self-hosted router needs no key. Rotation: platform keys quarterly; per-tenant BYO-key optional at the higher tier.
+
+---
+
+## 13. Open questions
+
+| # | Question | Why it matters | Default if unanswered |
+|---|---|---|---|
+| Q-1 | What exactly does "first available worker" rank by when several are free at the earliest time: closest, least busy, or fixed order? `[S: 15]` vs "finds the closest worker" `[S: 19]` | Dispatch default | Earliest, then closest |
+| Q-2 | Are route containers **one per worker per day**, or named routes (e.g. "North route Thursdays") that workers are assigned to? Can a customer pick a route day only in specific zones/weekdays? `[S: 02]` | Route data model | One per worker/day; days offered when capacity exists |
+| Q-3 | "Vehicle on every job" `[S: llms]`: the **customer's vehicle (asset)** or the **company vehicle/van** the worker drives? | Calendar card + possible fleet resource scheduling | Customer asset; fleet = future resource type |
+| Q-4 | Do crew/split jobs reduce the duration (2 workers = half time), or does each worker block the full duration? | Availability math | Full duration unless service is `crewDivisible` |
+| Q-5 | Does a drag-reschedule **always** notify the customer, or is there a prompt/toggle? `[S: 08]` says automatic | UX + spam risk | Confirm dialog with toggles defaulted on |
+| Q-6 | Recurring: materialization horizon in Fieldd? Is "every N weeks", multi-weekday, or "nth weekday of month" supported? `[S: 14]` lists only daily/weekly/monthly | Parity vs. scope | Support interval + multi-weekday + nth weekday |
+| Q-7 | Does "after N jobs" count skipped or cancelled occurrences? | Customer fairness, subscription usage (06) | Skips/cancels don't count |
+| Q-8 | Does the recurring discount stack with discount codes / subscription discounts (06)? Order? | Pricing (05/06) | Recurring discount first, then codes; no stacking with subscription package price |
+| Q-9 | If "charge at booking" fails in CRM, does Fieldd still book the job? | Booking saga | Book + flag payment failed |
+| Q-10 | Are travel blocks counted toward worker paid time / timesheets (09)? Does the first job count travel from home? | Payroll + slot math | Not counted; travel-from-home off |
+| Q-11 | Multi-day jobs (e.g. ceramic coating 2 days): supported? | Calendar model | CRM-only all-day/multi-day blocks |
+| Q-12 | Can customers pick a specific worker on the booking site? | 01 UX + dispatch | Off by default; tenant setting |
+| Q-13 | Is shop capacity per bay, per worker, or both? (02 shop model) | F5 feasibility | Bays = units; default = number of shop workers |
+| Q-14 | Holiday handling in Fieldd: is there a closures calendar at all? | Recurring policy | Ours: tenant holiday calendar |
+| Q-15 | Past scheduling: which roles may do it, and are notifications suppressed? `[S: llms]` | Permissions (09) | Owner/admin; notifications off by default |
+| Q-16 | What lead time / booking horizon / slot interval settings does Fieldd expose and where? | Settings parity | §3.12 defaults |
+| Q-17 | Does Fieldd use exact times only ("without relying on arrival windows" `[S: 06]`) or offer arrival windows as an option? | Slot display | Exact; windows optional |
+
+---
+
+## 14. Verify against video
+
+Owner walkthrough (customer side): https://youtu.be/vyELvdWCdnc. CRM-side items need a CRM recording. For each item, record the actual label, position and behaviour, then update tags from `[I]` to `[S: video]`.
+
+### 14.1 Booking site (customer side — swash.co-style subdomain)
+- [ ] How slots are presented: date strip vs calendar month; time chips vs list; exact times vs arrival windows; slot interval (15/30/60).
+- [ ] Is the worker shown or selectable? Is "any available" the default?
+- [ ] Earliest offered time vs "now": infer lead time. Furthest bookable date: infer horizon.
+- [ ] What happens when a chosen time is taken (does a message appear? are alternatives shown?).
+- [ ] Is there a visible reservation timer/hold during checkout?
+- [ ] Route-type services: wording ("Anytime Thursday"?), which days are offered, any capacity "full" state `[S: 02]`.
+- [ ] Do add-ons visibly change offered times (longer duration → fewer slots)? `[S: 07]`
+- [ ] Out-of-area address: message and whether the user can continue `[S: 11]`.
+- [ ] Recurring option on the booking site: frequency choices, discount display `[S: 06]` recurring booking options.
+- [ ] Time-zone label on times; behaviour across DST weeks if visible.
+- [ ] Confirmation screen/email: time format, worker name, reschedule/cancel links.
+- [ ] Customer self-reschedule flow (if present): same slot UI? Cutoff rules?
+- [ ] Mobile layout of the slot picker: no layout shift while slots load; loading skeleton.
+- [ ] Which branding elements (colors, fonts, logo, copy) appear on the scheduling steps, for Agent 11's theming inventory.
+
+### 14.2 CRM — Jobs tab & calendar `[S: 08]`
+- [ ] Jobs tab default view and column set/order (job time, address, service, payment status, assigned workers + others?).
+- [ ] Names and order of view switcher options (Day/Week/Month/List/Map) and the default.
+- [ ] Filter list and exact labels (status, tags, service areas, staff, customers); are filters saved?
+- [ ] Location of Recurring / Quotes / Invoices tabs and their columns and status pills.
+- [ ] Day view: are workers columns? Is there an unassigned lane? How are travel-time blocks drawn `[S: llms]`?
+- [ ] Job card contents: vehicle line `[S: llms]`, payment status, icons for recurring/route.
+- [ ] Drag behaviour: snapping interval, cross-worker drag, confirm dialog or not, notification prompt, undo.
+- [ ] What happens on a conflicting drop (blocked? warning? override?).
+- [ ] Map view: pins, worker colors, "who is free" panel, dispatch-from-map interaction `[S: llms]`.
+- [ ] Route container appearance on calendar; route overview: completion %, completed/remaining lists `[S: 02]`.
+- [ ] Global search placement and result types `[S: 08]`.
+- [ ] Empty, loading and error states of calendar and list.
+- [ ] Light/dark mode rendering of calendar colors `[S: llms]` dark mode.
+
+### 14.3 CRM — New → Appointment / Recurring job `[S: 15][S: 19][S: 14][S: 16]`
+- [ ] `New` menu items and order (Appointment, Recurring job, Quote, Invoice, Worker, Subscription…).
+- [ ] Exact field order in the left (service) and right (customer) columns.
+- [ ] Inline "create new service" fields; is duration required?
+- [ ] `+` add-ons picker: customer vs company add-ons, quantity controls.
+- [ ] Suggested times UI: how many suggestions, is the worker shown, is distance/travel shown?
+- [ ] Manual time entry controls; worker picker; split/crew controls `[S: llms]`.
+- [ ] Options & payment section labels (discount, tax, gift card, charge now/after, card on file).
+- [ ] Recurring toggle: frequency options, interval support, end options, discount fixed/% `[S: 14]`.
+- [ ] Assets, notes, tags, files: placement and whether files are allowed in one-off jobs.
+- [ ] Notify toggles at Book now? What toast/redirect follows Book now?
+- [ ] Past-date booking: allowed? warning? `[S: llms]`
+- [ ] Out-of-area override prompt in CRM `[S: 11]`.
+
+### 14.4 Recurring tab & edits `[S: 14]`
+- [ ] Recurring tab columns; how a series is opened.
+- [ ] Edit scope dialog wording ("this job / all future").
+- [ ] Skip / pause / end controls; display of skipped occurrences.
+- [ ] Is the worker kept per series or re-dispatched each time?
+
+### 14.5 Worker app — routes `[S: 02]`
+- [ ] "Start route" control: swipe vs tap, confirmation, loading while optimizing.
+- [ ] Sequence display, next-stop card, navigation hand-off.
+- [ ] Can the worker reorder or skip stops?
+- [ ] Route auto-close moment and summary screen.
+- [ ] Settings path: Settings → Customer hub → Style → Text → Routes text `[S: 02]`; Toolkit activation `[S: 02]`.

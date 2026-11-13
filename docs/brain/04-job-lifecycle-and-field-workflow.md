@@ -495,17 +495,17 @@ rendered into those emails/PDFs. Fields `[I]/[D]`:
 
 Notation: **Writes** = records created/changed; **Emits** = domain events (catalog in §9.3); **Notifies** =
 notification triggers handed to Agent 08 (which owns templates, channels, consent and the master
-notification catalog). Event domain prefix for this module is `jobs.` (`jobs.<entity>.<verb>`).
+notification catalog). Event names follow the team convention used by 02/03/05/07/08: `job.job.*`, `job.line.*`, `job.visit.*`, `job.photo.*`, `job.checklist.*`, `quote.quote.*`, `invoice.invoice.*` (full catalog and aliases in §9.3).
 
 ### W1. Create a quote in the CRM (New → Quote) `[S: t04]`
 
 1. Office clicks **New → Quote**. Editor opens in quote mode; business info prefilled `[S: t04]`.
    *Writes*: nothing yet (client-side draft) until the first meaningful field is entered, then
    `CreateJob{origin:'crm_quote', mode:'quote'}` → Job (status `draft`), job number allocated (§10.9).
-   *Emits*: `jobs.job.created`.
-2. Office selects/creates customer (Agent 07 `customers.customer.created` if new) `[S: t04]`.
+   *Emits*: `job.job.created`.
+2. Office selects/creates customer (Agent 07 `customer.customer.created` if new) `[S: t04]`.
 3. Office adds services/add-ons; prices/costs/durations default from catalog (Agent 02) and are
-   **snapshotted** onto the line (§5.1). *Emits*: `jobs.lineitem.added` (batched per save).
+   **snapshotted** onto the line (§5.1). *Emits*: `job.line.added` (batched per save).
 4. Office sets quote terms (default from settings), expiry, **book-online** toggle `[S: t04]`.
 5. Right panel: job address (zone resolved → travel fee/tax rate snapshot), preferred worker, assets,
    notify contacts `[S: t04]`.
@@ -516,10 +516,10 @@ notification catalog). Event domain prefix for this module is `jobs.` (`jobs.<en
      snapshot, style version). Render HTML + PDF, store with SHA-256 hash.
    - Create/refresh **PublicLink** (token) for the quote.
    - Quote state `draft → sent`; job master status → `quoted`.
-   - *Emits*: `jobs.quote.sent {jobId, quoteVersionId, recipients[], channels[], expiresOn, bookOnline}`.
+   - *Emits*: `quote.quote.sent {jobId, quoteVersionId, recipients[], channels[], expiresOn, bookOnline}`.
    - *Notifies*: `quote_sent` to selected notify contacts (email with PDF + link, SMS with link) — Agent 08.
    - Agent 08 schedules quote follow-up/expiring reminders per settings `[S: t04]`.
-8. Customer opens link → `jobs.quote.viewed` (first view per version; subsequent views counted) → quote
+8. Customer opens link → `quote.quote.viewed` (first view per version; subsequent views counted) → quote
    state `viewed`; office sees "Viewed 2×, last 3:14 PM" `[D]`.
 
 ### W2. Customer accepts and books online `[S: t04]`
@@ -531,16 +531,16 @@ notification catalog). Event domain prefix for this module is `jobs.` (`jobs.<en
      image ref, terms hash). Optional lines not selected are marked `declined_optional`; selected ones become
      active job lines.
    - Quote state `accepted`; job master status → `approved` ("Accepted — needs scheduling").
-   - *Emits*: `jobs.quote.accepted`. *Notifies*: `quote_accepted` → office/preferred worker (internal) `[I]`.
+   - *Emits*: `quote.quote.accepted`. *Notifies*: `quote_accepted` → office/preferred worker (internal) `[I]`.
 3. If book-online enabled → customer continues to slot picker (Agent 01 UI; Agent 03 availability for the
    job's total duration, address/zone, preferred worker rule).
 4. Customer selects a slot; payment step if deposit/card-on-file/pre-auth required (Agent 05).
-5. Agent 03 `ScheduleJob{jobId, slot, workers}` (hold → confirm) → *Emits* `schedule.job.scheduled`.
-6. 04 consumes `schedule.job.scheduled`:
+5. Agent 03 `ScheduleJob{jobId, slot, workers}` (hold → confirm) → *Emits* `scheduling.job.scheduled`.
+6. 04 consumes `scheduling.job.scheduled`:
    - Snapshot schedule onto job; master status `approved → scheduled`; quote state `accepted → booked`
      (terminal for the quote) `[S: t04]` "updates the job card automatically".
    - **Auto-generate invoice** (Invoice record in `draft`, number = job number) `[S: t04]` "at that point
-     Field will also generate an invoice". *Emits*: `jobs.invoice.created`.
+     Field will also generate an invoice". *Emits*: `invoice.invoice.created`.
    - *Notifies*: `job_booked_confirmation` to customer, `job_assigned` to workers `[S: t15]` (Agent 08).
 7. If the customer abandons after accepting but before booking → job stays `approved`; Agent 08 may run
    an "accepted-not-booked" follow-up; office sees it in **Quotes → Accepted — needs scheduling** `[D]`.
@@ -555,7 +555,7 @@ Idempotency: AcceptQuote keyed by `(quoteVersionId)` — a second accept returns
 1. Customer taps **Decline** → reason picker (Price too high / Chose another provider / Not needed now /
    Other + text) `[D]`.
 2. `DeclineQuote` → quote `declined`, job master status `declined` (a closed-lost job; not deleted) `[D]`.
-3. *Emits* `jobs.quote.declined {reason}`; *Notifies* office `quote_declined`; Agent 08 may enrol customer in a
+3. *Emits* `quote.quote.declined {reason}`; *Notifies* office `quote_declined`; Agent 08 may enrol customer in a
    "declined quote win-back" drip; Agent 07 lead/pipeline stage updates to Lost.
 4. Office can **Revise** a declined quote (creates vN+1, back to `quoted` on send) — declines are not terminal
    for the job, only for that version.
@@ -565,11 +565,11 @@ Idempotency: AcceptQuote keyed by `(quoteVersionId)` — a second accept returns
 - **Revise** (any time before acceptance; after acceptance only with `quote.revise_accepted` permission and it
   re-requires acceptance): editing a sent quote opens vN+1 as a *draft revision*; the customer still sees
   vN until vN+1 is sent. Sending vN+1 marks vN `superseded`; vN link redirects to vN+1 with "This quote was
-  updated on …" banner. *Emits* `jobs.quote.revised`, `jobs.quote.sent`.
+  updated on …" banner. *Emits* `quote.quote.revised`, `quote.quote.sent`.
 - **Withdraw**: office stops the offer → quote `withdrawn`, link shows withdrawn state; master status
-  `cancelled` unless another action follows. *Emits* `jobs.quote.withdrawn`; Agent 08 cancels reminders.
+  `cancelled` unless another action follows. *Emits* `quote.quote.withdrawn`; Agent 08 cancels reminders.
 - **Expire**: system job at 00:05 business-local time (§10.10) moves `sent|viewed` quotes whose `expiresOn`
-  (a local date, inclusive) has passed to `expired`; master status `expired`. *Emits* `jobs.quote.expired`;
+  (a local date, inclusive) has passed to `expired`; master status `expired`. *Emits* `quote.quote.expired`;
   *Notifies* office (digest) and optionally customer ("Your quote expired — request an update").
 - **Extend expiry**: editing only the expiry date on a sent quote does **not** create a new version (it is
   metadata, not offer content) but is audit-logged and the customer link updates `[D]`. Reviving an expired
@@ -592,7 +592,7 @@ Idempotency: AcceptQuote keyed by `(quoteVersionId)` — a second accept returns
    - Invoice auto-created in `draft` `[I — extends S: t04 to CRM bookings]`.
    - If payment timing = at booking and card on file → Agent 05 charges; 04 consumes `payments.payment.succeeded`
      → invoice `issued` + `paid` (§W12).
-   - Master status `scheduled`. *Emits*: `jobs.job.created`, `jobs.invoice.created`, `jobs.job.status_changed`.
+   - Master status `scheduled`. *Emits*: `job.job.created`, `invoice.invoice.created`, `job.job.status_changed`.
    - *Notifies* (via 08): assigned workers `job_assigned`; customer `job_booked_confirmation` and later
      reminders `[S: t15]` "notify your assigned team members, and send reminders directly to the customer".
 
@@ -615,7 +615,7 @@ Idempotency: AcceptQuote keyed by `(quoteVersionId)` — a second accept returns
 2. `CreateJob{origin:'crm_invoice', fieldWork:'none'}` — still a Job with a job number (single-ID model);
    no schedule, no requirements, workState `not_applicable` `[D]`.
 3. Preview → **Send**: freeze InvoiceVersion v1, render, public link, invoice `draft → open (sent)`; master
-   status `invoiced`. *Emits* `jobs.invoice.issued`, `jobs.invoice.sent`; *Notifies* `invoice_sent`; Agent 08
+   status `invoiced`. *Emits* `invoice.invoice.issued`, `invoice.invoice.sent`; *Notifies* `invoice_sent`; Agent 08
    schedules due/overdue reminders `[S: t04]`.
 4. Optional: the office later adds a schedule to a standalone invoice (e.g. "parts invoice now, install
    next week") → job gains field work (`fieldWork:'required'`), master status follows field states while the
@@ -626,7 +626,7 @@ Idempotency: AcceptQuote keyed by `(quoteVersionId)` — a second accept returns
 1. Worker opens WA; local store already holds today's jobs (prefetched; §10.7). Clock-in prompt if
    timesheets enabled and setting on `[S: t03]` (Agent 09 owns timesheets — job flow only *prompts*).
 2. Route day: worker swipes **Start route** `[S: t02]` → Agent 03 optimizes and emits
-   `schedule.route.started` + `schedule.route.sequenced {jobIds[]}`; WA reorders list.
+   `routing.route.started` + `routing.route.optimized {sequence[]}`; WA reorders list.
 3. Worker taps **On my way** on a job:
    - WA computes ETA (device location + routing, or manual) and shows the sheet (§3.12).
    - Command `MarkEnRoute{jobId, etaAt, etaSource, location, sendToCustomer}`.
@@ -634,7 +634,7 @@ Idempotency: AcceptQuote keyed by `(quoteVersionId)` — a second accept returns
      job per worker may be `en_route` at a time — starting en-route on job B while job A is en-route auto
      reverts A to `scheduled` with an audit note `[D]`.
    - Writes: `FieldVisit.enRouteAt`, `etaAt`; workState `en_route`; master status `en_route`.
-   - *Emits* `jobs.visit.en_route {jobId, workerId, etaAt, trackingSessionId}`.
+   - *Emits* `job.job.en_route {jobId, workerId, etaAt, trackingSessionId}`.
    - *Notifies* `on_my_way` to notify contacts with ETA and live tracking link `[S: llms "on-my-way
      tracking", t11 "real-time updates on your arrival"]` — Agent 08 sends; tracking page served by Agent 01
      portal; location stream from WA via the tracking service (§10.6).
@@ -647,14 +647,14 @@ Idempotency: AcceptQuote keyed by `(quoteVersionId)` — a second accept returns
 
 1. **Start job** (swipe) → `StartJob{jobId, startedAt(device), location}`; guard: `scheduled|en_route|arrived`
    (starting directly from scheduled is allowed: worker may be on site already). workState `in_progress`;
-   master status `in_progress`; `startedAt` recorded. *Emits* `jobs.visit.started`. Customer notification
+   master status `in_progress`; `startedAt` recorded. *Emits* `job.job.started`. Customer notification
    `job_started` optional (off by default) `[D]`. Location sharing stops.
 2. Requirements view: before photos (N), checklist items and questions, after photos (N) `[S: t06]`.
 3. **Before photos**: captured in app → photo pipeline (§10.12). Each photo: `stage:'before'`, optional
-   `lineItemId` tag. *Emits* `jobs.photo.added` (on metadata sync) and `jobs.photo.uploaded` (bytes stored).
+   `lineItemId` tag. *Emits* `job.photo.added` (on metadata sync) and `job.photo.uploaded` (bytes stored).
 4. **Checklist & questions**: each answer `AnswerChecklistItem{jobId, itemId, value, answeredAt}` — appended
    to `ChecklistResponse` log (last write per item wins for display; full history kept). When all required
-   items answered → `jobs.checklist.completed` (re-emitted if an answer is later cleared → `jobs.checklist.reopened`).
+   items answered → `job.checklist.completed` (re-emitted if an answer is later cleared → `job.checklist.reopened`).
 5. **Message the client** `[S: t02]`: opens the job-scoped conversation (Agent 08); messages carry `jobId`.
 6. **Pause/Resume** (optional): `PauseJob{reason}` / `ResumeJob` → `paused` ↔ `in_progress`; paused time
    excluded from actual duration.
@@ -666,11 +666,11 @@ Idempotency: AcceptQuote keyed by `(quoteVersionId)` — a second accept returns
    - Guard: job not completed (`[S: t07]` "before the job is marked complete"); after completion, only office
      can add lines (reopens invoice balance; §W13). Price edits require `wa.prices.edit`.
    - Writes: line items with `addedBy`, `source`, catalog snapshot; recompute totals; duration increases.
-   - Inventory: product add-ons reserve stock (Agent 02 consumes `jobs.lineitem.added`); decrement on completion.
-   - If added duration overruns the worker's next job start → warning in WA + `jobs.job.duration_extended`
+   - Inventory: product add-ons reserve stock (Agent 02 consumes `job.line.added`); decrement on completion.
+   - If added duration overruns the worker's next job start → warning in WA + `job.job.duration_extended`
      for Agent 03 to flag the conflict to dispatch `[D]`.
    - If invoice already issued (e.g. prepaid at booking) → invoice revision vN+1 with new balance (§10.2).
-   - *Emits* `jobs.lineitem.added`, `jobs.job.totals_changed`.
+   - *Emits* `job.line.added`, `job.job.totals_changed`.
 3. Upsell attribution: `addedByWorkerId` used by Agent 08 reporting/leaderboard and Agent 09 commissions `[I]`.
 
 ### W11. Complete job `[S: t16, t02]`
@@ -684,7 +684,7 @@ Idempotency: AcceptQuote keyed by `(quoteVersionId)` — a second accept returns
    - workState `completed`; `completedAt`; actual duration computed.
    - If invoice is `draft` → it stays draft until payment/send (step 5) but its lines are **locked for workers**.
    - Master status → `completed` (or `paid` if already fully prepaid).
-   - *Emits* `jobs.job.completed {jobId, lines, assets, workers, totals, balanceDue, photosShared[]}`.
+   - *Emits* `job.job.completed {jobId, lines, assets, workers, totals, balanceDue, photosShared[]}`.
    - Consumers: Agent 03 (route progress / auto-close route `[S: t02]`, next job), Agent 02 (inventory
      decrement), Agent 07 (asset last-service date `[S: llms]`, customer service history), Agent 08
      (completion message, review request `[S: llms "Google review booster"]`, leaderboard), Agent 06
@@ -697,7 +697,7 @@ Idempotency: AcceptQuote keyed by `(quoteVersionId)` — a second accept returns
    - Skip (permission) → job `completed`, invoice draft; office "Completed — awaiting payment" queue; optional
      auto-send after N hours (setting).
 6. If the business uses "charge at booking"/card-on-file-after-job automatic charge: Agent 05 auto-charges on
-   `jobs.job.completed` (if configured) — 04 does not charge.
+   `job.job.completed` (if configured) — 04 does not charge.
 
 ### W12. Payment applied to invoice (any channel) `[S: t16, t17]`
 
@@ -708,8 +708,8 @@ Idempotency: AcceptQuote keyed by `(quoteVersionId)` — a second accept returns
      Agent 05 decides tip handling).
    - Recompute invoice state: `balance = 0 → paid`, `0 < paid < total → partially_paid`.
    - Recompute master status (§10.1).
-   - *Emits* `jobs.invoice.payment_applied`, and `jobs.invoice.paid` when balance reaches 0.
-   - Agent 08 sends receipt; cancels pending reminders on `jobs.invoice.paid`.
+   - *Emits* `invoice.invoice.payment_applied`, and `invoice.invoice.paid` when balance reaches 0.
+   - Agent 08 sends receipt; cancels pending reminders on `invoice.invoice.paid`.
 3. Overpayment (allocation > balance) → invoice `paid`, `creditDue = excess` flag → Agent 05 decides refund or
    customer credit; 04 shows "Overpaid by $X".
 
@@ -721,7 +721,7 @@ Idempotency: AcceptQuote keyed by `(quoteVersionId)` — a second accept returns
 - If the invoice version was already **exported/locked** (accounting period close, Agent 05/08 export) →
   changes go to a **supplemental invoice** `#1042-2` (same job, same base number) rather than revising `[D]`.
 - **Reopen job** (`job.reopen`): `completed → in_progress` (e.g. callback/rework same day); keeps original
-  `completedAt` in history; emits `jobs.job.reopened`. Rework on another day = new linked job
+  `completedAt` in history; emits `job.job.reopened`. Rework on another day = new linked job
   (`relatedJobId`, `relationType:'callback'`) `[D]`.
 - **Refund** (Agent 05) → `payments.refund.succeeded` → 04 reduces `amountPaid` (net), invoice state →
   `partially_refunded`/`refunded` (§6.4); master status stays `paid` if net paid ≥ total, else reverts to
@@ -736,12 +736,12 @@ Idempotency: AcceptQuote keyed by `(quoteVersionId)` — a second accept returns
    `backfilled:true`, audit reason), no customer notifications except optionally invoice/receipt.
    **No**: job stays `scheduled` in the past → appears in "Past due — not completed" queue.
 3. Notifications for past-dated jobs are suppressed by default (no "your appointment is booked for
-   yesterday") — contract with Agent 08: `jobs.job.created.payload.suppressCustomerNotifications = true`.
+   yesterday") — contract with Agent 08: `job.job.created.payload.suppressCustomerNotifications = true`.
 
 ### W15. Cancel and no-show
 
 - **Cancel (office)**: `CancelJob{reason, notifyCustomer, feePolicy}` from any pre-completion state; schedule
-  released (Agent 03 consumes `jobs.job.cancelled`); invoice: draft → `void`; issued & unpaid → `void`;
+  released (Agent 03 consumes `job.job.cancelled`); invoice: draft → `void`; issued & unpaid → `void`;
   partially/fully paid → requires refund decision (Agent 05) before void, or keep as cancellation-fee invoice
   (lines replaced by a "Cancellation fee" line, revision) `[D]`.
 - **Cancel (customer, portal)**: Agent 01 enforces cancellation policy and feedback + reschedule prompt
@@ -749,7 +749,7 @@ Idempotency: AcceptQuote keyed by `(quoteVersionId)` — a second accept returns
 - **No-show** (worker): available after `arrived` + wait time (setting) → `MarkNoShow{evidencePhotos[], note}` →
   master `no_show`; Agent 05 may charge no-show fee per policy; Agent 08 notifies customer + office;
   Agent 03 frees remaining slot time `[D]`.
-- **Reschedule** is Agent 03's (`schedule.job.rescheduled`); 04 updates snapshot; if the job was `en_route`
+- **Reschedule** is Agent 03's (`scheduling.job.rescheduled`); 04 updates snapshot; if the job was `en_route`
   it reverts to `scheduled` and the tracking link is invalidated `[D]`; quote/invoice unaffected (invoice
   service date updates on next render if not issued).
 
@@ -771,7 +771,7 @@ Idempotency: AcceptQuote keyed by `(quoteVersionId)` — a second accept returns
 ### W17. Lead → job `[S: t20]`
 
 - Agent 07 lead conversion calls `CreateJob{origin:'lead_conversion', leadId, mode:'appointment'|'quote'}`;
-  04 emits `jobs.job.created {leadId}`; Agent 07 moves lead to Won/Converted when the job reaches
+  04 emits `job.job.created {leadId}`; Agent 07 moves lead to Won/Converted when the job reaches
   `scheduled` (appointment) or `approved` (quote accepted) `[D]`.
 
 ### W18. Estimator quote on site, customer books immediately `[S: t04]`
@@ -913,7 +913,7 @@ Rules:
   "Revised" note; payments carry over.
 - **Due date**: `dueOn = issueDate + terms` (local date). Due on receipt → `dueOn = issueDate`.
 - **Overdue**: computed, not stored as a primary state — `isOverdue = state ∈ {open, viewed, partially_paid}
-  && today(businessTz) > dueOn`. The `overdue` flag transition emits `jobs.invoice.overdue` once (system sweep).
+  && today(businessTz) > dueOn`. The `overdue` flag transition emits `invoice.invoice.overdue` once (system sweep).
 - **Partial payments**: unlimited; each payment allocated to this invoice by Agent 05; online partial payments
   only if setting on; minimum partial amount $1 or setting.
 - **Void**: allowed when `netPaid = 0`; otherwise refund first (Agent 05) or convert to credit. Void invoice is

@@ -1558,3 +1558,126 @@ interface AuditEntry { id: ID; businessId: ID; entityType: string; entityId: ID;
 `assets.view`, `assets.edit`, `assets.transfer`, `assets.history_reports` (paid lookups),
 `leads.view_own`, `leads.view_all`, `leads.create`, `leads.edit`, `leads.assign`,
 `leads.delete`, `leads.enrich`, `leads.pipeline_admin`, `settings.customers_admin`.
+
+### 7.13 Addendum (2026-11-13) — fields required by other agents' specs
+Added after reading 01–09 drafts; these extend the interfaces above.
+```ts
+interface Customer {                 // additions
+  blockedWorkerIds: ID[];            // "do not send this worker" — 03 eligibility rule E4 consumes
+                                     // via customer.worker_blocklist.updated [03 §9]
+  brandingLocale?: string;           // which tenant copy-override locale this customer sees (01/08)
+}
+type LeadSource = /* … */ 'out_of_area';   // 01 "Ask us anyway" / 02 out-of-area capture
+interface Lead {                     // additions
+  outOfArea?: { pointRounded: { lat: number; lng: number }; nearestZoneId?: ID; distanceKm?: number };
+  resumeToken?: string;              // 01's `/r/{resumeToken}` link restoring the session [01 §abandonment]
+  holdExpiredAt?: ISOTime;           // 03 `scheduling.hold.expired` — strong-intent signal
+}
+```
+
+---
+
+## 8. API surface
+
+Stack-agnostic command/query catalogue. Transport (REST/RPC/GraphQL) is a Stage-2 decision; the
+same operations are exposed to the CRM UI, the team app, the booking site (customer scope), the
+public API and AI assistants (MCP-style), mirroring Fieldd's CRM-scope vs. Bookings-scope split
+[S: llms]. Conventions [I]:
+- Every mutating command takes `idempotencyKey` (client-generated UUID; stored 24 h) and, for
+  updates, `expectedVersion` (→ `409 VERSION_CONFLICT` with current record).
+- Errors: `{ code, message, field?, details? }`; codes listed per command.
+- Lists use cursor pagination (`cursor`, `limit ≤ 200`), stable sort with `id` tie-breaker.
+- Scope column: **B** = business staff (permission key in brackets), **C** = authenticated
+  customer (own records only), **P** = public/anonymous (rate-limited, bot-protected),
+  **S** = internal service-to-service (other modules), **AI** = allowed for assistant tokens.
+
+### 8.1 Customers
+| Name | Input | Output | Scope | Errors |
+|---|---|---|---|---|
+| `customers.create` | CustomerDraft {kind, names, people[], contactPoints[], addresses[], tags[], customerTypeId, taxExempt, defaultDiscountId, preferredWorkerIds, source, notes, customFields, consents[], assets[]?, suppressAutomations?, createdVia} | Customer + ids of children | B[`customers.create`], S, AI | `DUPLICATE_VERIFIED_CONTACT` (with matchId), `VALIDATION`, `INVALID_PHONE`, `INVALID_EMAIL` |
+| `customers.update` | id, expectedVersion, patch (field-level) | Customer | B[`customers.edit`], AI | `VERSION_CONFLICT`, `FORBIDDEN_FIELD` |
+| `customers.get` | id, include[] (people, contactPoints, addresses, stats, assets, consents, intake, tags) | Customer aggregate; if merged → `{ mergedIntoId }` with 301-like semantic | B[`customers.view`], S, AI (masked secrets) | `NOT_FOUND`, `OUT_OF_VISIBILITY_WINDOW` |
+| `customers.list` | filter: FilterExpr, sort, columns, cursor, limit, includeArchived | page of CustomerRow + total (approximate above 10 k) | B, AI | `FILTER_INVALID` |
+| `customers.search` | q, types[] (customer, lead, asset), limit | grouped hits with highlight | B, AI | — |
+| `customers.findMatches` | partial {names, phones, emails, address}, mode: 'suggest'\|'strict' | candidates [{customerId, score, reasons, displaySafe}] | B, S | — |
+| `customers.resolveForBooking` (= 01 `MatchCustomer`/`UpsertCustomer`) | attemptId/sessionId, contact {name, phone, email}, address, assets[], consents[], intake?, accountId? | {customerId, personId, addressId, assetIds, contactPointIds, blocked: boolean, created: boolean} — never returns profile data to caller | S (01 only) | `BLOCKED_CUSTOMER` (soft; boolean), `VALIDATION` |
+| `customers.addContactPoint` / `updateContactPoint` / `archiveContactPoint` / `setPrimary` | customerId, data | ContactPoint | B, C (own), AI | `DUPLICATE_ON_CUSTOMER`, `LAST_CONTACT_POINT` (warn) |
+| `customers.addPerson` / `updatePerson` / `archivePerson` / `movePerson` | … | Person | B | `PRIMARY_REQUIRED` |
+| `customers.addAddress` / `updateAddress` / `archiveAddress` | … | Address (geocodeStatus) | B, C (own), AI | `ADDRESS_IN_USE_FUTURE_JOBS` |
+| `customers.setTags` / `customers.bulkTag` | ids or filter snapshot, add[], remove[] | {affected, jobId?} | B | `TOO_MANY_TAGS` |
+| `customers.setStatus` | id, status, reason | Customer | B[`customers.block`/`archive`] | `HAS_FUTURE_JOBS` |
+| `customers.setWorkerBlocklist` | id, workerIds[] | Customer | B[`customers.edit`] | — |
+| `customers.merge` | survivorId, mergedIds[], fieldDecisions | MergeRecord | B[`customers.merge`]; AI only with human confirmation token | `MERGE_CONFLICT` (details), `ALREADY_MERGED` |
+| `customers.unmerge` | mergeRecordId | Customer[] | B[`customers.merge`] | `UNDO_EXPIRED` |
+| `customers.erase` | id, confirmationText | ErasureReceipt | B[`customers.erase`] (owner) | `HAS_BALANCE`, `HAS_ACTIVE_SUBSCRIPTION`, `HAS_FUTURE_JOBS` |
+| `customers.exportPersonalData` | id | file link (JSON + CSV) | B, C (own) | — |
+| `customers.duplicates.list` / `.dismiss` / `.snooze` | … | DuplicateCandidate[] | B | — |
+| `customers.notes.add` / `.edit` / `.delete` / `.pin` | entityType, entityId, body, visibility | Note | B, worker (job-scoped) | — |
+| `customers.saveIntakeResponse` | customerId, formVersionId, answers | IntakeResponse | C (own), S (01), B | `FORM_VERSION_UNKNOWN`, `VALIDATION` |
+| `customers.getServiceHistory` | customerId, assetId?, cursor | rows | B, C (own; customer-safe fields), AI | — |
+| `customers.consent.record` | contactPointId, channel, purpose, action, method, evidence | ConsentState | B[`customers.consent_edit`], C (own toggles), S (01/08) — **see conflict C1 §9.6** | `EVIDENCE_REQUIRED`, `REGRANT_NOT_ALLOWED` |
+| `customers.consent.check` | contactPointId \| endpoint, channel, purpose | {allowed, status, reason} | S (08) | — |
+| `customers.import.create` / `.setMapping` / `.validate` / `.run` / `.cancel` / `.undo` / `.get` | per §4 W3 | ImportJob | B[`customers.import`] | `FILE_TOO_LARGE`, `ENCODING_UNSUPPORTED`, `MAPPING_REQUIRED_FIELD`, `UNDO_EXPIRED` |
+| `customers.export.create` / `.get` | entity, filter, columns, format | ExportJob / stream | B[`customers.export`] (AI blocked by default) | `RATE_LIMITED` |
+| `customers.savedViews.*` | CRUD | SavedView | B | — |
+| `customers.settings.*` | customer types, tags, custom fields, dedupe rules, retention | settings | B[`settings.customers_admin`] | `TAG_IN_USE` |
+
+### 8.2 Assets
+| Name | Input | Output | Scope |
+|---|---|---|---|
+| `assets.create` | customerId, kind, details (Vehicle/Property/Equipment), photos[], nickname | Asset | B[`assets.edit`], C (own garage), S (01, 03, 04), AI |
+| `assets.update` / `assets.archive` / `assets.restore` | id, expectedVersion, patch / reason | Asset | B, C (own; cannot edit service records) |
+| `assets.get` | id, include[] (history, odometer, photos, reports) | Asset aggregate | B, C (own), worker (job-scoped), AI |
+| `assets.list` | filter (incl. lastServiceDate relative/absolute [S: llms]), sort, cursor | page | B, AI |
+| `assets.vehicle.decodeVin` | vin | {valid, checkDigitOk, year, make, model, trim, bodyClass, sizeClass, engine, tireSizes?, source} | B, C, S, P (booking site; rate-limited) |
+| `assets.vehicle.lookupPlate` | plate, region | {vin?, decode?} or `NOT_AVAILABLE_ON_PLAN` | B, C, S (gated) |
+| `assets.vehicle.catalog` | year? make? model? | years / makes / models / trims lists (cached, CDN-able) | P, B, C |
+| `assets.recordOdometer` | assetId, value, unit, jobId?, recordedAt | OdometerReading (+ flag) | B, worker, C |
+| `assets.photos.uploadUrl` / `.attach` / `.remove` | assetId, contentType, size | signed URL / Asset | B, worker, C |
+| `assets.transfer` | assetId, toCustomerId, shareHistory | Asset | B[`assets.transfer`] |
+| `assets.merge` | survivorId, mergedIds | MergeRecord | B |
+| `assets.history.fetchReport` | assetId, provider | VehicleHistoryReport (cost shown first; confirm token) | B[`assets.history_reports`] (gated) |
+| `assets.recalls.get` | assetId | recall list | B, C |
+
+### 8.3 Customer-scope API (booking site / customer app; consumed by 01)
+`me.profile.get/update` (whitelisted fields: names, contact points (new ones unverified until
+OTP), addresses, locale), `me.assets.*` (garage) [S: T05], `me.intake.get/save` [S: T05],
+`me.consents.get/update` (preference centre), `me.serviceHistory.list` (for "rebook previous
+services" [S: T05]), `me.dataExport.request`, `me.deletion.request` (creates a staff task; not
+instant because of balances/jobs) [I]. All require an account session issued by 01 whose
+`customerId` claim comes from `PortalAccountLink`.
+
+### 8.4 Leads
+| Name | Input | Output | Scope |
+|---|---|---|---|
+| `leads.create` | mode ('scratch'\|'existing_customer'\|'address_only'), contact/customerId/address, interests, assetHint, source, sourceRef, ownerUserId?, stageId?, estimatedValueCents?, followUp?, consents[] | Lead (+ duplicate warnings) | B[`leads.create`], worker (field referral), S (01, 08), AI |
+| `leads.submitForm` (= public lead form) | formId, fields, consents, disclosureVersionId, utm, honeypot, renderedAt | {ok} (never reveals duplicates) | P (rate-limited per IP + per business; challenge on abuse) |
+| `leads.ingestAttemptEvent` | attempt event envelope (01) | {leadId?} | S (01 only) |
+| `leads.ingestQrScan` | qrId, campaignId, recipientToken?, visitorId | {leadId?} | S (01/08) |
+| `leads.update` | id, expectedVersion, patch | Lead | B[`leads.edit`] (own unless `leads.view_all`) |
+| `leads.moveStage` | id, toStageId, expectedVersion, lostReasonId?, note? | Lead | B |
+| `leads.assign` | ids[], ownerUserId | {affected} | B[`leads.assign`] |
+| `leads.logActivity` | id, type (note/call/visit/email/sms), body, occurredAt, durationSec? | LeadActivity | B, worker (own) |
+| `leads.setFollowUp` / `leads.completeFollowUp` | id, at, assigneeId | Lead | B |
+| `leads.attachToCustomer` | id, customerId | Lead | B |
+| `leads.convert` | id, mode ('appointment'\|'quote'), bookingDraft (03/04 payload) | {customerId, jobId} | B (needs 03/04 booking permissions too) |
+| `leads.markLost` / `leads.reopen` | id, reasonId, note | Lead | B |
+| `leads.merge` | survivorId, mergedIds | MergeRecord | B |
+| `leads.delete` | id | — | B[`leads.delete`] |
+| `leads.enrich.request` / `.apply` / `.get` | leadId, provider, attestation / candidate selection | EnrichmentRequest | B[`leads.enrich`] (owner/admin), never AI |
+| `leads.board` | pipelineId, layout, filter, sort | columns with cards + counts + summed values | B, AI |
+| `leads.funnel` | dateRange, bookingSource? | step counts, conversion, recovery | B |
+| `leads.pipelines.*` / `stages.*` / `lostReasons.*` / `sources.*` | CRUD + reorder | — | B[`leads.pipeline_admin`] |
+| `leads.subscribe` (realtime) | pipelineId | stream of {lead.created/updated/moved} | B |
+
+### 8.5 Internal read models offered to other modules (S scope)
+- `customers.summary(customerId)` → {displayName, kind, status, primary contact (masked per
+  caller permission), primaryAddress (geo), tags, customerTypeId, taxExempt (+cert ref),
+  defaultDiscountId, blockedWorkerIds, preferredWorkerIds, hasPortalAccount, timezone, locale}
+  — used by 03 job cards, 04 documents, 05 POS, 06 eligibility.
+- `customers.segmentQuery(FilterExpr)` → streaming IDs + consent-eligible endpoints per channel
+  (08 audience builder; 08 re-checks consent at send time).
+- `customers.newCustomerCheck(customerId | {phone,email,address})` → {isNew, matchedIds} (06
+  "new customer" discount anti-abuse [06 §5.7]).
+- `assets.summary(assetIds[])` → {YMM, color, plate, sizeClass, photo thumb, tire sizes} for
+  03 calendar "vehicle on every job" [S: llms], 04 job card, 02 pricing variation selection.
