@@ -10,6 +10,7 @@
 |---|---|
 | `[S: T01]` | `research/transcripts/01_mP9YP49qDiI.txt` (Subscriptions) |
 | `[S: T02]` | `research/transcripts/02_rMVRwp-anZM.txt` (Route Optimization) |
+| `[S: T03]` | `research/transcripts/03_-d1cjZPEmoQ.txt` (Timesheets; permission pattern only) |
 | `[S: T04]` | `research/transcripts/04_pASG8RTrhWc.txt` (Quotes & Invoices) |
 | `[S: T05]` | `research/transcripts/05_0qNwovgNTqM.txt` (Online Booking Page) |
 | `[S: T06]` | `research/transcripts/06_0atw7gNWDzg.txt` (Services & Prices) |
