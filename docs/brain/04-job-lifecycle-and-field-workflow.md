@@ -1,0 +1,990 @@
+# 04 — Job Lifecycle & Field Workflow
+
+> Agent 04 · Phase 1 "CRM brain" · 2026-11-12
+> Scope: the **Job** as the single central record from first quote to closed invoice, the quote and
+> invoice documents that hang off it, the master job status state machine, and how a worker
+> performs the job in the field (worker app: day list → on-my-way → start → checklists/photos →
+> upsell → payment hand-off → complete), including offline-first sync and photo upload reliability.
+> Product name: "the platform". Stack-agnostic. Money is always integer minor units (cents).
+
+## 0. Reading guide
+
+### 0.1 Source legend
+
+| Tag | File |
+|---|---|
+| `[S: t01]` … `[S: t20]` | `research/transcripts/NN_<id>.txt` (NN = video number; e.g. `t04` = `04_pASG8RTrhWc.txt`) |
+| `[S: t04.desc]` etc. | `research/transcripts/NN_<id>.description` (YouTube description; chapter lists are often generic/auto-generated → **low confidence**) |
+| `[S: llms]` | `research/site/llms.txt` (fieldd official facts, last updated 2026-10-23 — authoritative) |
+| `[I]` | Inference: industry convention or our design decision. Never a claim about Fieldd. |
+| `[D]` | Our **design decision** for the platform (a special case of `[I]` that we are proposing, not inferring about Fieldd). |
+
+Source-quality notes (important for anyone re-reading the research):
+
+- The *only* video dedicated to this module is **t04 (Quotes & Invoices)** — ~400 words of narration. Most
+  of the job-card and worker-flow detail below is therefore `[I]`/`[D]` and must be verified against
+  the owner's walkthrough video (section 14).
+- `t04.desc` **chapter list does not match the t04 video** — its chapters ("What the customer portal can
+  do", "Installation methods (link, embed, QR)") describe video 05. Treat the t04 chapters as a
+  copy/paste error; only the t04 description prose is relevant. `[S: t04.desc]`
+- `t15.desc` and `t16.desc` chapter lists ("Tap 'New Job' or 'Add Booking'", "Tap 'Add Payment'",
+  "Select Payment Type", "Enter Amount & Save") read as generic auto-generated text and are **not**
+  consistent with the narration. They hint at an "Add Payment" action on the worker-app job detail;
+  treat as low-confidence hints only. `[S: t15.desc, t16.desc]`
+
+### 0.2 What the research actually says about this module (fact inventory)
+
+Every fact below is quoted/paraphrased from source; all other content in this document builds on these.
+
+| # | Fact | Source |
+|---|---|---|
+| F1 | Competitors assign separate numbers to jobs, quotes and invoices; Fieldd tracks each job "from the initial quote, appointment to the final invoice … within a single job card with the same ID". | `[S: t04]` |
+| F2 | Create a quote via **New → Quote**. Business information is already filled in. | `[S: t04]` |
+| F3 | On the quote you add or create the customer profile and add the service(s). | `[S: t04]` |
+| F4 | You can include **quote terms** and a **"book online" button** so the customer can self-schedule if they accept. | `[S: t04]` |
+| F5 | Right-hand side of the quote editor: **job address, preferred worker, customer assets, contact info to notify** the customer. | `[S: t04]` |
+| F6 | **Preview** the quote and **send** it. | `[S: t04]` |
+| F7 | If the customer accepts **and books**, Fieldd keeps everything in sync and **updates the job card automatically**; at that point Fieldd **generates an invoice** for the job. | `[S: t04]` |
+| F8 | Standalone invoice: **New → Invoice**, fill in info, preview and send. | `[S: t04]` |
+| F9 | "Everything shown here can also be done in the field worker app" — for **estimators or on-site staff** to deliver quotes and help customers book immediately. | `[S: t04]` |
+| F10 | Quote/invoice look and the emails sent when a quote or invoice is sent, plus **reminder settings**, live in **Settings → Communication → Email**. | `[S: t04]` |
+| F11 | "Right below that" is the **Payment** section: deposits, prepayments, pre-authorization for jobs. | `[S: t04]` |
+| F12 | Jobs tab shows upcoming appointments with **job time, address, service, payment status, assigned workers**; drag to reschedule (time or staff) and Fieldd notifies the necessary people. | `[S: t08]` |
+| F13 | Jobs tab filters: **job status, tags, service areas, assigned staff, customers**. Also manage **recurring jobs**, track **open quotes**, view **all invoices**, "each clearly marked with their status". | `[S: t08]` |
+| F14 | Sidebar search finds **job number, invoice, staff, customer**. | `[S: t08]` |
+| F15 | New → Appointment: pick existing service or create one; **plus** button for extra services/add-ons; find/create customer; add job address; schedule (first available time/worker or manual); **Book now** → added to calendar, assigned team notified, customer reminders sent. Edit later from calendar or search. | `[S: t15]` |
+| F16 | Job editor left side: service (dropdown or type a new one and save it for next time), **discounts, tax, card on file**, **cost of each service** to track profit per job. Right side: customer, date/time or auto-find slot + worker (travel time, closest worker), then **customer assets, notes, job tags**, repeat toggle. | `[S: t19]` |
+| F17 | Job form section **"Options and payment"**: Options = attach/create **discount**, apply **tax**, add **gift card**. Payment = **when and how** to collect: charge after job complete, or add **card on file** then charge at booking or after job. | `[S: t16]` |
+| F18 | If "after job": worker marks the job **complete in the worker app** and is then taken to the **POS**: enter new card, charge card on file, or mark **cash, check**, or **send an invoice**. Recorded payment appears under **Transactions**. | `[S: t16]` |
+| F19 | Services carry **checklists (checkboxes and questions)** shown in the worker app, and **required before and after photos** "by specifying how many should be uploaded at each stage"; global checklist/photo requirements exist in settings, service-specific ones add to them. | `[S: t06]` |
+| F20 | Service-specific **customer questions** answered before booking; global questions can be turned off per service. | `[S: t06]` |
+| F21 | Customer add-ons (visible online) and **company add-ons** (labor fees, equipment charges — only visible in CRM/worker app). Add-ons can carry **cost, duration (added to booking), inventory (part numbers, stock, min/max qty)**. Upsells can be added **after booking** in the CRM or **worker app POS before the job is marked complete**. | `[S: t07]` |
+| F22 | Route jobs: worker swipes **start route**; route optimized; worker proceeds through each job with "the normal job workflow"; **before/after photos, complete checklists, message the client, finish all required steps**; route **closes automatically** when the final job is completed. Admin sees completed/remaining jobs and completion %. | `[S: t02]` |
+| F23 | Recurring job: New → Recurring job; frequency daily/weekly/monthly; end never/date/count; recurring discount fixed $ or %; notes/tags/files; **auto-finds best available worker for each future job**; edits can be "committed across all future bookings" from the Recurring tab. | `[S: t14]` |
+| F24 | Mobile businesses should pair service areas with **live tracking**: customers receive real-time updates on arrival. Zones carry **travel charge** (fixed $) and **custom tax rate**. CRM can override out-of-area bookings. | `[S: t11]` |
+| F25 | Online booking: booking questions; intake form saved to profile; **customer assets**; terms & conditions acceptance; **cancellation policy** with feedback and optional reschedule prompt. | `[S: t05]` |
+| F26 | Plans include: point of sale, **invoicing and quoting**, sales pipelines, **job photos**, timesheets, credit cards, gift cards, **team app**, recurring jobs, Google review booster, **automated SMS and email job updates**, calendar sync, **on-my-way tracking** (all on the $199 Start tier). | `[S: llms]` |
+| F27 | 2026 features: **split a job or its services between team members**, recurring in the same flow, **schedule or reschedule jobs in the past**; **vehicle on every job**; dashboard "all photos"; live chat incl. group chats with the team; customers with multiple phones/people/addresses; ~200 emails rebuilt. | `[S: llms]` |
+| F28 | MCP: CRM MCP (150+ actions, e.g. booking jobs) and Bookings MCP (customer-level); Darwin AI can do anything a business can do. | `[S: llms]` |
+| F29 | fielddPAY: in-app POS, tipping, card on file, gift cards, Apple Pay; card-not-present (invoices, online, card on file) 2.9%. | `[S: llms]` |
+| F30 | Transactions: card payments "charged on invoices through the customer portal and in the worker app POS". | `[S: t17]` |
+| F31 | Timesheets: worker clock in/out/breaks in the worker app (separate from job time). | `[S: t03]` |
+| F32 | Leads can be turned into a booking without leaving the dashboard. | `[S: t20]` |
+
+Everything not in this table is `[I]` or `[D]`.
+
+### 0.3 Glossary
+
+| Term | Meaning in this spec |
+|---|---|
+| **Job** | The aggregate root. One record, one human-readable **job number**, that carries the quote, the appointment (schedule + field work), the invoice, payments view, photos, checklists, messages and audit. `[S: t04]` for the single-ID concept; structure `[D]`. |
+| **Job number** | Per-business monotonically increasing integer shown as `#1042`. Same number printed on the quote ("Quote #1042") and invoice ("Invoice #1042"). `[D]` (concept `[S: t04]`) |
+| **Quote** | A versioned, customer-facing **offer** document generated from the job's line items + terms. Lives *inside* the job. |
+| **Invoice** | A versioned, customer-facing **request for payment** document generated from the job's line items. Lives inside the job. Auto-created when the job is booked. `[S: t04]` |
+| **Line item** | Service, customer add-on, company add-on, custom item, fee, discount or adjustment on the job. |
+| **Appointment / schedule slot** | The time window + assigned workers. **Owned by Agent 03** (Scheduling); the job holds a denormalized snapshot. |
+| **Visit / field execution** | The worker-side performance of the job: on-my-way, arrival, start, pause, checklist responses, photos, completion. Owned by 04. |
+| **Requirements** | The resolved set of checklist items, questions and photo counts for a job, computed from Agent 02's catalog rules at booking time and snapshotted. |
+| **Document rendering** | An immutable rendered (HTML/PDF) snapshot of a quote or invoice version, with a content hash. |
+| **Public link** | An unguessable, revocable token URL letting the customer view/accept/pay a document without logging in. |
+| **POS** | Point-of-sale checkout screen in the worker app/CRM. Cart editing (upsell) is 04; tendering/charging is **Agent 05**. |
+| **Office** | Any CRM user (owner/admin/manager/dispatcher) as opposed to a field worker. |
+
+---
+
+## 1. Summary
+
+The Job module is the spine of the platform. Every piece of revenue work — whether it starts as a quote
+an estimator writes on a driveway, an online booking from the customer's website, a recurring
+subscription visit, a lead the office converts, or a standalone invoice for parts — becomes **one Job
+record with one job number** that never changes as it moves from *quoted* to *scheduled* to *in
+progress* to *completed* to *invoiced* to *paid* `[S: t04]`. The quote and the invoice are not separate
+objects with separate numbers; they are **versioned documents rendered from the same job** and labelled
+with the same number, so the office, the worker and the customer always talk about "#1042".
+
+This module defines: the Job aggregate (line items, address, assets, assignments snapshot, notes, tags,
+files, photos, checklist responses, messages link, payments projection, documents, audit log); the quote
+workflow (draft → send → view → accept/book or decline/expire, with revisions); the invoice workflow
+(auto-generated on booking, standalone invoices, issue/send, partial payments, reminders, void); the
+**master job status state machine** reconciled with quote, schedule, field-work, invoice and payment
+sub-states; and the **worker app job flow** (day list, on-my-way with ETA/live tracking, start,
+checklists, required before/after photos, messaging, POS upsell, payment hand-off, complete; estimators
+quoting on site) built **offline-first** with explicit sync-conflict rules and a resumable photo upload
+pipeline. Payments themselves (charging, refunds, tips, tax order authority) belong to Agent 05,
+scheduling/assignment to Agent 03, catalog/checklist/photo rule definitions to Agent 02, customers/assets
+to Agent 07, notifications to Agent 08 and permissions to Agent 09 — section 9 defines those contracts.
+
+---
+
+## 2. Roles
+
+| Role | What they do in this module | Source |
+|---|---|---|
+| **Owner / Operator** | Everything. Configures document styling, numbering, quote/invoice defaults, completion requirements enforcement. Sees cost & profit. | `[S: t03]` names "owner, operator, or an admin"; rest `[I]` |
+| **Admin** | Same as owner except billing/plan and (configurable) destructive financial actions (void paid invoice, delete job with history). | `[I]` |
+| **Manager / Dispatcher** | Creates/edits jobs, quotes, invoices; sends documents; reschedules (via 03); marks no-show/cancel; overrides completion requirements with reason; reopens completed jobs. | `[I]`; foreman/manager concept `[S: t03]` |
+| **Foreman / Crew lead** | In the worker app: sees crew jobs, can start/complete on behalf of crew, edit line items/prices if permitted, approve upsells. | `[S: t03]` mentions foreman/manager permission tier; job-side powers `[I]` |
+| **Field worker (technician)** | Sees *assigned* jobs; on-my-way, start, checklists, photos, message client, upsell via POS (if permitted), collect payment (if permitted), complete. | `[S: t02, t06, t07, t16]` |
+| **Estimator** | Worker-app user who creates and sends quotes on site and can book the customer immediately. | `[S: t04]` |
+| **Customer** | Receives quote/invoice by email/SMS; views, accepts (and books online), declines, pays, downloads PDF; receives on-my-way ETA + live tracking; messages the worker/office. | `[S: t04, t11]`; details `[I]` |
+| **Customer's notify contacts** | Additional contacts selected on the job/quote who receive notifications (e.g. spouse, property manager, fleet manager). | `[S: t04]` "contact info to notify the customer"; multi-people per contact `[S: llms]` |
+| **System** | Number allocation, invoice auto-generation, quote expiry, overdue detection, status derivation, route closure signal, reminders hand-off, AI/MCP actions. | `[S: t04, t02, llms]`; mechanics `[I]` |
+| **AI assistant / MCP client** | Calls the same commands as office users within the permission scope of the connected user (CRM MCP) or customer scope (Bookings MCP: accept quote, book, pay). | `[S: llms]` existence; scoping `[D]` |
+
+---
+
+## 3. Screens
+
+Conventions: "CRM" = desktop/tablet web app; "WA" = worker app (iOS/Android, phone-first). Layout
+descriptions are `[I]` unless tagged — visual truth comes from the owner's video. Field lists give
+*type · validation · default*.
+
+### 3.1 CRM — "New" menu entry points
+
+- Global **New** button (top/side nav) `[S: t01, t04, t13, t14, t15]` lists at least: Appointment `[S: t15]`,
+  Quote `[S: t04]`, Invoice `[S: t04]`, Recurring job `[S: t14]`, Subscription `[S: t01]`, Subscription
+  package `[S: t01]`, Worker `[S: t13]`, (Customer, Lead — `[S: t18, t20]` implied).
+- Jobs-module entries: **Appointment**, **Quote**, **Invoice**, **Recurring job**. All four open the **same
+  Job editor** in a different *mode* `[D]` — this is how we guarantee the single-ID model (the mode only
+  changes which sections are expanded, which primary button is shown and which document is previewed).
+
+| Mode | Primary button | Sections emphasised | Resulting job state |
+|---|---|---|---|
+| Appointment | **Book now** `[S: t15]` | Services, customer, address, schedule, options & payment | `scheduled` (+ invoice draft auto-created) |
+| Quote | **Preview** → **Send quote** `[S: t04]` | Business header, customer, services, quote terms, book-online toggle, right panel | `quoted` |
+| Invoice | **Preview** → **Send invoice** `[S: t04]` | Business header, customer, line items, due terms, payment options | `invoiced` (no field work) |
+| Recurring job | **Book now** `[S: t14]` | + recurrence block (Agent 03) | series created; each occurrence is its own job |
+
+### 3.2 CRM — Job editor (shared by all modes)
+
+Two-column layout on desktop: **left = what & how much**, **right = who, where, when** — matches the
+narrated layout in t04 ("On the right hand side … job address, preferred worker, customer assets, and
+contact info") and t19 ("on the left you'll put in the service … on the right attach an existing
+customer") `[S: t04, t19]`. On mobile/tablet portrait the right column stacks above the left `[D]`.
+
+**Header bar**
+- Job number chip `#1042` (assigned on first save; "Draft" before) `[D]`.
+- Mode switcher (Appointment / Quote / Invoice) — allowed only before the first document is sent `[D]`.
+- Master status pill + payment status pill (two separate pills, mirroring the jobs-tab "payment status" column `[S: t08]`).
+- Overflow: Duplicate, Discard draft, View audit log, Print/PDF.
+
+**Left column**
+
+1. **Business information block** (quote/invoice modes) — read-only, prefilled from Settings → Business
+   profile: logo, legal name, address, phone, email, website, tax/licence ID `[S: t04]` "business information
+   is already filled in"; field list `[I]`. Link "Edit in settings".
+2. **Services & items**
+   - Row per line: item picker (search catalog: services, customer add-ons, company add-ons) `[S: t07, t15]`;
+     "type a new one and save it for next time" creates a custom line with a "Save to catalog" checkbox `[S: t19]`.
+   - Per line fields: name (text, 1–120 chars, required), description (text ≤ 2,000), qty (decimal ≥ 0.001,
+     ≤ 9,999, default 1), unit price (money, ≥ 0 unless kind = discount/adjustment, default catalog price),
+     cost (money ≥ 0, default catalog cost; visible only with `job.cost.view`) `[S: t06, t07, t19]`,
+     duration minutes (int 0–1,440, default catalog duration; services/add-ons that are services) `[S: t06, t07]`,
+     taxable (bool, default from catalog/zone), assigned worker(s) (optional per-line split `[S: llms]`),
+     parent service (for add-ons; default = the service it was added under).
+   - **+** button to add extra services/add-ons `[S: t15]`. Add-ons are filtered to those paired with the
+     selected services (Agent 02's pairing rules `[S: t07]`); company add-ons shown with a "Company" badge
+     and never rendered as selectable online `[S: t07]`.
+   - Product add-ons show stock level and min/max quantity from inventory `[S: t07]`; qty validation
+     against min/max is a **warning** in CRM (office may override), hard limit online `[D]`.
+   - Drag handle to reorder lines (order is preserved on documents) `[D]`.
+3. **Options** `[S: t16]`: Discount (attach existing code/promo or create one inline — Agent 06),
+   Apply tax (toggle; rate from service-area zone tax `[S: t11]` or business default; Agent 02/05), Gift card
+   (apply a gift card balance — tender, Agent 05/06), Travel fee (auto-added from zone `[S: t11]`, removable
+   with permission `[D]`).
+4. **Payment** `[S: t16]`: timing radio — *Charge after job is complete* (default `[I]`) / *Charge at booking*;
+   card on file picker / "Add card" (Agent 05 component); deposit / prepayment / pre-authorization per
+   Settings → Payments `[S: t04]` (Agent 05). In invoice mode: **due terms** (Due on receipt / Net 7 / Net 15 /
+   Net 30 / Custom date) `[D]` and "Allow online card payment" toggle `[D]`.
+5. **Totals panel** (sticky at bottom of left column): Subtotal, Discounts, Fees, Tax, **Total**, Deposit
+   required, Paid to date, **Balance due**; with `job.cost.view`: Cost, Profit, Margin % `[S: t19]` "track
+   profits automatically for every job"; layout `[I]`.
+6. **Quote terms** (quote mode) `[S: t04]`: rich text (bold, italics, lists, links; ≤ 10,000 chars), default
+   from Settings → Quotes; per-quote override. **Quote expiry** date (default today + N days, N from settings,
+   default 30) `[D]`.
+7. **Book-online button** toggle (quote mode) `[S: t04]`: "Let the customer book a time when they accept".
+   Sub-options `[D]`: restrict bookable workers to preferred worker / any qualified worker; earliest bookable
+   date; require deposit to confirm.
+8. **Invoice notes / footer** (invoice mode): free text, default from settings `[D]`.
+9. **Message to customer** (quote & invoice): short text included in the email/SMS body `[I]`.
+
+**Right column**
+
+1. **Customer** `[S: t04, t15, t19]`: search existing (name, phone, email, company) or **+ create** inline
+   (first/last/company, phone(s), email, — Agent 07 component). Shows tags, balance owed, card on file
+   badge, last job. Business customers with multiple people `[S: llms]`.
+2. **Job address** `[S: t04, t15]`: pick from customer's saved addresses or enter new (autocomplete,
+   geocoded; Agent 07 owns address book). Shows the resolved **service area/zone** (Agent 02) with
+   out-of-area warning + override `[S: t11]`. Shop jobs: pick shop instead of address `[S: t11]`.
+3. **Preferred worker** `[S: t04]` (quote mode) / **Assigned worker(s)** (appointment mode; Agent 03 picker
+   with auto-find first available worker `[S: t15, t19]`).
+4. **Schedule** (appointment mode — Agent 03 component): date/time, duration (sum of line durations
+   `[S: t06, t07]`), "find first available" `[S: t15]`, route day for route services `[S: t02]`, repeat toggle
+   `[S: t19]` → recurrence block, past dates allowed `[S: llms]`.
+5. **Customer assets** `[S: t04, t19]`: multi-select from the customer's assets (vehicles, properties,
+   equipment), **+ add asset** inline (Agent 07). A vehicle shows make/model/year/color/plate/photo `[S: llms]`.
+6. **Notify contacts** `[S: t04]`: checkboxes for the customer's contacts/people with channel toggles
+   (email/SMS) per contact; default = primary contact on both channels the customer has consented to `[D]`.
+7. **Notes** `[S: t19]`: *Customer-visible note* and *Internal note* (two fields — `[D]`; internal notes are
+   never rendered on documents).
+8. **Tags** `[S: t19, t08]`: multi-select tag chips, create inline.
+9. **Files** `[S: t14]`: attach files (PDF, images, docs; ≤ 25 MB each, ≤ 50 per job `[D]`); per-file
+   "visible to customer" and "visible to workers" toggles `[D]`.
+10. **Booking answers** (read-only when job came from online booking; editable by office) `[S: t05, t06]`.
+11. **Lead source / booking source** (read-only; set by origin) `[S: t05]`.
+
+**Footer actions by mode**
+- Appointment: Save draft · **Book now** `[S: t15]`.
+- Quote: Save draft · **Preview** · **Send** `[S: t04]` (· Copy link · Download PDF after first send).
+- Invoice: Save draft · **Preview** · **Send** `[S: t04]` (· Record payment → Agent 05 · Copy payment link).
+
+**States**
+- *Loading*: skeleton for both columns; totals panel shows "—".
+- *Empty*: no services → totals 0, Book/Send disabled with inline reason "Add at least one item".
+- *Validation error*: field-level messages; a summary banner listing blockers (e.g. "Customer has no email
+  or mobile number — the quote can't be sent. Add one, or use Copy link.").
+- *Saving*: optimistic; autosave every 5 s of idle for drafts `[D]`; "Saved · 2s ago" indicator.
+- *Conflict*: another user/worker changed the job → non-blocking banner "Updated by Dana (worker app) 30 s
+  ago — Review changes" with a field diff; on save, server rejects stale version (see §10.8).
+- *Success*: toast "Quote #1042 sent to jane@… and +1 512…" with Undo for 10 s (undo = recall
+  before the notification dispatcher sends; §10.11) `[D]`.
+
+### 3.3 CRM — Job card (job detail view)
+
+The single place where the whole life of `#1042` is visible. Opened from calendar, jobs list, quotes list,
+invoices list, customer profile, search `[S: t08, t15]`.
+
+Layout `[I]`:
+- **Header**: `#1042` · customer name · master status pill · payment pill · scheduled time · assigned workers
+  avatars · primary action (context-sensitive: Send quote / Schedule / Send invoice / Record payment /
+  Reopen) · overflow (Edit, Duplicate, Cancel job, Mark no-show, Void invoice, Delete draft, Print).
+- **Lifecycle stepper** across the top: Quote ▸ Booked ▸ On the way ▸ In progress ▸ Completed ▸ Invoiced ▸ Paid —
+  steps that didn't apply (e.g. no quote) are shown as skipped; each step shows timestamp + actor on hover `[D]`.
+- **Tabs / sections**:
+  1. *Overview* — line items with totals, address with map, assets, notes, tags, booking answers.
+  2. *Quote* — current version preview, version list (v1, v2…), sent/viewed/accepted log, customer
+     acceptance evidence (name, IP, timestamp, signature if captured) `[D]`.
+  3. *Invoice* — current invoice preview, versions, due date, reminders sent, payments list (from Agent 05)
+     with allocation, balance, refunds.
+  4. *Field work* — on-my-way time + ETA sent, arrival, start/pause/resume/complete timestamps, actual vs
+     estimated duration, worker GPS points (start/complete), checklist responses, questions, signature.
+  5. *Photos* — grouped Before / After / Other, with counts vs required, uploader, time, worker; lightbox;
+     "Share with customer" toggle per photo `[D]`; dashboard "all photos" feeds from here `[S: llms]`.
+  6. *Messages* — the customer conversation thread scoped to this job (Agent 08 inbox) `[S: t02, llms]`.
+  7. *Files*.
+  8. *Activity / audit log* — every change with actor, source (CRM, worker app, portal, system, API/MCP,
+     AI), before → after.
+- **Right rail**: customer card (call/text/email), notify contacts, schedule card (reschedule → Agent 03),
+  recurring series link `[S: t14]`, subscription link `[S: t01]`, route link `[S: t02]`, lead link `[S: t20]`.
+
+### 3.4 CRM — Jobs tab sub-views owned (content) by 04
+
+Agent 03 owns the calendar/list/map *views*; 04 owns the **status vocabulary, columns, filters and the
+Quotes / Invoices lists** content `[S: t08]`.
+
+**Jobs list columns** `[S: t08]`: job time, address, service(s), **payment status**, assigned workers — plus
+`[D]`: job #, customer, master status, total, balance, tags, zone.
+**Filters** `[S: t08]`: job status, tags, service areas, assigned staff, customers; `[D]`: date range,
+payment status, origin, has-unsynced-field-data, requirements incomplete.
+
+**Quotes list** ("track open quotes" `[S: t08]`): columns #, customer, created, sent, expires, total, status
+(Draft/Sent/Viewed/Accepted/Booked/Declined/Expired/Withdrawn), last activity, owner. Quick filters: *Open*
+(sent+viewed), *Expiring in 7 days*, *Accepted — needs scheduling*, *Declined*. Bulk: resend, extend expiry,
+export CSV.
+
+**Invoices list** ("view all invoices, each clearly marked with their status" `[S: t08]`): columns #, customer,
+issued, due, total, paid, balance, status (Draft/Open/Viewed/Partially paid/Paid/Overdue/Void/Refunded),
+reminders sent, last payment. Quick filters: *Unpaid*, *Overdue*, *Paid this week*. Totals row (sum balance).
+Bulk: send reminders, export CSV, download PDFs (zip).
+
+Search `[S: t08]`: typing `1042` or `#1042` or `INV-1042` or `Q-1042` resolves to the same job card `[D]`.
+
+### 3.5 CRM — Document preview & send dialog
+
+- **Preview** renders exactly what the customer will see (email body + attached/linked document) in a
+  side-by-side: left = email/SMS preview with recipients; right = document (HTML) with "Download PDF" `[S: t04]`
+  for "preview"; side-by-side `[D]`.
+- **Send dialog** fields:
+  - To: notify contacts (prefilled from right panel) `[S: t04]`; add ad-hoc email/phone (validated
+    RFC 5322-lite / E.164).
+  - Channel: Email ☑ SMS ☑ (SMS = short text + link) `[D]`.
+  - Subject (email; default template from Settings → Communication → Email `[S: t04]`).
+  - Message (prefilled from template; merge fields `{customer.first_name}`, `{job.number}`, `{document.total}`,
+    `{document.link}`, `{quote.expires_on}`, `{invoice.due_on}`).
+  - Attach PDF ☑ (default on for email) `[D]`.
+  - "Send me a copy" ☐ `[D]`.
+  - Schedule send (date/time) `[D]` — budget tier: hide.
+- Errors: no deliverable channel; contact unsubscribed from SMS (STOP) → SMS disabled with tooltip;
+  email hard-bounced previously → warning.
+
+### 3.6 Customer-facing — Quote page (public link; hosted inside the booking portal, Agent 01)
+
+Rendered on the business's booking subdomain (Agent 01) so the brand is consistent `[D]`.
+
+- Business header (logo, name, contact) `[S: t04]`.
+- "Quote #1042" · issued date · **valid until** date · version label if > v1 ("Updated 12 Nov") `[D]`.
+- Prepared for: customer, job address, assets (e.g. "2019 Toyota RAV4 · Blue") `[S: t04]`.
+- Line items (name, description, qty, price), optional items with checkboxes `[D — better than]`, subtotal,
+  discounts, fees, tax, total, deposit due at booking (if any).
+- **Quote terms** `[S: t04]` with "I accept the terms" checkbox (required before Accept) `[D]`.
+- Actions: **Accept & book online** (if book-online enabled) `[S: t04]` / **Accept** (if not) / **Decline**
+  (opens reason sheet) / **Ask a question** (opens message to business — Agent 08) / Download PDF.
+- Accept flow: optional typed-name or drawn signature `[D]` → if book-online: slot picker (Agent 03
+  availability, Agent 01 UI) → payment step per settings (deposit/card on file/pre-auth — Agent 05) →
+  confirmation page showing "Booked: Thu 14 Nov, 9:00–11:00 · Job #1042" + add-to-calendar.
+- States: *Expired* ("This quote expired on …. Request an updated quote" button → message + job event),
+  *Superseded* (auto-redirect to latest version with banner), *Withdrawn* ("This quote is no longer
+  available — contact …"), *Already accepted* (shows booking status), *Declined* (shows "You declined
+  on … Changed your mind? Contact us"), *Link revoked/invalid* (generic 404 without leaking existence).
+- Performance: server-rendered HTML, < 60 KB critical path, no client framework required to read; JS only
+  for accept/sign/book `[D]` (brief performance bar).
+
+### 3.7 Customer-facing — Invoice page (public link)
+
+- Business header; "Invoice #1042"; issued, **due date**, status badge (Due / Overdue / Paid / Partially
+  paid / Void).
+- Bill to / service address / service date / worker (optional per style setting) / assets.
+- Line items, subtotal, discounts, fees, tax, total, **payments received (date, method, amount)**, **balance due**.
+- **Pay now** (card, Apple Pay `[S: llms]`; amount = balance, or partial if business allows partial online
+  payments `[D]`; tip prompt if enabled — Agent 05) `[S: t17]` "payments charged on invoices through the
+  customer portal".
+- Photos section (only photos flagged "share with customer") `[D]`.
+- Download PDF, receipt after payment.
+- States: Paid (receipt view), Void ("This invoice was cancelled"), Superseded version → latest.
+
+### 3.8 Settings → Communication → Email (document look + emails + reminders)
+
+Location per `[S: t04]`. Agent 08 owns the email templates/sending; **04 owns the document style model**
+rendered into those emails/PDFs. Fields `[I]/[D]`:
+
+- *Document style*: logo (from brand settings), accent color (from brand), font (system set), header
+  layout (logo left/centered), show business tax ID ☐, show worker name ☐, show service date ☐, show line
+  descriptions ☑, show qty/unit price columns ☑, show tax breakdown by rate ☑, show photos on invoice ☐,
+  show assets ☑, footer text (≤ 1,000 chars), payment instructions text (for check/bank transfer).
+- *Quote email*: subject, body template, attach PDF default, SMS template (≤ 320 chars incl. link).
+- *Invoice email*: subject, body, attach PDF default, SMS template.
+- *Reminders* `[S: t04]`: Quote follow-up (off / after N days if not viewed / if viewed but not accepted),
+  quote expiring (N days before), invoice due (N days before due), invoice overdue (every N days, max M
+  times), receipt on payment ☑. Defaults `[D]`: quote follow-up 3 days; expiring 2 days before; invoice
+  overdue at +1, +7, +14 days; max 3.
+- Preview pane with sample data; "Send test to me".
+
+### 3.9 Settings → Jobs (proposed; not seen in research) `[D]`
+
+- **Numbering**: next job number (≥ current max + 1; can only increase), display prefixes (Quote "Q-", Invoice
+  "INV-", Job "#") — all share the same integer; optional "Strict sequential invoice numbers" (separate gapless
+  legal sequence assigned at issuance, printed alongside the job number) for jurisdictions that require it.
+- **Quotes**: default expiry days (1–365, default 30), default terms, book-online default (on), require
+  signature (off), allow optional items (on), auto-convert accepted quote without booking → status
+  "Accepted — needs scheduling" + office task.
+- **Invoices**: default due terms (Due on receipt), auto-send invoice on job completion (off / immediately /
+  after N hours if unpaid), allow partial online payments (off), auto-generate invoice on booking (on —
+  locked on; it is the Fieldd behaviour `[S: t04]`), late fee (budget tier: hidden).
+- **Field workflow**: completion requirements enforcement (**Block** / **Warn & require reason** / **Off**) for
+  photos and checklists separately; require customer signature at completion (off); auto-arrive by geofence
+  (on, radius 150 m); on-my-way ETA source (GPS route / manual); live tracking link expiry; allow workers
+  to see prices (on), edit prices (off), add company add-ons (on), apply discounts (off); require payment
+  before completion (off); prompt clock-in on first job action when timesheets enabled (on) `[S: t03]`.
+- **No-show & cancellation**: no-show fee (amount or % — charged by Agent 05 per cancellation policy owned
+  by Agent 01 `[S: t05]`), require photo evidence for no-show (on), wait time before no-show allowed
+  (default 15 min after arrival).
+
+### 3.10 Worker app — Today (job list for the day)
+
+`[S: t02]` for route mode and "normal job workflow"; layout `[I]`.
+
+- Top: date switcher (◀ Today ▶, tap for calendar), **sync status chip** ("Synced" · "3 pending" · "Offline"),
+  clock-in control if timesheets enabled `[S: t03]`.
+- If the worker has a route today: **Route card** — "Anytime Thursday route · 6 stops · Start route" swipe
+  `[S: t02]`; once started, jobs list re-orders to optimized sequence (Agent 03) with a progress bar
+  "2 / 6 complete · 33%" `[S: t02]`.
+- Job cards (sorted by start time, or route sequence): time window, customer name, address (one line),
+  services summary, master status chip, payment badge (Paid / Card on file / Collect $X), requirement
+  indicators (camera icon "0/4" · checklist icon "0/6"), distance/drive time from current
+  location, assigned crew avatars, unsynced dot.
+- Tabs: Today · Upcoming · Completed (last 7 days) · Quotes (estimators) `[D]`.
+- Empty state: "No jobs today" + upcoming next job date.
+- Pull-to-refresh; works fully offline from local store.
+- **New** floating button (if permitted): New quote (estimator) `[S: t04]`, New job (if permission) `[S: t15]`.
+
+### 3.11 Worker app — Job detail
+
+- Header: `#1042`, status chip, time window, overflow (Call office, Report issue, View history).
+- Customer block: name, **Call**, **Text**, **Message** (in-app thread, Agent 08) `[S: t02]`; notify contacts.
+- Address block: address, gate code/access notes, **Navigate** (deep link to Apple/Google Maps/Waze).
+- Assets: vehicle card(s) with photo, make/model/year/color/plate/VIN, tire size `[S: llms]`; home/equipment
+  details.
+- Services & add-ons with quantities and durations (prices shown only if `wa.prices.view`).
+- Booking answers & customer notes `[S: t05, t06]`; internal notes (worker-visible).
+- Files visible to workers.
+- **Requirements panel**: Before photos x/N · Checklist m/M (required r/R) · Questions · After photos x/N ·
+  Signature (if required) `[S: t06]`.
+- History: previous jobs at this address/asset (last 3) with after-photos `[D]`.
+- **Sticky primary action** (state-driven): `On my way` → `I've arrived` (optional) → `Start job` (swipe) →
+  `Complete job`; secondary: Pause, Add items (POS), Take photo, Add note.
+
+### 3.12 Worker app — On my way sheet
+
+- Shows computed ETA ("18 min · arrive ~2:47 PM") from device location and routing `[I]`; editable
+  (+5/+10/+15 or custom) `[D]`.
+- Toggle "Send ETA & live tracking to customer" (default on if business has live tracking `[S: t11, llms]`).
+- Recipients preview (notify contacts with SMS consent).
+- Confirm → job `en_route`; starts location sharing; if offline: "Will send when back online" with
+  staleness rule (§10.6).
+
+### 3.13 Worker app — In-progress job
+
+- Timer (elapsed since start, pauses excluded), estimated duration bar.
+- Step list (configurable order, default): 1 Before photos → 2 Checklist & questions → 3 Add-ons/upsell →
+  4 After photos → 5 Signature (opt.) → 6 Complete `[I]` (t02 lists photos, checklists, message, "finish all
+  required steps").
+- **Checklist screen**: items grouped by source (Global / per service name) `[S: t06]`; item types (owned by
+  Agent 02): checkbox, yes/no, text, number (with unit/range), single/multi select, photo-required item,
+  date; required marker; "N/A" option if item allows; autosave per answer; answered-by avatar for crews.
+- **Photo capture**: in-app camera with stage selector (Before / After / Other) and per-service tag; burst
+  allowed; shows "Before 2/4"; thumbnails with upload state badges (queued/uploading %/done/failed-retry);
+  pick from gallery allowed only if setting permits (`[D]` anti-fraud: default allow, flag "from gallery").
+- **Add items (POS cart)** `[S: t07, t16]`: catalog search (customer add-ons + company add-ons + services if
+  permitted), qty, price (editable if `wa.prices.edit`), shows new total and added duration with warning if
+  it overruns the next job (Agent 03 data); "Customer approved" checkbox / signature for upsells over a
+  threshold `[D]`.
+- **Pause** (reason: waiting for parts / customer request / weather / break / other) → `paused`; **Resume**.
+
+### 3.14 Worker app — Complete job & payment hand-off
+
+- **Completion check** (§10.4): lists unmet requirements; if enforcement = Block, Complete is disabled with
+  "2 after photos missing"; if Warn, shows "Complete anyway" requiring a reason (and permission
+  `wa.requirements.override`).
+- Completion summary: services done, added items, total, paid to date, **balance due**, customer signature pad
+  (optional), "Send photos to customer" toggle `[D]`.
+- **Complete** → job `completed` → if balance > 0 and payment timing = after job → **POS** (Agent 05) `[S: t16]`
+  with tenders: new card, card on file, cash, check, **send invoice** `[S: t16]`, (tap-to-pay / Apple Pay where
+  supported `[S: llms]`), tip prompt (Agent 05). "Skip — collect later" (permission `wa.payment.skip`).
+- After payment: receipt sent (Agent 08), "Next job" CTA with drive time; in route mode auto-advance to next stop
+  `[S: t02]`; when the last route job completes, route closes automatically `[S: t02]` (Agent 03 consumes event).
+
+### 3.15 Worker app — Estimator: New quote on site `[S: t04]`
+
+- Condensed editor: customer (search/create), address (use current location → reverse geocode `[D]`), assets
+  (add vehicle by VIN/plate scan `[S: llms]` lookup), services/add-ons, photos of the problem (attached to the
+  quote, optionally shown to customer `[D]`), terms (default), expiry, book-online toggle.
+- Actions: **Send** (SMS/email) · **Present on device** (hand phone to customer: review, sign, accept) ·
+  **Book now** (customer present: pick slot from availability — Agent 03 — and confirm; collect deposit — Agent 05).
+- Offline: quote saved as local draft with provisional number "Draft"; Send/Book disabled with "Needs
+  connection" (Present & sign can work offline; acceptance syncs later — §10.7) `[D]`.
+
+### 3.16 Worker app — Sync center
+
+- List of pending items (commands, photos) with size and state; "Retry now"; per-item error with plain
+  language ("Job #1042 was cancelled by the office while you were offline — your 4 photos and notes were
+  saved to the job record").
+- Storage usage, "photos waiting: 37 (210 MB)", Wi-Fi-only toggle for large uploads `[D]` (default off —
+  reliability beats data cost for proof-of-work photos).
+- Never offers "clear pending" without a double confirmation and export option.
+
+### 3.17 Mobile behaviour (CRM)
+
+- CRM job editor collapses to a single column with a sticky bottom bar (Total · primary button).
+- Job card tabs become a segmented control + accordion.
+- Document preview opens full-screen with a tab toggle Email ↔ Document.
+- All tap targets ≥ 44 px; totals panel readable at 320 px width.
+
+---
+
+## 4. Workflows
+
+Notation: **Writes** = records created/changed; **Emits** = domain events (catalog in §9.3); **Notifies** =
+notification triggers handed to Agent 08 (which owns templates, channels, consent and the master
+notification catalog). Event domain prefix for this module is `jobs.` (`jobs.<entity>.<verb>`).
+
+### W1. Create a quote in the CRM (New → Quote) `[S: t04]`
+
+1. Office clicks **New → Quote**. Editor opens in quote mode; business info prefilled `[S: t04]`.
+   *Writes*: nothing yet (client-side draft) until the first meaningful field is entered, then
+   `CreateJob{origin:'crm_quote', mode:'quote'}` → Job (status `draft`), job number allocated (§10.9).
+   *Emits*: `jobs.job.created`.
+2. Office selects/creates customer (Agent 07 `customers.customer.created` if new) `[S: t04]`.
+3. Office adds services/add-ons; prices/costs/durations default from catalog (Agent 02) and are
+   **snapshotted** onto the line (§5.1). *Emits*: `jobs.lineitem.added` (batched per save).
+4. Office sets quote terms (default from settings), expiry, **book-online** toggle `[S: t04]`.
+5. Right panel: job address (zone resolved → travel fee/tax rate snapshot), preferred worker, assets,
+   notify contacts `[S: t04]`.
+6. **Preview** `[S: t04]` → server renders a *preview* (not persisted as a version; watermarked "Preview").
+7. **Send** `[S: t04]`:
+   - Validate (§5.8 quote send guards).
+   - Freeze **QuoteVersion vN** (immutable snapshot of lines, totals, terms, expiry, customer/address/asset
+     snapshot, style version). Render HTML + PDF, store with SHA-256 hash.
+   - Create/refresh **PublicLink** (token) for the quote.
+   - Quote state `draft → sent`; job master status → `quoted`.
+   - *Emits*: `jobs.quote.sent {jobId, quoteVersionId, recipients[], channels[], expiresOn, bookOnline}`.
+   - *Notifies*: `quote_sent` to selected notify contacts (email with PDF + link, SMS with link) — Agent 08.
+   - Agent 08 schedules quote follow-up/expiring reminders per settings `[S: t04]`.
+8. Customer opens link → `jobs.quote.viewed` (first view per version; subsequent views counted) → quote
+   state `viewed`; office sees "Viewed 2×, last 3:14 PM" `[D]`.
+
+### W2. Customer accepts and books online `[S: t04]`
+
+1. Customer on quote page ticks "I accept the terms", optionally signs, taps **Accept & book online**.
+2. `AcceptQuote{publicToken, quoteVersionId, acceptedOptionalLineIds[], signature?, acceptorName}`:
+   - Guard: version is latest sent version, not expired, not withdrawn, job not cancelled (§6.2).
+   - Writes: `QuoteAcceptance` (version, selected optional lines, name, IP, user agent, timestamp, signature
+     image ref, terms hash). Optional lines not selected are marked `declined_optional`; selected ones become
+     active job lines.
+   - Quote state `accepted`; job master status → `approved` ("Accepted — needs scheduling").
+   - *Emits*: `jobs.quote.accepted`. *Notifies*: `quote_accepted` → office/preferred worker (internal) `[I]`.
+3. If book-online enabled → customer continues to slot picker (Agent 01 UI; Agent 03 availability for the
+   job's total duration, address/zone, preferred worker rule).
+4. Customer selects a slot; payment step if deposit/card-on-file/pre-auth required (Agent 05).
+5. Agent 03 `ScheduleJob{jobId, slot, workers}` (hold → confirm) → *Emits* `schedule.job.scheduled`.
+6. 04 consumes `schedule.job.scheduled`:
+   - Snapshot schedule onto job; master status `approved → scheduled`; quote state `accepted → booked`
+     (terminal for the quote) `[S: t04]` "updates the job card automatically".
+   - **Auto-generate invoice** (Invoice record in `draft`, number = job number) `[S: t04]` "at that point
+     Field will also generate an invoice". *Emits*: `jobs.invoice.created`.
+   - *Notifies*: `job_booked_confirmation` to customer, `job_assigned` to workers `[S: t15]` (Agent 08).
+7. If the customer abandons after accepting but before booking → job stays `approved`; Agent 08 may run
+   an "accepted-not-booked" follow-up; office sees it in **Quotes → Accepted — needs scheduling** `[D]`.
+8. If book-online disabled → steps 3–6 are performed by the office (W5 Schedule) after the acceptance
+   notification.
+
+Idempotency: AcceptQuote keyed by `(quoteVersionId)` — a second accept returns the existing acceptance
+(200, no duplicate events). Payment hold and schedule hold are coordinated by a booking saga (§10.3).
+
+### W3. Customer declines a quote
+
+1. Customer taps **Decline** → reason picker (Price too high / Chose another provider / Not needed now /
+   Other + text) `[D]`.
+2. `DeclineQuote` → quote `declined`, job master status `declined` (a closed-lost job; not deleted) `[D]`.
+3. *Emits* `jobs.quote.declined {reason}`; *Notifies* office `quote_declined`; Agent 08 may enrol customer in a
+   "declined quote win-back" drip; Agent 07 lead/pipeline stage updates to Lost.
+4. Office can **Revise** a declined quote (creates vN+1, back to `quoted` on send) — declines are not terminal
+   for the job, only for that version.
+
+### W4. Quote revision, withdrawal, expiry
+
+- **Revise** (any time before acceptance; after acceptance only with `quote.revise_accepted` permission and it
+  re-requires acceptance): editing a sent quote opens vN+1 as a *draft revision*; the customer still sees
+  vN until vN+1 is sent. Sending vN+1 marks vN `superseded`; vN link redirects to vN+1 with "This quote was
+  updated on …" banner. *Emits* `jobs.quote.revised`, `jobs.quote.sent`.
+- **Withdraw**: office stops the offer → quote `withdrawn`, link shows withdrawn state; master status
+  `cancelled` unless another action follows. *Emits* `jobs.quote.withdrawn`; Agent 08 cancels reminders.
+- **Expire**: system job at 00:05 business-local time (§10.10) moves `sent|viewed` quotes whose `expiresOn`
+  (a local date, inclusive) has passed to `expired`; master status `expired`. *Emits* `jobs.quote.expired`;
+  *Notifies* office (digest) and optionally customer ("Your quote expired — request an update").
+- **Extend expiry**: editing only the expiry date on a sent quote does **not** create a new version (it is
+  metadata, not offer content) but is audit-logged and the customer link updates `[D]`. Reviving an expired
+  quote = extend expiry (state `expired → sent`).
+- **Office marks accepted on behalf** (phone/verbal acceptance): `AcceptQuote{actor:office, method:'verbal',
+  note}` — acceptance evidence records the office user; same downstream as W2 step 2 `[D]`.
+
+### W5. Create an appointment in the CRM (New → Appointment) `[S: t15, t19]`
+
+1. New → Appointment; choose service(s) (or create new), **+** for extra services/add-ons `[S: t15]`.
+2. Find/create customer, add job address `[S: t15]`.
+3. Options & payment: discount, tax, gift card; payment timing; card on file `[S: t16]`.
+4. Schedule: Agent 03 proposes first available time + worker (travel time, closest worker `[S: t19]`) or
+   manual; past dates allowed `[S: llms]` (→ W14).
+5. Assets, notes, tags, repeat `[S: t19]`.
+6. **Book now** `[S: t15]`:
+   - `CreateJob{origin:'crm_appointment'}` (if not yet saved) + `ScheduleJob` (Agent 03) in one transaction
+     boundary via the booking saga (§10.3).
+   - Requirements snapshot resolved from Agent 02 (`catalog.requirements.resolve`) → stored on job (§10.5).
+   - Invoice auto-created in `draft` `[I — extends S: t04 to CRM bookings]`.
+   - If payment timing = at booking and card on file → Agent 05 charges; 04 consumes `payments.payment.succeeded`
+     → invoice `issued` + `paid` (§W12).
+   - Master status `scheduled`. *Emits*: `jobs.job.created`, `jobs.invoice.created`, `jobs.job.status_changed`.
+   - *Notifies* (via 08): assigned workers `job_assigned`; customer `job_booked_confirmation` and later
+     reminders `[S: t15]` "notify your assigned team members, and send reminders directly to the customer".
+
+### W6. Online booking from the booking portal (Agent 01) creates a job
+
+1. Agent 01 portal collects services, add-ons, assets, booking answers, address, slot, payment method.
+2. Portal calls `CreateJobFromBooking{bookingSessionId, idempotencyKey, ...}` (04) and Agent 03's slot
+   confirmation inside the booking saga (§10.3).
+3. Job created with `origin:'online_booking'`, `bookingSource` (Agent 01 source tracking `[S: t05]`), booking
+   answers snapshot `[S: t05, t06]`, T&C acceptance evidence `[S: t05]`.
+4. Invoice auto-created `draft`; prepayment/deposit/pre-auth per Settings → Payments (Agent 05) `[S: t04]`.
+5. Master status `scheduled` (or `unscheduled` for request-only booking modes, if Agent 01 supports them) `[I]`.
+6. Emits as W5. Agent 07 links/creates customer, assets; Agent 08 abandoned-booking flow is cancelled for
+   that session.
+
+### W7. Standalone invoice (New → Invoice) `[S: t04]`
+
+1. New → Invoice. Editor in invoice mode; business info prefilled; customer; line items; due terms;
+   notes/footer; payment options.
+2. `CreateJob{origin:'crm_invoice', fieldWork:'none'}` — still a Job with a job number (single-ID model);
+   no schedule, no requirements, workState `not_applicable` `[D]`.
+3. Preview → **Send**: freeze InvoiceVersion v1, render, public link, invoice `draft → open (sent)`; master
+   status `invoiced`. *Emits* `jobs.invoice.issued`, `jobs.invoice.sent`; *Notifies* `invoice_sent`; Agent 08
+   schedules due/overdue reminders `[S: t04]`.
+4. Optional: the office later adds a schedule to a standalone invoice (e.g. "parts invoice now, install
+   next week") → job gains field work (`fieldWork:'required'`), master status follows field states while the
+   invoice keeps its own state `[D]`.
+
+### W8. Worker day: list, route start, on-my-way `[S: t02, t11, llms]`
+
+1. Worker opens WA; local store already holds today's jobs (prefetched; §10.7). Clock-in prompt if
+   timesheets enabled and setting on `[S: t03]` (Agent 09 owns timesheets — job flow only *prompts*).
+2. Route day: worker swipes **Start route** `[S: t02]` → Agent 03 optimizes and emits
+   `schedule.route.started` + `schedule.route.sequenced {jobIds[]}`; WA reorders list.
+3. Worker taps **On my way** on a job:
+   - WA computes ETA (device location + routing, or manual) and shows the sheet (§3.12).
+   - Command `MarkEnRoute{jobId, etaAt, etaSource, location, sendToCustomer}`.
+   - Guard: job `scheduled`, worker assigned (or foreman/crew), not already completed/cancelled; only one
+     job per worker may be `en_route` at a time — starting en-route on job B while job A is en-route auto
+     reverts A to `scheduled` with an audit note `[D]`.
+   - Writes: `FieldVisit.enRouteAt`, `etaAt`; workState `en_route`; master status `en_route`.
+   - *Emits* `jobs.visit.en_route {jobId, workerId, etaAt, trackingSessionId}`.
+   - *Notifies* `on_my_way` to notify contacts with ETA and live tracking link `[S: llms "on-my-way
+     tracking", t11 "real-time updates on your arrival"]` — Agent 08 sends; tracking page served by Agent 01
+     portal; location stream from WA via the tracking service (§10.6).
+4. Location stream: every 15 s or 50 m (whichever first) while en route; ETA re-estimated server-side; if
+   ETA slips > 10 min vs. the sent ETA, Agent 08 may send a "running late" update (setting) `[D]`.
+5. Arrival: explicit **I've arrived** or geofence auto-arrive (radius setting) → workState `arrived`,
+   `arrivedAt`; tracking link switches to "Your technician has arrived" and stops streaming `[D]`.
+
+### W9. Start job, checklists, photos `[S: t02, t06]`
+
+1. **Start job** (swipe) → `StartJob{jobId, startedAt(device), location}`; guard: `scheduled|en_route|arrived`
+   (starting directly from scheduled is allowed: worker may be on site already). workState `in_progress`;
+   master status `in_progress`; `startedAt` recorded. *Emits* `jobs.visit.started`. Customer notification
+   `job_started` optional (off by default) `[D]`. Location sharing stops.
+2. Requirements view: before photos (N), checklist items and questions, after photos (N) `[S: t06]`.
+3. **Before photos**: captured in app → photo pipeline (§10.12). Each photo: `stage:'before'`, optional
+   `lineItemId` tag. *Emits* `jobs.photo.added` (on metadata sync) and `jobs.photo.uploaded` (bytes stored).
+4. **Checklist & questions**: each answer `AnswerChecklistItem{jobId, itemId, value, answeredAt}` — appended
+   to `ChecklistResponse` log (last write per item wins for display; full history kept). When all required
+   items answered → `jobs.checklist.completed` (re-emitted if an answer is later cleared → `jobs.checklist.reopened`).
+5. **Message the client** `[S: t02]`: opens the job-scoped conversation (Agent 08); messages carry `jobId`.
+6. **Pause/Resume** (optional): `PauseJob{reason}` / `ResumeJob` → `paused` ↔ `in_progress`; paused time
+   excluded from actual duration.
+
+### W10. Upsell via POS before completion `[S: t07]`
+
+1. Worker taps **Add items**; picks customer add-ons / company add-ons (and services if permitted) `[S: t07]`.
+2. `AddLineItems{jobId, lines[], source:'pos_upsell', approvedByCustomer?}`:
+   - Guard: job not completed (`[S: t07]` "before the job is marked complete"); after completion, only office
+     can add lines (reopens invoice balance; §W13). Price edits require `wa.prices.edit`.
+   - Writes: line items with `addedBy`, `source`, catalog snapshot; recompute totals; duration increases.
+   - Inventory: product add-ons reserve stock (Agent 02 consumes `jobs.lineitem.added`); decrement on completion.
+   - If added duration overruns the worker's next job start → warning in WA + `jobs.job.duration_extended`
+     for Agent 03 to flag the conflict to dispatch `[D]`.
+   - If invoice already issued (e.g. prepaid at booking) → invoice revision vN+1 with new balance (§10.2).
+   - *Emits* `jobs.lineitem.added`, `jobs.job.totals_changed`.
+3. Upsell attribution: `addedByWorkerId` used by Agent 08 reporting/leaderboard and Agent 09 commissions `[I]`.
+
+### W11. Complete job `[S: t16, t02]`
+
+1. Worker taps **Complete job**.
+2. Completion gate (§10.4) evaluates requirements snapshot vs responses/photos (counting photos that are
+   captured locally even if not yet uploaded — they're marked `pending_upload`, §10.12).
+   - Block mode + unmet → cannot complete; Warn mode → "Complete anyway" with reason + permission.
+3. Optional customer signature capture.
+4. `CompleteJob{jobId, completedAt, location, signature?, overrideReason?}`:
+   - workState `completed`; `completedAt`; actual duration computed.
+   - If invoice is `draft` → it stays draft until payment/send (step 5) but its lines are **locked for workers**.
+   - Master status → `completed` (or `paid` if already fully prepaid).
+   - *Emits* `jobs.job.completed {jobId, lines, assets, workers, totals, balanceDue, photosShared[]}`.
+   - Consumers: Agent 03 (route progress / auto-close route `[S: t02]`, next job), Agent 02 (inventory
+     decrement), Agent 07 (asset last-service date `[S: llms]`, customer service history), Agent 08
+     (completion message, review request `[S: llms "Google review booster"]`, leaderboard), Agent 06
+     (subscription usage), Agent 09 (job time for pay/commission).
+5. Payment hand-off `[S: t16]`: if balance > 0 and timing = after job → WA opens **POS** (Agent 05) with
+   `{jobId, invoiceId, amountDue}`:
+   - Card (new/on file/tap) or cash/check → Agent 05 records payment → `payments.payment.succeeded`
+     → 04 issues invoice (if draft) + applies payment (§W12).
+   - **Send invoice** `[S: t16]` → `IssueInvoice{jobId, send:true}` → invoice `open`, master `invoiced`.
+   - Skip (permission) → job `completed`, invoice draft; office "Completed — awaiting payment" queue; optional
+     auto-send after N hours (setting).
+6. If the business uses "charge at booking"/card-on-file-after-job automatic charge: Agent 05 auto-charges on
+   `jobs.job.completed` (if configured) — 04 does not charge.
+
+### W12. Payment applied to invoice (any channel) `[S: t16, t17]`
+
+1. Agent 05 emits `payments.payment.succeeded {paymentId, jobId, invoiceId?, amount, tip, method, allocations[]}`.
+2. 04 handler (idempotent on `paymentId`):
+   - If invoice `draft` → **issue** it first (freeze version; `issuedReason:'payment'`).
+   - Apply allocation: `amountPaid += allocation` (tips are tracked separately and do not reduce balance;
+     Agent 05 decides tip handling).
+   - Recompute invoice state: `balance = 0 → paid`, `0 < paid < total → partially_paid`.
+   - Recompute master status (§10.1).
+   - *Emits* `jobs.invoice.payment_applied`, and `jobs.invoice.paid` when balance reaches 0.
+   - Agent 08 sends receipt; cancels pending reminders on `jobs.invoice.paid`.
+3. Overpayment (allocation > balance) → invoice `paid`, `creditDue = excess` flag → Agent 05 decides refund or
+   customer credit; 04 shows "Overpaid by $X".
+
+### W13. Post-completion edits, reopen, refunds
+
+- **Office edits lines after completion**: allowed with `job.edit_completed`; creates invoice revision if
+  issued; if invoice paid and new total > paid → state back to `partially_paid` and Agent 08 can send updated
+  invoice; if new total < paid → `overpaid` flag → Agent 05 refund flow.
+- If the invoice version was already **exported/locked** (accounting period close, Agent 05/08 export) →
+  changes go to a **supplemental invoice** `#1042-2` (same job, same base number) rather than revising `[D]`.
+- **Reopen job** (`job.reopen`): `completed → in_progress` (e.g. callback/rework same day); keeps original
+  `completedAt` in history; emits `jobs.job.reopened`. Rework on another day = new linked job
+  (`relatedJobId`, `relationType:'callback'`) `[D]`.
+- **Refund** (Agent 05) → `payments.refund.succeeded` → 04 reduces `amountPaid` (net), invoice state →
+  `partially_refunded`/`refunded` (§6.4); master status stays `paid` if net paid ≥ total, else reverts to
+  `invoiced`/`partially_paid` as computed — except full refund of a cancelled job → `cancelled` with
+  `refunded` payment pill.
+
+### W14. Record a past job (backfill) `[S: llms "schedule or reschedule jobs in the past"]`
+
+1. New → Appointment with a past date/time.
+2. Prompt: "This time is in the past. Mark as completed?" `[D]` → **Yes**: job created with
+   `workState:'completed'`, `completedAt = scheduledEnd`, requirements gate skipped (flag
+   `backfilled:true`, audit reason), no customer notifications except optionally invoice/receipt.
+   **No**: job stays `scheduled` in the past → appears in "Past due — not completed" queue.
+3. Notifications for past-dated jobs are suppressed by default (no "your appointment is booked for
+   yesterday") — contract with Agent 08: `jobs.job.created.payload.suppressCustomerNotifications = true`.
+
+### W15. Cancel and no-show
+
+- **Cancel (office)**: `CancelJob{reason, notifyCustomer, feePolicy}` from any pre-completion state; schedule
+  released (Agent 03 consumes `jobs.job.cancelled`); invoice: draft → `void`; issued & unpaid → `void`;
+  partially/fully paid → requires refund decision (Agent 05) before void, or keep as cancellation-fee invoice
+  (lines replaced by a "Cancellation fee" line, revision) `[D]`.
+- **Cancel (customer, portal)**: Agent 01 enforces cancellation policy and feedback + reschedule prompt
+  `[S: t05]`; calls `CancelJob{actor:customer}` or Agent 03 reschedule instead.
+- **No-show** (worker): available after `arrived` + wait time (setting) → `MarkNoShow{evidencePhotos[], note}` →
+  master `no_show`; Agent 05 may charge no-show fee per policy; Agent 08 notifies customer + office;
+  Agent 03 frees remaining slot time `[D]`.
+- **Reschedule** is Agent 03's (`schedule.job.rescheduled`); 04 updates snapshot; if the job was `en_route`
+  it reverts to `scheduled` and the tracking link is invalidated `[D]`; quote/invoice unaffected (invoice
+  service date updates on next render if not issued).
+
+### W16. Recurring and subscription occurrences `[S: t14, t01]`
+
+- Agent 03 owns the recurring series; Agent 06 owns subscriptions with auto-scheduling. Each occurrence is
+  materialised (rolling horizon, Agent 03's call) by calling `CreateJob{origin:'recurring'|'subscription',
+  seriesId|subscriptionId, occurrenceIndex, lines[], discounts[]}` → each occurrence is its **own job with its
+  own number** linked by `seriesId` `[D]` (consistent with "show up in your calendar on every scheduled date"
+  `[S: t14]`).
+- "Commit across all future bookings" `[S: t14]`: Agent 03 issues `ApplySeriesChange{seriesId, fromDate,
+  patch}` → 04 updates every future occurrence job in `scheduled` (or earlier) state that has **not been
+  individually edited** (`detachedFromSeries=false`); individually edited occurrences get a conflict list for
+  the office ("3 occurrences have custom changes — overwrite?") `[D]`.
+- Subscription-covered lines: line `coveredBySubscriptionId`, price shown with "Included in plan" and a
+  discount line making net 0 or the plan discount `[S: t01]` "20% off all services and one free add-on";
+  invoice for a fully covered visit is auto-issued as `paid` with `$0` (no customer invoice email) `[D]`.
+
+### W17. Lead → job `[S: t20]`
+
+- Agent 07 lead conversion calls `CreateJob{origin:'lead_conversion', leadId, mode:'appointment'|'quote'}`;
+  04 emits `jobs.job.created {leadId}`; Agent 07 moves lead to Won/Converted when the job reaches
+  `scheduled` (appointment) or `approved` (quote accepted) `[D]`.
+
+### W18. Estimator quote on site, customer books immediately `[S: t04]`
+
+1. Estimator creates quote in WA (§3.15). Online → number allocated immediately; offline → local draft.
+2. **Present on device**: customer reviews on the worker's phone, accepts terms, signs → `AcceptQuote
+   {method:'in_person', deviceId, signature}` (queued if offline).
+3. **Book now**: estimator picks a slot from availability (requires online; Agent 03); deposit via POS
+   (Agent 05). Then same as W2 steps 5–6.
+4. Or **Send**: SMS/email link (requires online) → W1 step 7 onward.
+
+### W19. Crew / split jobs `[S: llms "split a job or its services between team members"]`
+
+- Assignments (Agent 03) may be job-level (crew) or line-level (service X → worker A, service Y → worker B).
+- Each assigned worker has their own `FieldVisit` record (en route/start/complete per worker) `[D]`; the
+  job's workState is the **aggregate**: `en_route` if any worker en route and none started; `in_progress` if
+  any started and not all assigned visits completed; `completed` when all required visits are complete, **or**
+  when a foreman/lead completes the whole job (closing the others with `closedBy`).
+- Requirements are evaluated per job (not per worker) unless a requirement is tagged to a line assigned to a
+  specific worker; then that worker's completion is gated on it.
+- On-my-way notifications: only the first worker's en-route triggers the customer ETA by default (setting:
+  "lead worker only") to avoid duplicate texts `[D]`.
+
+---
+
+## 5. Business rules & math
+
+### 5.1 Price snapshotting `[D]`
+
+- When a catalog item is added to a job, the line stores a **snapshot**: name, description, unit price,
+  cost, duration, taxable flag, tax category, item kind, catalog item id + catalog version. Later catalog
+  changes (Agent 02 `catalog.service.updated`) **never** change existing job lines.
+- A sent quote's prices are binding until expiry: booking from the quote uses the quote version's lines,
+  not current catalog prices — even if the catalog price went up.
+- Recurring/subscription occurrences take the series' line template (Agent 03/06) at materialisation time;
+  a series price change applies only to occurrences materialised (or re-applied via "commit to future")
+  afterwards.
+- Office can "Refresh prices from catalog" on a draft job/quote (explicit action, shows diff).
+
+### 5.2 Totals computation (order of operations)
+
+Authority for tax order and tax rules is **Agent 05** (with zone tax rates from **Agent 02** `[S: t11]`). The
+pipeline below is our proposed default; 04 implements it as a pure function `computeTotals(job)` shared by
+CRM, WA (offline), portal and document rendering so all surfaces agree to the cent `[D]`.
+
+All amounts integer cents (`int64`). Quantities are decimals with up to 3 fractional digits stored as
+integer milli-units (`qtyMilli`). Percentages stored as basis points (`bps`, 1% = 100 bps).
+
+```
+for each line L (kind ∈ service, customer_addon, company_addon, custom_item, fee):
+    L.gross = roundHalfUp(L.unitPriceCents * L.qtyMilli / 1000)
+
+# 1. line-level discounts (recurring discount, subscription %, code tied to specific items)
+for each line-level discount D on line L:
+    D.amount = (D.type == 'percent') ? roundHalfUp(L.gross * D.bps / 10000) : min(D.fixedCents, L.gross_remaining)
+    L.net = L.gross - Σ D.amount        # never below 0
+
+# 2. order-level discounts (code on whole order, manual $ or % off)
+eligibleBase = Σ L.net over lines eligible for that discount (Agent 06 decides eligibility)
+orderDiscount = percent ? roundHalfUp(eligibleBase * bps / 10000) : min(fixedCents, eligibleBase)
+allocate orderDiscount across eligible lines pro-rata by L.net using largest-remainder (§10.2.1)
+L.netAfterOrder = L.net - L.allocatedOrderDiscount
+
+# 3. fees (travel fee from zone [S: t11], other fees) are lines of kind 'fee'; discounts don't apply
+#    to fees unless the discount explicitly includes fees.
+
+# 4. tax
+for each tax rate R applicable (zone/business rate; normally one rate):
+    taxableBase_R = Σ L.netAfterOrder over lines with taxable && rate R
+    tax_R = roundHalfUp(taxableBase_R * R.bps / 10000)       # invoice-level rounding per rate
+allocate tax_R back to lines (largest remainder) for per-line reporting only
+
+subtotal       = Σ L.gross (non-fee lines)
+discountTotal  = Σ line discounts + orderDiscount
+feeTotal       = Σ fee lines net
+taxTotal       = Σ tax_R
+total          = subtotal - discountTotal + feeTotal + taxTotal
+```
+
+Rules:
+- `total ≥ 0` always; a discount can never make a line negative; excess discount is dropped (with UI
+  warning "Discount exceeds eligible amount — capped at $X").
+- Gift cards are **tenders** (payments), not discounts — they reduce balance, not total, and are not taxed
+  around `[I; video t16 places gift card under "Options" next to discount/tax in the UI — verify]`.
+- Tips are never part of `total`; tracked by Agent 05 on the payment.
+- Rounding mode: half-up (away from zero for positives) on every multiplication; no intermediate floats.
+- Tax-inclusive pricing (VAT/GST countries; fieldd operates in 37 countries `[S: llms]`) — if the business
+  setting `pricesIncludeTax=true`: `tax_R = taxableBase_R - roundHalfUp(taxableBase_R * 10000 / (10000 + R.bps))`
+  and `total = subtotal - discountTotal + feeTotal` (tax shown as "includes $X tax") `[D]`.
+- **Deposit required** = per Agent 05 settings (fixed or % of total, rounded half-up), shown on quote and
+  booking step; deposit is a payment against the same invoice (no separate deposit invoice number) `[D]`.
+- **Balance due** = `total − Σ net allocations` (payments − refunds allocated to this invoice), excluding tips.
+- **Cost & profit** `[S: t06, t07, t19]`: `costTotal = Σ roundHalfUp(L.unitCostCents × qty)`;
+  `revenueNet = total − taxTotal`; `profit = revenueNet − costTotal`; `marginBps = profit × 10000 / revenueNet`
+  (0 if revenueNet = 0). Payment processing fees (Agent 05) can optionally be included in cost for
+  "true profit" `[D]`.
+- **Duration**: `estimatedDuration = Σ service durations × qty (if qty-based) + Σ add-on durations`
+  `[S: t06, t07]` "extra time will be added to the overall booking"; Agent 03 consumes it.
+
+### 5.3 Job number rules `[D]` (concept `[S: t04, t08]`)
+
+- Per business, monotonically increasing integer, default seed 1001, allocated atomically on first persist.
+- Never reused, never changed after allocation. Discarded drafts keep their number (visible as "Discarded").
+- Display: `#1042` (job), `Quote #1042` / `Q-1042`, `Invoice #1042` / `INV-1042` (prefixes configurable, the
+  integer is shared). Supplemental invoices: `#1042-2`, `#1042-3`.
+- Quote versions: `Quote #1042 (v2)` — version only shown when > 1.
+- **Strict sequential invoice numbering** (optional setting, for tax jurisdictions requiring gapless invoice
+  sequences): a separate `legalInvoiceNumber` allocated from a gapless sequence **at issuance** (not at draft
+  creation), printed as "Invoice no. 2026-000123 (Job #1042)". Off by default; budget tier: available on all
+  plans since it's compliance, not a premium feature.
+- Offline-created jobs get a provisional `localRef` ("Draft · A7F2") until sync assigns the number. A document
+  can never be sent with a provisional number.
+- Search matches number with or without prefix/hash.
+
+### 5.4 Quote rules
+
+- Expiry: `expiresOn` local date (business tz), inclusive; default today + 30 days `[D]`; quote valid until
+  23:59:59 local on that date. Accept attempts after that → `QUOTE_EXPIRED`.
+- Acceptance is bound to a **specific version** and records the **terms hash**; changing terms requires a new
+  version.
+- Only the latest sent version can be accepted. Draft revisions are invisible to the customer.
+- A quote with zero line items or total = 0 can be sent only if the business allows "$0 quotes" (default
+  allowed — some businesses quote "free inspection") `[D]`.
+- Book-online from a quote books the **quote's lines and duration**; customer cannot change services in the
+  booking step except choosing offered optional lines `[D]`.
+- Preferred worker on a quote `[S: t04]` is a *preference*: Agent 03 uses it as a hard filter if "restrict to
+  preferred worker" is on, otherwise as a ranking boost.
+- Accepted quote → the job's lines become the "contract" baseline; later changes are tracked as deltas
+  (shown on the invoice as "Changes since quote: +$45 Pet hair removal") `[D — better than]`.
+
+### 5.5 Invoice rules
+
+- **Auto-generation**: an Invoice record is created (state `draft`) when the job first becomes `scheduled`
+  `[S: t04]`, or at creation for standalone invoices `[S: t04]`. Exactly one *primary* invoice per job.
+- While `draft`, the invoice is a **live view** of job lines (no snapshot). It is **issued** (snapshot frozen as
+  InvoiceVersion v1) on the first of: sent to customer; any payment applied (incl. deposits at booking);
+  job completed with auto-send; manual "Mark as issued".
+- After issuance, line changes produce a new InvoiceVersion (vN+1); customer link always shows latest with a
+  "Revised" note; payments carry over.
+- **Due date**: `dueOn = issueDate + terms` (local date). Due on receipt → `dueOn = issueDate`.
+- **Overdue**: computed, not stored as a primary state — `isOverdue = state ∈ {open, viewed, partially_paid}
+  && today(businessTz) > dueOn`. The `overdue` flag transition emits `jobs.invoice.overdue` once (system sweep).
+- **Partial payments**: unlimited; each payment allocated to this invoice by Agent 05; online partial payments
+  only if setting on; minimum partial amount $1 or setting.
+- **Void**: allowed when `netPaid = 0`; otherwise refund first (Agent 05) or convert to credit. Void invoice is
+  kept (never deleted), watermarked "VOID".
+- **Uncollectible / write-off** `[D]`: `MarkUncollectible{reason}` → state `written_off`, balance moved to bad
+  debt reporting; can be reversed by a later payment.
+- Invoices for **$0** (fully covered by subscription/gift/discount) are auto-issued and marked `paid` without
+  sending unless the business opts in.
+- Currency: single business currency (ISO 4217); multi-currency out of scope v1.
+
+### 5.6 Field workflow rules
+
+- Workers see only jobs where they are assigned (job- or line-level), plus crew jobs if foreman, plus all
+  jobs if `wa.jobs.view_all` (Agent 09).
+- One active `en_route` job per worker (§W8 step 3); multiple `in_progress` jobs per worker are allowed only
+  if setting "allow concurrent jobs" (e.g. a shop worker with two cars) `[D]`; default off → starting a second
+  job prompts "Pause #1041?".
+- `StartJob` allowed from `scheduled`, `en_route`, `arrived`, `paused`(=resume) only; not before
+  `scheduledStart − earlyStartWindow` (default 12 h, guards accidental taps on next week's job) unless confirmed.
+- **Requirements** = union of global requirements (settings) and service-specific requirements for every
+  service/add-on line on the job `[S: t06]`; photo counts per stage = `max(global, max over lines of
+  service requirement)` by default; a service rule may be marked `additive` → summed `[D]` (see Q in §13).
+- Requirement snapshot is taken at booking; adding a service later (upsell) **adds** its requirements; removing a
+  service removes requirements not yet answered (answered ones are kept as history).
+- Completion gate counts photos with local status ≥ `captured` (§10.12) — workers are never blocked by bad
+  signal — but the job carries `evidencePendingUpload=true` until all bytes are on the server, and the office
+  sees "Photos uploading (3)".
+- **Actual duration** = `completedAt − startedAt − Σ pauses`. Displayed to office; feeds Agent 03 duration
+  learning and Agent 09 performance.
+- Job time ≠ timesheet time: the job flow can *prompt* clock-in, never clocks in automatically `[S: t03]`
+  (timesheets are permissioned; workers may not have them).
+
+### 5.7 Editing locks matrix `[D]`
+
+| Job phase | Lines (office) | Lines (worker) | Customer | Address | Schedule (via 03) | Delete |
+|---|---|---|---|---|---|---|
+| draft | ✔ | ✔ (own drafts) | ✔ | ✔ | ✔ | ✔ (discard) |
+| quoted (sent) | ✔ → new version | ✗ | ✔ → new version | ✔ → new version | n/a | ✗ (withdraw) |
+| approved / scheduled | ✔ | ✔ add only (upsell perm.) | ✔ (warn: invoice) | ✔ (re-zone, re-price fees, warn) | ✔ | ✗ (cancel) |
+| en_route / in_progress | ✔ (notify worker) | ✔ add/edit qty (perm.) | ✗ | ✗ (warn hard) | ✔ (warn) | ✗ |
+| completed (unpaid) | ✔ `job.edit_completed` | ✗ | ✗ | ✗ | ✔ (date correction) | ✗ |
+| paid | ✔ `job.edit_paid` → revision/supplemental | ✗ | ✗ | ✗ | date correction only | ✗ |
+| cancelled / no_show | fee line only | ✗ | ✗ | ✗ | "Rebook" creates new job | ✗ |
+
+### 5.8 Send guards (quote and invoice)
+
+- Customer has at least one deliverable channel among selected recipients (email valid & not hard-bounced,
+  or mobile with SMS consent) — otherwise "Copy link" only.
+- At least one line item (unless $0 allowed).
+- Job number allocated (online).
+- Total ≥ 0; all lines have names; no line with qty 0.
+- For quotes: expiry ≥ today; terms present if "require terms" setting.
+- For invoices: if job has field work and is not completed, warn "Invoicing before completion" (allowed,
+  common for prepayment) `[D]`.
+- Rate limit: max 10 sends per document per hour (anti-spam).
+
+### 5.9 Timezone & DST rules
+
+- Every business has an IANA timezone; jobs store instants in UTC plus `jobTz` (the job location's tz — equals
+  the business tz unless a multi-region business; derived from geocode) `[D]`.
+- Date-only concepts (quote `expiresOn`, invoice `dueOn`, route "anytime Thursday" day `[S: t02]`) are stored as
+  local dates `YYYY-MM-DD` + tz, never as midnight UTC instants.
+- Sweeps (expiry, overdue) run per business at local 00:05, computed with the tz database (DST-safe; on
+  spring-forward days 00:05 always exists; on fall-back, run once — dedupe by `(businessId, localDate)`).
+- Worker app displays times in the job's tz with a tz badge if the device tz differs.
+
+### 5.10 Money rounding & invariants (checked on every write; violation = reject + alert)
+
+- `total = subtotal − discountTotal + feeTotal + taxTotal` (exclusive tax).
+- `Σ line allocations of order discount = orderDiscount`; `Σ line tax allocations = taxTotal`.
+- `amountPaid = Σ allocations(payments) − Σ allocations(refunds)` from Agent 05's ledger, never edited directly.
+- `balanceDue = max(total − amountPaid, 0)`; `creditDue = max(amountPaid − total, 0)`.
+- No negative line except kind `discount`/`adjustment`; adjustments require `job.price.adjust`.
+
